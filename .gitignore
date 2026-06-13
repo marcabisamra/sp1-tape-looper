@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+.Rhistory
+
+# Zephyr / west build output
+build/
+build_*/
+*.elf
+*.map
+zephyr/
