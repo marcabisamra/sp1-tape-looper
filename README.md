@@ -20,7 +20,8 @@ re-flashing the firmware.
   together, one BPM per click.
 - 💾 **4 song slots**, each remembering its own tracks and tempo; loops persist
   across power-off *and* across re-flashing the firmware.
-- 🎧 **Speaker and headphone output**, both clean.
+- 🎧 **Speaker and headphone output**, both clean — speaker auto-mutes when
+  headphones are plugged in.
 - 🔋 **Real power behaviour** — charge/standby on plug-in, hold to switch on/off,
   battery-friendly sleep.
 - 🛟 **Self-correcting flash storage** (hardware CRC-checked with retry) plus a
@@ -94,7 +95,8 @@ whatever was there.
 
 ### Mixing & tempo
 - **The four faders** set the **volume of each track** (fader 1 = track 1, etc.).
-- **VOL +/− buttons** set the **overall (master) volume.**
+- **VOL +/− buttons** set the **overall (master) volume** — a smooth, gradual
+  control that steps all the way down to fully muted. Hold to sweep quickly.
 - **FWD / RWD buttons** change the **tempo / playback speed** — 1 BPM per press,
   hold to sweep faster. (It's a tape-style speed change: faster = higher pitch.)
 
@@ -106,7 +108,8 @@ whatever was there.
 
 ### Headphones
 - Plug headphones into the **headphone jack** (the one nearest the headphone
-  symbol — **not** the second/sync jack). The speaker stays on as well.
+  symbol — **not** the second/sync jack). The **speaker mutes automatically**
+  while headphones are plugged in, and comes back when you unplug.
 
 ### If it ever locks up
 - **Hold Track 1 + Track 4 together for ~1.2 s** to drop straight back into

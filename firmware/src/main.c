@@ -281,6 +281,16 @@ static int tas_wr(uint8_t reg, uint8_t val)
 }
 static void tas_page(uint8_t p) { (void)tas_wr(0x00, p); }
 
+/* Power the speaker amp on/off (page-1 reg 0x2D: 0x02 = driver up, 0x00 = off).
+ * Used by the headphone auto-mute. Main-thread only (audio thread never touches
+ * I2C after init), so no locking needed. */
+static void tas_set_speaker(int on)
+{
+	tas_page(0x01);
+	(void)tas_wr(0x2D, on ? 0x02 : 0x00);
+	tas_page(0x00);
+}
+
 /* TAS2505 speaker bring-up, following TI Application Reference Guide SLAU472C
  * Section 5.1 ("Play Digital Data Through DAC and Headphone/Speaker Outputs").
  *
@@ -372,6 +382,7 @@ static uint8_t g_cs42_addr = CS42L42_ADDR;
 static uint8_t g_cs42_id8;       /* diag: 8-bit-scheme reg 0x01 readback */
 static uint8_t g_cs42_dev[3];    /* diag: 16-bit DEVID A/B, C/D, E (0x42 0xA4 x = CS42L42) */
 static uint8_t g_hp_pll;         /* diag: PLL lock status readback */
+static volatile int g_hp_in = -1;   /* headphones detected in jack: 1 yes, 0 no, -1 unknown */
 static bool cs42_wr8(uint8_t reg, uint8_t val)
 {
 	uint8_t b[2] = { reg, val };
@@ -419,6 +430,14 @@ static bool tpr(uint16_t reg, uint8_t *val)  /* paged read */
 	return i2c_write_read(i2c_bus, g_cs42_addr, &o, 1, val, 1) == 0;
 }
 
+/* Headphone presence from the CS42L42: DET_STATUS1 (page 0x1B reg 0x77) bit7,
+ * per Tim's wiki "request headphone status". 1=plugged, 0=unplugged, -1=read failed. */
+static int hp_detect_connected(void)
+{
+	uint8_t st;
+	if (!tpr(0x1B77, &st)) return -1;
+	return (st >> 7) & 1;
+}
 #endif
 
 static void hp_codec_init(int pllcfg)
@@ -728,7 +747,15 @@ static volatile int      g_rec_track = -1;       /* the one track currently reco
  * SPK_VOL_Q8 = 48 ~= 0.19 full-scale): the little TAS2505-driven speaker distorts
  * well below full scale, and the looper sums up to 4 tracks + the live monitor, so
  * this also keeps the mix from hard-clipping. Adjustable up to 256 via the buttons. */
-static volatile uint16_t g_master_vol_q8 = 48;
+/* Master volume Q8 (256 = unity). The VOL +/- buttons step a perceptual curve
+ * (~3 dB/step) so each press is an equal-loudness change, smooth from full down
+ * to silence. g_vol_idx = current position. (Per-track faders set vol_q8 directly.) */
+static const uint16_t g_vol_table[] = {
+	0, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 64, 90, 128, 181, 256,
+};
+#define VOL_STEPS ((int)(sizeof(g_vol_table) / sizeof(g_vol_table[0])) - 1)  /* 15 */
+static volatile int      g_vol_idx = 10;          /* -> 45 */
+static volatile uint16_t g_master_vol_q8 = 45;
 static volatile int      g_arm_req[NTRK];         /* main -> engine: track i pressed (start rec) */
 static volatile int      g_stop_req;               /* main -> engine: track released (stop rec) */
 static volatile int      g_del_req[NTRK];          /* main -> engine: double-tap = delete track i */
@@ -1637,9 +1664,9 @@ static void controls_diag(void)
 
 	static const char *const tsn[] = { "---", "ARM", "REC", "DON", "PLY" };
 	int batt = ladder_read(&adc_ladder[LAD_BATT]);   /* raw 12-bit, battery divider */
-	printk("LOOPER %dHz song=%d %s hp=%d usb=%d chg=%d batt=%d bpm=%d vol=%d "
+	printk("LOOPER %dHz song=%d %s hp=%d hpin=%d usb=%d chg=%d batt=%d bpm=%d vol=%d "
 	       "trk[%s %s %s %s] rec=%d ovr=%u rerr=%u werr=%u\n",
-	       (int)LOOP_RATE, (int)g_slot, g_playing ? "PLAY" : "STOP", g_hp_on,
+	       (int)LOOP_RATE, (int)g_slot, g_playing ? "PLAY" : "STOP", g_hp_on, g_hp_in,
 	       usb_present() ? 1 : 0, charging() ? 1 : 0, batt,
 	       g_play_bpm, g_master_vol_q8,
 	       tsn[trk[0].state % 5], tsn[trk[1].state % 5],
@@ -1964,6 +1991,20 @@ int main(void)
 	usb_audio_start();              /* device_next: UAC2 audio-in + CDC console  */
 	feed_wdt();
 
+	/* HEADPHONE AUTO-MUTE boot state: start muted if headphones are already in. */
+#if HP_TIM_TEST
+	if (g_hp_on == 1) {
+		int votes = 0, reads = 0;
+		for (int i = 0; i < 5; i++) {
+			int c = hp_detect_connected();
+			if (c >= 0) { reads++; votes += c; }
+			k_msleep(8);
+		}
+		g_hp_in = (reads > 0 && votes * 2 > reads) ? 1 : 0;
+		tas_set_speaker(!g_hp_in);
+	}
+#endif
+
 	/* ---- power-ON indication: sweep the LEDs on, then clear ---- */
 	for (int i = 0; i < NUM_LEDS; i++) {
 		led_on(i);
@@ -2140,16 +2181,22 @@ int main(void)
 			}
 
 #if HP_TIM_TEST
-			/* AUTO-SWITCH DISABLED: the tip-sense bit read "connected" (0x96)
-			 * in every capture, plugged or not — unreliable on this unit, and
-			 * it falsely MUTED the speaker ("I don't hear anything"). Speaker
-			 * stays always on; headphones always live (the jack itself decides
-			 * what the user hears). Status still polled for the diag only. */
+			/* HEADPHONE AUTO-MUTE: poll the codec jack-detect ~5x/s and mute the
+			 * speaker while headphones are in. Debounced (3 consecutive equal
+			 * reads) so a single noisy read can't flip it; failed reads hold. */
 			if (g_hp_on == 1) {
-				static int hp_poll;
-				if (++hp_poll >= 25) {            /* ~200 ms */
+				static int hp_poll, hp_cand = -1, hp_cnt;
+				if (++hp_poll >= 5) {            /* ~40 ms */
 					hp_poll = 0;
-					{ uint8_t st; (void)tpr(0x1B77, &st); }
+					int c = hp_detect_connected();
+					if (c >= 0) {
+						if (c == hp_cand) {
+							if (++hp_cnt >= 3 && c != g_hp_in) {
+								g_hp_in = c;
+								tas_set_speaker(!c);
+							}
+						} else { hp_cand = c; hp_cnt = 1; }
+					}
 				}
 			}
 #endif
@@ -2179,10 +2226,26 @@ int main(void)
 			else if (vraw == vcand)    { if (++vcnt >= 3) { vcommit = vraw; vcnt = 0; } }
 			else                       { vcand = vraw; vcnt = 1; }
 
-			/* master volume: one step per fresh (debounced) press */
-			if (vcommit != vbefore) {
-				if (vcommit == VOL_UP   && g_master_vol_q8 < 256) g_master_vol_q8 += 16;
-				if (vcommit == VOL_DOWN && g_master_vol_q8 > 16)  g_master_vol_q8 -= 16;
+			/* master volume: one perceptual (~3 dB) step per fresh press, along
+			 * g_vol_table[] — gradual from full (256) down to fully muted (0).
+			 * Hold to repeat for a quick sweep. */
+			{
+				static int64_t vrep_t = -1, vrep_last;
+				int vdir = (vcommit == VOL_UP) ? 1 : (vcommit == VOL_DOWN) ? -1 : 0;
+				int vstep = 0;
+				if (vdir != 0) {
+					int64_t tnow = k_uptime_get();
+					if (vcommit != vbefore) { vstep = 1; vrep_t = tnow; vrep_last = tnow; }
+					else if (tnow - vrep_t >= 500 && tnow - vrep_last >= 110) {
+						vstep = 1; vrep_last = tnow;
+					}
+				} else { vrep_t = -1; }
+				if (vstep) {
+					g_vol_idx += vdir;
+					if (g_vol_idx < 0) g_vol_idx = 0;
+					if (g_vol_idx > VOL_STEPS) g_vol_idx = VOL_STEPS;
+					g_master_vol_q8 = g_vol_table[g_vol_idx];
+				}
 			}
 			/* FWD/RWD rocker -> tempo, 1 BPM PER CLICK for fine control (the old
 			 * version ramped ~37 BPM/s — way too coarse). Holding repeats slowly
