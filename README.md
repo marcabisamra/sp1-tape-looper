@@ -19,9 +19,9 @@ re-flashing the firmware.
   loop and it adds another bar, and another, in whole multiples of the base — so a
   2-bar melody can sit over a 1-bar drum loop, all locked in time.
 - 🔇 **Tap to mute / unmute**, **double-tap to erase** a track.
-- ▶️ **Streamed straight off the internal flash** — comes in two builds: **24 kHz**
-  (the default, handles a full multi-track jam) and **48 kHz** (best fidelity,
-  fewer simultaneous tracks). See *Which file to flash* below.
+- ▶️ **Streamed straight off the internal flash** — comes in **three builds**: a
+  **24 kHz** default that handles a full multi-track jam, plus two **48 kHz**
+  options for best fidelity. See *Which file to flash* below.
 - 📼 **Tape-style tempo** — the FWD/RWD rocker changes playback speed *and* pitch
   together, one BPM per click.
 - 🥁 **Tempo detection** — the first loop's rhythm is analysed to estimate its
@@ -46,8 +46,9 @@ re-flashing the firmware.
 ```
 sp-1 looper/
 ├── README.md                     ← you are here
-├── sp1_looper.bin                ← MAIN build — 24 kHz, MIDI on (flash this one)
-├── sp1_looper_48kHz_no_midi.bin  ← backup build — 48 kHz, no MIDI (see below)
+├── sp1_looper.bin                            ← MAIN — 24 kHz, MIDI (flash this one)
+├── sp1_looper_48kHz_no_midi.bin              ← 48 kHz, no MIDI, different-length loops
+├── sp1_looper_48kHz_no_midi_same_length.bin  ← 48 kHz, no MIDI, all-same-length (smoothest)
 └── firmware/                     ← the full source code (for reading / rebuilding)
     ├── src/
     │   ├── main.c         the whole looper: audio engine, controls, power, USB
@@ -65,31 +66,37 @@ If you just want to **use** it, you only need one of the two `.bin` files
 
 ### Which file to flash
 
-**Most people want `sp1_looper.bin`** (the 24 kHz build). Here's the difference:
+**Most people want `sp1_looper.bin`** (the 24 kHz build). The full menu:
 
-| | `sp1_looper.bin` *(main)* | `sp1_looper_48kHz_no_midi.bin` *(backup)* |
-|---|---|---|
-| **Sample rate** | 24 kHz | 48 kHz |
-| **Best for** | a **full multi-track jam** (several layers + recording) | **maximum fidelity** with a couple of tracks |
-| **MIDI / sync out** | ✅ yes | ❌ no — all headroom goes to audio |
-| **Character** | warm / lo-fi (like a classic sampler) | crisp, full top end |
+| Build | Rate | MIDI | Loop lengths | Best for |
+|---|---|---|---|---|
+| **`sp1_looper.bin`** *(main)* | 24 kHz | ✅ | mix & match | a full multi-track jam |
+| `sp1_looper_48kHz_no_midi.bin` | 48 kHz | ❌ | mix & match | best fidelity + different-length loops |
+| `sp1_looper_48kHz_no_midi_same_length.bin` | 48 kHz | ❌ | all the same | the smoothest 48 kHz multi-track |
 
-The SP-1's internal flash can only stream so many tracks at once. **24 kHz halves
-the data per track, so it comfortably handles several layered tracks *while*
-recording another** — that's why it's the default. The trade is the very top
-octave of "air" (cymbal sparkle); most people won't notice it on the built-in
-speaker, and it gives the 24 kHz build a pleasant warm character either way.
+**The rate (24 vs 48 kHz).** The SP-1's flash can only stream so many tracks at
+once. **24 kHz halves the data per track, so it comfortably handles several
+layered tracks *while* recording another** — that's why it's the default. The
+trade is the top octave of "air" (cymbal sparkle); most people won't notice it on
+the built-in speaker, and it gives 24 kHz a warm, classic-sampler character. The
+**48 kHz** builds sound crisper but run the flash near its limit, so they're
+happiest with fewer simultaneous tracks; MIDI is left out of them so all the
+bandwidth goes to the audio.
 
-The **48 kHz build** sounds crisper but runs the flash near its limit, so it's
-happiest with fewer simultaneous tracks. MIDI is left out of it so every bit of
-bandwidth goes to the audio. Flash it if you want the best fidelity and aren't
-stacking a big jam.
+**The two 48 kHz builds** differ only in the looping model:
+- **`…_no_midi.bin`** lets tracks be **different lengths** — hold an overdub past
+  the loop to extend it (see the controls below).
+- **`…_no_midi_same_length.bin`** keeps it simplest: **the first loop sets one
+  length and every track shares it.** That's the leanest the engine ever runs, so
+  it's the smoothest 48 kHz option for stacking tracks — you just give up the
+  different-length trick.
 
-> The two builds use **different save formats**, so switching between them
+> Each build uses its **own save format**, so switching between any of them
 > reformats the loop storage (saved loops are wiped). Pick one for a session.
 
-The source in `firmware/` builds the 24 kHz version; the 48 kHz build is the same
-source with two compile flags changed (`DECIM` 2→1 and `MIDI_SYNC_ENABLE` 1→0).
+The `firmware/` source builds the 24 kHz main; the 48 kHz builds are the same
+project compiled at the higher rate with MIDI off (the *same-length* build also
+uses the project's simpler fixed-length engine).
 
 ---
 
