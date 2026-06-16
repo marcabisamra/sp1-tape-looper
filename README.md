@@ -13,16 +13,23 @@ re-flashing the firmware.
 ### Features
 - 🎛️ **4 independent loop tracks**, each with its own fader for level.
 - 🎙️ **Hold-to-record with auto-start** — hold a track button and recording
-  begins on the *first sound it hears* (no clipped attacks); the first recording
-  sets the loop length, later ones overdub in time with it.
+  begins on the *first sound it hears* (no clipped attacks). The first recording
+  sets the base loop length; later ones overdub in time with it.
+- 🔁 **Different-length loops** — keep *holding* an overdub past the end of the
+  loop and it adds another bar, and another, in whole multiples of the base — so a
+  2-bar melody can sit over a 1-bar drum loop, all locked in time.
 - 🔇 **Tap to mute / unmute**, **double-tap to erase** a track.
-- ▶️ **Full 48 kHz playback** streamed straight off the internal flash.
+- ▶️ **Streamed straight off the internal flash** — comes in two builds: **24 kHz**
+  (the default, handles a full multi-track jam) and **48 kHz** (best fidelity,
+  fewer simultaneous tracks). See *Which file to flash* below.
 - 📼 **Tape-style tempo** — the FWD/RWD rocker changes playback speed *and* pitch
   together, one BPM per click.
 - 🥁 **Tempo detection** — the first loop's rhythm is analysed to estimate its
   BPM, which drives the beat LEDs and the MIDI clock grid.
 - 🎹 **MIDI clock + Pocket-Operator sync out** of the sync jack — start/stop +
-  24-PPQN clock for MIDI gear, and a 2-PPQN pulse for Korg/Volca/PO sync.
+  24-PPQN clock for MIDI gear, and a 2-PPQN pulse for Korg/Volca/PO sync. The MIDI
+  bytes are clocked by a hardware timer, so syncing gear never disturbs the audio.
+  (On the 24 kHz build; the 48 kHz build ships without MIDI.)
 - 💾 **4 song slots**, each remembering its own tracks and tempo; loops persist
   across power-off *and* across re-flashing the firmware.
 - 🎧 **Speaker and headphone output**, both clean — speaker auto-mutes when
@@ -38,9 +45,10 @@ re-flashing the firmware.
 
 ```
 sp-1 looper/
-├── README.md          ← you are here
-├── sp1_looper.bin     ← the firmware to flash onto the SP-1
-└── firmware/          ← the full source code (for reading / rebuilding)
+├── README.md                     ← you are here
+├── sp1_looper.bin                ← MAIN build — 24 kHz, MIDI on (flash this one)
+├── sp1_looper_48kHz_no_midi.bin  ← backup build — 48 kHz, no MIDI (see below)
+└── firmware/                     ← the full source code (for reading / rebuilding)
     ├── src/
     │   ├── main.c         the whole looper: audio engine, controls, power, USB
     │   ├── sp1_emmc.c     the flash-memory driver (stores/loads the loops)
@@ -51,9 +59,37 @@ sp-1 looper/
     └── Kconfig
 ```
 
-If you just want to **use** it, you only need `sp1_looper.bin` (Section 2–3).
-If you want to **read or change** how it works, start with `firmware/src/main.c`
-— it opens with a full architecture overview (Section 5 summarizes it).
+If you just want to **use** it, you only need one of the two `.bin` files
+(Section 2–3). If you want to **read or change** how it works, start with
+`firmware/src/main.c` — it opens with a full architecture overview.
+
+### Which file to flash
+
+**Most people want `sp1_looper.bin`** (the 24 kHz build). Here's the difference:
+
+| | `sp1_looper.bin` *(main)* | `sp1_looper_48kHz_no_midi.bin` *(backup)* |
+|---|---|---|
+| **Sample rate** | 24 kHz | 48 kHz |
+| **Best for** | a **full multi-track jam** (several layers + recording) | **maximum fidelity** with a couple of tracks |
+| **MIDI / sync out** | ✅ yes | ❌ no — all headroom goes to audio |
+| **Character** | warm / lo-fi (like a classic sampler) | crisp, full top end |
+
+The SP-1's internal flash can only stream so many tracks at once. **24 kHz halves
+the data per track, so it comfortably handles several layered tracks *while*
+recording another** — that's why it's the default. The trade is the very top
+octave of "air" (cymbal sparkle); most people won't notice it on the built-in
+speaker, and it gives the 24 kHz build a pleasant warm character either way.
+
+The **48 kHz build** sounds crisper but runs the flash near its limit, so it's
+happiest with fewer simultaneous tracks. MIDI is left out of it so every bit of
+bandwidth goes to the audio. Flash it if you want the best fidelity and aren't
+stacking a big jam.
+
+> The two builds use **different save formats**, so switching between them
+> reformats the loop storage (saved loops are wiped). Pick one for a session.
+
+The source in `firmware/` builds the 24 kHz version; the 48 kHz build is the same
+source with two compile flags changed (`DECIM` 2→1 and `MIDI_SYNC_ENABLE` 1→0).
 
 ---
 
@@ -87,7 +123,7 @@ Each track button does three things depending on how you press it:
 
 | Gesture | What it does |
 |---|---|
-| **Hold** (and keep holding) | **Arms recording** into that track — capture begins on the **first sound** it hears (so a held breath or count-in doesn't get recorded), and you can let go any time to stop. The very first recording sets the loop length. While other tracks play, a new recording overdubs in time with them. |
+| **Hold** (and keep holding) | **Records** into that track — capture begins on the **first sound** it hears (so a held breath or count-in doesn't get recorded). The very first recording sets the **base loop length**. For overdubs: **let go after one loop** for a same-length layer, or **keep holding** to extend the track to 2, 3… bars (whole multiples of the base) — so tracks can be *different lengths* yet stay locked in time. |
 | **Quick tap** | **Mutes / unmutes** that track (its content is kept — tap again to bring it back). |
 | **Double-tap** | **Deletes** that track. |
 
@@ -122,8 +158,10 @@ whatever was there.
   pulse** for Korg / Volca / Pocket-Operator–style sync.
 - Use the appropriate **3.5 mm TRS adapter** for whatever you're driving (a
   TRS→MIDI-DIN adapter for MIDI, or a sync cable for PO/Volca).
-- This is **new and not yet widely tested** — if a MIDI device reads it inverted,
-  it's a one-line firmware flag (`MIDI_INVERT`) to flip.
+- The MIDI byte timing is generated by a **hardware timer**, so driving external
+  gear never glitches the audio. **MIDI is on the 24 kHz `sp1_looper.bin` build
+  only** — the 48 kHz build leaves it out for headroom. If a MIDI device reads it
+  inverted, it's a one-line firmware flag (`MIDI_INVERT`) to flip.
 
 ### If it ever locks up
 - **Hold Track 1 + Track 4 together for ~1.2 s** to drop straight back into
@@ -133,17 +171,23 @@ whatever was there.
 
 ## 4. Audio quality, honestly
 
-- **Playback and recording are both 48 kHz, 16-bit.** Each track is recorded
-  and played at full rate — the only compromise versus the stock player is that
-  tracks are **mono** (the loop bus sums to mono before it's written).
-- **The mono-ness is a storage-bandwidth choice, not a quality cap.** Each loop
-  track is written to flash *independently* and in real time; mono keeps the
-  write rate well inside what the flash can sustain while it's also reading the
-  other three tracks back for playback. (Earlier RAM-only versions topped out
-  around 8 kHz — streaming straight to flash is what unlocked full rate.)
-- The flash occasionally pauses for its own internal housekeeping; the firmware
-  reads ahead to hide this, so on a busy 4-track jam you may very rarely hear a
-  tiny hiccup. Nothing is damaged and the loops on disk stay intact.
+- **Tracks are mono, 16-bit**, recorded and played at the build's sample rate —
+  **24 kHz** on `sp1_looper.bin`, **48 kHz** on the no-MIDI backup. (Mono, rather
+  than the stock player's stereo, is a storage-bandwidth choice.)
+- **Why two rates?** Every playing track is a separate stream read off the flash
+  in real time, *while* the track you're recording is written back. The flash has
+  a hard ceiling on how many of those it can sustain at once. 48 kHz reaches that
+  ceiling at just a few simultaneous tracks; **24 kHz halves the data per track,
+  so it keeps a whole multi-track jam (several layers + recording) glitch-free.**
+  That is the entire reason 24 kHz is the default.
+- **What you give up at 24 kHz** is the top octave above ~12 kHz — cymbal "air"
+  and sparkle. On the built-in speaker (which rolls off up there anyway) it's hard
+  to hear at all; on headphones it reads as a slightly warmer, lo-fi tone — the
+  sound classic samplers were built on. The 48 kHz backup keeps the full top end
+  for when fidelity matters more than track count.
+- The flash occasionally pauses for its own housekeeping; the firmware reads ahead
+  to hide it, so even on a busy jam you'd at most rarely hear a tiny hiccup.
+  Nothing is damaged and the loops on disk stay intact.
 
 ---
 
@@ -182,7 +226,8 @@ audio to **its own** region; the other three are never rewritten — they're jus
 being *read* for monitoring. Mixing happens live in the audio engine and is
 never stored. So an overdub is one region being written while three are read,
 all independent — no read-modify-write of a combined file. Each track is mono
-`int16` at 48 kHz. Regions are laid out so write bursts line up with the flash's
+`int16` at the build's loop rate (24 kHz default, 48 kHz on the backup). Regions
+are laid out so write bursts line up with the flash's
 8 KB internal pages, and the flash is driven through the nRF's hardware SPI
 engine at 16 MHz with a CRC check + retry on every block, so the bus is both
 fast and self-correcting.
@@ -195,7 +240,7 @@ data-structure docs; the rest is its own thing.)
 like:
 
 ```
-LOOPER 48000Hz song=1 PLAY hp=1 usb=1 chg=1 batt=2230 bpm=80 vol=48 trk[PLY PLY --- ---] rec=-1 ovr=0 rerr=0 werr=0
+LOOPER 24000Hz song=1 PLAY hp=1 usb=1 chg=1 batt=2230 bpm=80 vol=48 trk[PLY PLY --- ---] rec=-1 ovr=0 rerr=0 werr=0
 ```
 
 The healthy signs are `ovr=0` (no recording-buffer overflow) and `rerr=0

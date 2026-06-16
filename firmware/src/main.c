@@ -46,6 +46,7 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/irq.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/drivers/adc.h>
@@ -649,8 +650,8 @@ static volatile uint32_t g_ring_overflows;
  * start at the next block (~38 ms = effectively instant) and record exactly one
  * loop, wrapping. "BPM" is just the varispeed label (80 = 1.0x); there is NO
  * tempo grid — the beat constants below only pace the LED pulse + MIDI clock. */
-#define DECIM            1u
-#define LOOP_RATE        (I2S_TRUE_HZ / DECIM)             /* 48000 Hz mono — FULL RATE, no decimation */
+#define DECIM            2u
+#define LOOP_RATE        (I2S_TRUE_HZ / DECIM)             /* 24000 Hz mono — HALF RATE: ~half the eMMC read/write bandwidth, ~2x the multi-track headroom (trade: ~12 kHz audio bandwidth) */
 #define SAMP_PER_BLK     (EMMC_BLOCK_SIZE / 2u)            /* 256 int16 / block */
 #define LOOP_BPM_BASE    80u                               /* BPM label for 1.0x varispeed */
 /* FULL-RATE LOOPS: the SPIM2 hardware eMMC path measures 1333 blk/s sustained
@@ -690,14 +691,23 @@ static volatile uint32_t g_ring_overflows;
  * wipe-on-reflash build stamp is gone — user prefers persistence; double-tap a
  * track to delete it instead). Storage only re-formats if this constant or the
  * layout ever changes. */
-#define META_MAGIC       0x53503933u                       /* 'SP93' — 48 kHz full-rate layout, persistent */
+#define META_MAGIC       0x53453234u                       /* 'SE24' — 24 kHz SEGMENT layout (per-track lengths) */
 static inline uint32_t trk_blk(uint32_t slot, uint32_t t)
 {
 	return SLOT0_BLOCK + (slot * NTRK + t) * TRACK_BLOCKS;
 }
 /* loop_len = this song's loop length in loop-samples (a whole number of bars,
  * 0 = empty/no loop yet). Saved so a song resumes at its own length + tempo. */
-struct slot_state { uint32_t speed_q16; uint32_t loop_len; uint8_t present[NTRK]; };
+/* SEGMENT looper: each track also remembers its own length (a whole multiple of
+ * the base loop_len) and its phase anchor, so a song reloads with the same
+ * per-track loop lengths it was recorded with. */
+struct slot_state {
+	uint32_t speed_q16;
+	uint32_t loop_len;
+	uint8_t  present[NTRK];
+	uint32_t trk_len[NTRK];      /* per-track length in eMMC blocks (0 -> base) */
+	uint32_t trk_start[NTRK];    /* per-track segment-0 transport-block anchor */
+};
 struct meta_blk {
 	uint32_t magic;
 	uint32_t cur_slot;
@@ -725,6 +735,16 @@ struct looptrk {
 	volatile uint8_t  starved;           /* ring underran; silent until half-refilled */
 	uint32_t flush_blk;                  /* streamer: next loop block to write */
 	uint32_t flush_mod;                  /* wrap the flush at this many blocks (overdub = loop len) */
+	/* SEGMENT looper: a track's length is a whole multiple of the base loop. The
+	 * first take sets the base; an overdub records ONE base-length segment as a
+	 * bounded take, and if the button is still held when the segment boundary is
+	 * reached it appends another base-length segment (and another), each one a
+	 * bounded take through the same proven flush path -- never the old open-ended
+	 * "record until release, then figure out the length". len_blocks is the
+	 * track's total length; start_blk is the transport block where its segment 0
+	 * began (the phase anchor used to line playback up with where it was cut). */
+	uint32_t len_blocks;                 /* this track's total length in eMMC blocks (N * base) */
+	uint32_t start_blk;                  /* transport block of this take's segment 0 (playback anchor) */
 	/* AUTO-START-ON-SOUND: a take ARMS on the button hold and the recorder only
 	 * begins capturing at the first input past SOUND_THRESHOLD (or SOUND_WAIT_TICKS
 	 * as a fallback), so dead air before the first note never lands in the loop. */
@@ -783,6 +803,9 @@ static volatile int g_play_bpm = 80;
 /* auto-start thresholds (loop-sample domain @ LOOP_RATE) */
 #define SOUND_THRESHOLD  1000              /* int16 level (~ -30 dBFS) */
 #define SOUND_WAIT_TICKS (LOOP_RATE * 4u)  /* ~4 s fallback */
+/* track-button gesture timing */
+#define HOLD_RECORD_MS   180   /* physical button-down this long (ms) => RECORD; shorter => TAP */
+#define DTAP_GAP_MS      420   /* 2nd tap within this of the 1st tap's release => DOUBLE-TAP delete */
 
 /* BEAT GRID for the LED pulse + MIDI clock — defaults to the nominal beat, but
  * the first-track TEMPO ESTIMATOR replaces it with the detected beat period so
@@ -930,7 +953,12 @@ static void looper_audio_block(int16_t *s)
 		if (g_rec_track == i) g_rec_track = -1;
 		trk[i].state = TS_EMPTY;
 		trk[i].rec_silence = 0; trk[i].rec_target = 0; trk[i].rec_count = 0; trk[i].muted = 0;
-		if (g_slot < NUM_SLOTS) g_meta.slot[g_slot].present[i] = 0;
+		trk[i].len_blocks = 0; trk[i].start_blk = 0;     /* drop all its segments */
+		if (g_slot < NUM_SLOTS) {
+			g_meta.slot[g_slot].present[i] = 0;
+			g_meta.slot[g_slot].trk_len[i] = 0;
+			g_meta.slot[g_slot].trk_start[i] = 0;
+		}
 		int any = 0;
 		for (int k = 0; k < NTRK; k++)
 			if (trk[k].state != TS_EMPTY ||
@@ -977,6 +1005,7 @@ static void looper_audio_block(int16_t *s)
 					g_loop_len = blocks * SAMP_PER_BLK;
 					g_loop_blocks = blocks;
 					trk[i].rec_target = g_loop_len;
+					trk[i].len_blocks = g_loop_blocks;   /* base take = one segment */
 					tempo_finish();         /* set the detected beat grid + BPM */
 					if (g_slot < NUM_SLOTS) {
 						g_meta.slot[g_slot].loop_len = g_loop_len;
@@ -1034,6 +1063,10 @@ static void looper_audio_block(int16_t *s)
 		trk[i].flush_mod = MAX_LOOP_BLOCKS;
 		trk[i].rec_count = 0; trk[i].rec_silence = 0; trk[i].rec_target = 0; trk[i].muted = 0;
 		trk[i].wait_peak = 0; trk[i].wait_ticks = 0;
+		/* NOTE: len_blocks/start_blk are NOT reset here -- they are set when the
+		 * first sound lands (TS_REC). Leaving them intact means a re-record that
+		 * is cancelled (released before any sound) returns the track to PLAY with
+		 * its ORIGINAL length, not a clobbered one. */
 		trk[i].state = TS_ARMED;
 		g_rec_track = i;
 	}
@@ -1068,6 +1101,15 @@ static void looper_audio_block(int16_t *s)
 			trk[i].state = pres ? TS_PLAY : TS_EMPTY;
 			trk[i].p_w = 0;
 			trk[i].rec_silence = 0; trk[i].rec_target = 0; trk[i].rec_count = 0; trk[i].muted = 0;
+			/* SEGMENT: restore this track's own length + phase anchor (older saves
+			 * with trk_len==0 fall back to the base length = one segment). */
+			if (pres && g_slot < NUM_SLOTS) {
+				uint32_t L = g_meta.slot[g_slot].trk_len[i];
+				trk[i].len_blocks = L ? L : g_loop_blocks;
+				trk[i].start_blk  = g_meta.slot[g_slot].trk_start[i];
+			} else {
+				trk[i].len_blocks = 0; trk[i].start_blk = 0;
+			}
 			if (pres) any = 1;
 		}
 		g_loop_active = any && (g_loop_len > 0);
@@ -1146,13 +1188,19 @@ static void looper_audio_block(int16_t *s)
 							tempo_reset();
 							rt->flush_blk = 0; rt->flush_mod = MAX_LOOP_BLOCKS;
 							rt->rec_target = 0;
+							rt->start_blk = 0;        /* the base take anchors the grid at 0 */
+							rt->len_blocks = 0;       /* set when the held length is known */
 						} else {
-							/* overdub: anchor at the current transport block and
-							 * record one base loop, wrapping (in sync). */
-							uint32_t sb = (g_consume_pos / SAMP_PER_BLK) % g_loop_blocks;
-							rt->flush_blk = sb;
-							rt->flush_mod = g_loop_blocks;
+							/* overdub: SEGMENT recorder. Capture ONE base-length
+							 * segment as a bounded take, contiguously from the track's
+							 * block 0 (linear flush, no wrap -- the same proven path
+							 * the base take uses). If the button is still held at the
+							 * segment boundary, the rec loop appends another segment.
+							 * start_blk anchors playback to where recording began. */
+							rt->flush_blk = 0; rt->flush_mod = MAX_LOOP_BLOCKS;
 							rt->rec_target = g_loop_len;
+							rt->start_blk = g_consume_pos / SAMP_PER_BLK;
+							rt->len_blocks = g_loop_blocks;
 						}
 						rt->r_w = 0; rt->r_r = 0; rt->rec_count = 0; rt->rec_silence = 0;
 						rt->state = TS_REC;
@@ -1172,6 +1220,7 @@ static void looper_audio_block(int16_t *s)
 							g_loop_len = MAX_LOOP_SAMPLES;
 							g_loop_blocks = g_loop_len / SAMP_PER_BLK;
 							rt->rec_target = g_loop_len;
+							rt->len_blocks = g_loop_blocks;
 							tempo_finish();
 							if (g_slot < NUM_SLOTS) {
 								g_meta.slot[g_slot].loop_len = g_loop_len;
@@ -1180,7 +1229,24 @@ static void looper_audio_block(int16_t *s)
 							rt->state = TS_DONE; g_rec_track = -1;
 						}
 					} else if (rt->rec_count >= rt->rec_target) {
-						rt->state = TS_DONE; g_rec_track = -1;
+						/* SEGMENT boundary. If the button is still held (the take has
+						 * not been released -> rec_silence not set) and the track
+						 * region has room, append another base-length segment and keep
+						 * recording; otherwise finish the take here. Releasing thus
+						 * rounds the length UP to the segment you were holding into,
+						 * padding any remainder with silence. */
+						if (!rt->rec_silence &&
+						    rt->len_blocks + g_loop_blocks <= MAX_LOOP_BLOCKS) {
+							/* cap at MAX_LOOP_BLOCKS, the SAME modulus the linear
+							 * flush wraps at (flush_mod), so the recorder's write
+							 * address and the player's read address agree right up to
+							 * the top of the track region -- never wrap a final
+							 * segment back onto this take's own segment 0. */
+							rt->rec_target += g_loop_len;
+							rt->len_blocks += g_loop_blocks;
+						} else {
+							rt->state = TS_DONE; g_rec_track = -1;
+						}
 					}
 				}
 
@@ -1333,7 +1399,11 @@ static void streamer_thread(void *a, void *b, void *c)
 					/* Start playback BLOCK-ALIGNED at the live playhead. p_w must be a
 					 * multiple of SAMP_PER_BLK or the streamer writes each eMMC block at
 					 * a misaligned ring offset and the track plays ~16 ms out of sync. */
-					if (slot < NUM_SLOTS) g_meta.slot[slot].present[i] = 1;
+					if (slot < NUM_SLOTS) {
+						g_meta.slot[slot].present[i]   = 1;
+						g_meta.slot[slot].trk_len[i]   = t->len_blocks;  /* SEGMENT: per-track length */
+						g_meta.slot[slot].trk_start[i] = t->start_blk;   /* + phase anchor */
+					}
 					g_meta_save_req = 1;             /* persist the new recording */
 					t->p_w = g_consume_pos & ~(SAMP_PER_BLK - 1u);
 					t->state = TS_PLAY;
@@ -1380,12 +1450,18 @@ static void streamer_thread(void *a, void *b, void *c)
 				if ((int32_t)(t->p_w - cpos) >
 				    (int32_t)(RING_SAMPLES - 16u * SAMP_PER_BLK))
 					continue;          /* this ring is fed */
-				uint32_t gb = g_loop_blocks ? g_loop_blocks : 1u;
+				/* SEGMENT: this track loops at ITS OWN length (a whole multiple
+				 * of the base), not the shared g_loop_blocks. */
+				uint32_t gb = t->len_blocks ? t->len_blocks
+					    : (g_loop_blocks ? g_loop_blocks : 1u);
 				/* Snapshot the frontier: the (higher-priority) audio thread
 				 * can reset p_w mid-eMMC-read on a song switch / restart.
 				 * Fill from the snapshot, COMMIT only if unchanged. */
 				uint32_t pw = t->p_w;
-				uint32_t loop_blk = (pw / SAMP_PER_BLK) % gb;
+				/* phase-anchored loop position: (pw_block - start_blk) mod gb, in
+				 * modular form so it is safe when pw_block < start_blk (restart). */
+				uint32_t pwb = pw / SAMP_PER_BLK;
+				uint32_t loop_blk = ((pwb % gb) + gb - (t->start_blk % gb)) % gb;
 				uint32_t n = 16u;
 				if (loop_blk + n > gb) n = gb - loop_blk;  /* stop at the wrap */
 				uint32_t blkno = trk_blk(slot, (uint32_t)i) + loop_blk;
@@ -1429,6 +1505,16 @@ static void streamer_thread(void *a, void *b, void *c)
 #define MIDI_BIT_US   32u    /* 31250 baud                                    */
 #define PO_PULSE_MS   5      /* sync pulse width                              */
 #define PO_DIV        12u    /* 24-PPQN clock / 12 = 2 PPQN (1/8-note pulses) */
+/* MIDI/PO SYNC OUT — ENABLED, streaming-safe. The OLD bit-bang held irq_lock()
+ * ~320us per byte (10 bits x 32us), masking the eMMC SPIM + I2S DMA ISRs ~32x/s
+ * while playing -> stole the streamer's worst-case margin = the >3-track crackle
+ * (v1/v2 had no MIDI thread). NOW the 10 UART bits are clocked out by a hardware
+ * TIMER, one bit per tiny (~0.5us) ISR, with interrupts LEFT ON the whole time,
+ * so the streamer is never starved. The PNP inverts the line, which a hardware
+ * UARTE cannot compensate for -- the timer's ISR drives the bit via midi_line()
+ * which applies MIDI_INVERT, so the timing is hardware-accurate AND the polarity
+ * is right. Set to 0 to compile MIDI out entirely. */
+#define MIDI_SYNC_ENABLE 1
 
 static K_THREAD_STACK_DEFINE(midi_stack, 768);
 static struct k_thread   midi_tcb;
@@ -1457,16 +1543,61 @@ static inline void midi_line(int mark)   /* drive the MIDI line; mark=1 is idle/
 	else   NRF_P0->OUTCLR = (1u << MIDI_PIN);
 }
 
+/* Streaming-safe MIDI byte TX: a free hardware timer (TIMER2 — the board binds
+ * no TIMER) clocks out the UART bits one per ISR. The start bit is driven when
+ * the byte is queued; the timer then drives the 8 data bits (LSB first) + stop
+ * bit at MIDI_BIT_US spacing. Interrupts stay ON throughout, so the eMMC/I2S
+ * ISRs are never masked (the fix for the >3-track crackle). Only midi_thread
+ * calls midi_send, sequentially, and MIDI bytes are >=31ms apart in practice,
+ * so the single-byte-in-flight guard (midi_tx_done) never actually contends. */
+#define MIDI_TIMER       NRF_TIMER2
+#define MIDI_TIMER_IRQn  TIMER2_IRQn
+static volatile uint16_t midi_tx_bits;     /* remaining frame, LSB = next bit out */
+static volatile uint8_t  midi_tx_left;     /* bits still to clock (0 = done) */
+static struct k_sem      midi_tx_done;     /* 1 = line free for the next byte */
+
+static void midi_timer_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+	MIDI_TIMER->EVENTS_COMPARE[0] = 0;
+	(void)MIDI_TIMER->EVENTS_COMPARE[0];        /* flush the clear (nRF anomaly) */
+	if (midi_tx_left) {
+		midi_line(midi_tx_bits & 1u);       /* drive this bit (PNP-inverted) */
+		midi_tx_bits >>= 1;
+		midi_tx_left--;
+	} else {
+		MIDI_TIMER->TASKS_STOP = 1;
+		midi_line(1);                       /* leave the line idle at mark */
+		k_sem_give(&midi_tx_done);
+	}
+}
+
+static void midi_timer_init(void)
+{
+	MIDI_TIMER->MODE      = TIMER_MODE_MODE_Timer;
+	MIDI_TIMER->BITMODE   = TIMER_BITMODE_BITMODE_16Bit;
+	MIDI_TIMER->PRESCALER = 4;                          /* 16MHz/16 = 1us tick */
+	MIDI_TIMER->CC[0]     = MIDI_BIT_US;                /* fire every 32us = 1 bit */
+	MIDI_TIMER->SHORTS    = TIMER_SHORTS_COMPARE0_CLEAR_Msk;
+	MIDI_TIMER->INTENSET  = TIMER_INTENSET_COMPARE0_Msk;
+	k_sem_init(&midi_tx_done, 1, 1);                    /* start with the line free */
+	IRQ_CONNECT(MIDI_TIMER_IRQn, 2, midi_timer_isr, NULL, 0);
+	irq_enable(MIDI_TIMER_IRQn);
+}
+
 static void midi_send(uint8_t b)
 {
-	unsigned int key = irq_lock();           /* keep the 10 bits evenly spaced */
-	midi_line(0); k_busy_wait(MIDI_BIT_US);  /* start bit (space) */
-	for (int i = 0; i < 8; i++) {            /* 8 data bits, LSB first */
-		midi_line((b >> i) & 1);
-		k_busy_wait(MIDI_BIT_US);
-	}
-	midi_line(1); k_busy_wait(MIDI_BIT_US);  /* stop bit (mark) */
-	irq_unlock(key);
+	/* wait for any in-flight byte to finish (in practice it always has) */
+	if (k_sem_take(&midi_tx_done, K_MSEC(5)) != 0) return;   /* stuck -> skip byte */
+	/* The ENTIRE 10-bit frame is timer-clocked -- start(0), d0..d7 (LSB first),
+	 * stop(1). The START bit is the timer's FIRST event, NOT driven here, so every
+	 * edge is timer-paced; a thread preemption between here and TASKS_START can no
+	 * longer stretch the start bit and corrupt the framing. */
+	midi_tx_bits = ((uint16_t)b << 1) | (1u << 9);   /* bit0=start(0), d0..d7 @1..8, stop @9 */
+	midi_tx_left = 10;                                /* start + 8 data + stop */
+	midi_line(1);                                     /* hold idle/mark until the 1st ISR */
+	MIDI_TIMER->TASKS_CLEAR = 1;
+	MIDI_TIMER->TASKS_START = 1;                      /* 1st ISR (+32us) emits the START bit */
 }
 
 static void midi_thread(void *a, void *b, void *c)
@@ -1590,12 +1721,17 @@ static void audio_init(void)
 			streamer_thread, NULL, NULL, NULL,
 			K_PRIO_PREEMPT(5), 0, K_NO_WAIT);
 
-	/* MIDI clock + PO sync out over the SYNC jack (bit-banged GPIO, TimK pins).
-	 * Low priority; sends bytes when the engine flags them. */
+	/* MIDI clock + PO sync out over the SYNC jack (TimK pins). The MIDI byte TX
+	 * is now clocked by a hardware timer (midi_timer_init) so it no longer masks
+	 * interrupts -- the >3-track crackle fix. Thread is low priority; it just
+	 * flags bytes + drives the PO-sync GPIO pulse. */
+#if MIDI_SYNC_ENABLE
 	midi_pins_init();
+	midi_timer_init();
 	k_thread_create(&midi_tcb, midi_stack, K_THREAD_STACK_SIZEOF(midi_stack),
 			midi_thread, NULL, NULL, NULL,
 			K_PRIO_PREEMPT(6), 0, K_NO_WAIT);
+#endif
 
 	/* Wait until the audio thread has the I2S stream running (BCLK live), then
 	 * configure the codec here on the main thread. The audio thread keeps the
@@ -2261,50 +2397,48 @@ int main(void)
 				cand = raw; cand_cnt = 1;
 			}
 
-			/* TRACK buttons, three gestures:
-			 *   TAP  (<300 ms)            -> MUTE/unmute the track (audio off,
-			 *                                content kept — tap again to bring
-			 *                                it back)
-			 *   HOLD (>=300 ms)           -> RECORD while held (take starts at
-			 *                                the 300 ms mark, stops on release)
-			 *   DOUBLE-TAP (2nd press
-			 *      <400 ms after a tap)   -> DELETE the track
-			 * Recording no longer starts on the press edge — a press only arms
-			 * a pending hold, so taps can't leave record stubs on a track. */
-			static int64_t tap_press_t[NTRK], tap_release_t[NTRK];
-			static int hold_pend = -1;       /* track whose press awaits 300 ms */
+			/* TRACK buttons:
+			 *   HOLD (button physically down >= HOLD_RECORD_MS) -> RECORD (auto-start
+			 *      then captures from the first sound). A quick tap never lasts this long.
+			 *   TAP (released before that) -> MUTE / unmute.
+			 *   DOUBLE-TAP (a 2nd tap within DTAP_GAP_MS of the 1st tap's release) -> DELETE.
+			 * Tap-vs-hold is decided by the PHYSICAL down-time and double-tap by the
+			 * rhythm of two quick taps, so taps/double-taps stay reliable regardless of
+			 * how fast recording arms (a quick ~HOLD_RECORD_MS hold instead of 300ms). */
+			static int64_t press_t[NTRK];        /* when committed first named this track */
+			static int64_t tap_deadline[NTRK];   /* >0: a single tap awaiting a possible 2nd */
+			static uint8_t armed_press[NTRK];    /* this press already armed a take */
 			if (committed != before) {
 				int64_t tnow = k_uptime_get();
-				if (before >= TRK_1 && before <= TRK_4) {
+				if (before >= TRK_1 && before <= TRK_4) {       /* RELEASE edge */
 					int ti = (int)before;
-					g_stop_req = 1;          /* released -> stop a running take */
-					tap_release_t[ti] = tnow;
-					if (hold_pend == ti) {   /* released before 300 ms = TAP */
-						hold_pend = -1;
-						trk[ti].muted = !trk[ti].muted;
+					if (armed_press[ti]) {
+						armed_press[ti] = 0;
+						g_stop_req = 1;                  /* end the take */
+					} else if (tap_deadline[ti] > 0 && tnow <= tap_deadline[ti]) {
+						tap_deadline[ti] = 0;            /* 2nd tap in time -> DOUBLE-TAP delete */
+						g_del_req[ti] = 1;
+						trk[ti].muted = 0;
+					} else {
+						trk[ti].muted = !trk[ti].muted;  /* 1st tap -> mute + open dtap window */
+						tap_deadline[ti] = tnow + DTAP_GAP_MS;
 					}
 				}
-				if (committed >= TRK_1 && committed <= TRK_4) {
+				if (committed >= TRK_1 && committed <= TRK_4) { /* PRESS edge */
 					int ti = (int)committed;
-					int64_t dur = tap_release_t[ti] - tap_press_t[ti];
-					int was_tap = (dur > 0 && dur < 300);
-					if (was_tap && (tnow - tap_release_t[ti]) < 400) {
-						g_del_req[ti] = 1;               /* double-tap -> delete */
-						trk[ti].muted = 0;               /* undo the tap's mute */
-					} else {
-						hold_pend = ti;                  /* wait out the tap window */
-					}
-					tap_press_t[ti] = tnow;
+					press_t[ti] = tnow;
+					armed_press[ti] = 0;
 				}
 			}
-			/* press has outlasted the tap window -> it's a HOLD: start recording */
-			if (hold_pend >= 0) {
-				if (committed != (enum trk_btn)hold_pend) {
-					hold_pend = -1;          /* lost the button (noise/slip) */
-				} else if (k_uptime_get() - tap_press_t[hold_pend] >= 300) {
-					g_arm_req[hold_pend] = 1;
-					g_playing = 1;           /* recording implies play */
-					hold_pend = -1;
+			/* HOLD-ARM: button physically held >= HOLD_RECORD_MS -> a real hold, ARM
+			 * recording now (a quick tap releases before this, so it can't mis-arm). */
+			if (committed >= TRK_1 && committed <= TRK_4) {
+				int ti = (int)committed;
+				if (!armed_press[ti] && k_uptime_get() - press_t[ti] >= HOLD_RECORD_MS) {
+					armed_press[ti] = 1;
+					tap_deadline[ti] = 0;            /* a hold cancels a pending single-tap */
+					g_arm_req[ti] = 1;
+					g_playing = 1;                   /* recording implies play */
 				}
 			}
 			g_dbg_btn = (int)committed;                      /* diag: settled button */
