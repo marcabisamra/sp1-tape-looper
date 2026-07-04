@@ -1406,16 +1406,15 @@ static void xfer_service(void)
 	static int64_t  last;
 
 	if (!g_xfer_mode) {
-		/* LEAN IDLE PATH: no RX interrupt while looping (it adds USB interrupt load
-		 * that competes with the audio engine and nudges the last track). Instead
-		 * POLL the CDC for the 8-byte enter-magic, throttled to ~every 64 streamer
-		 * passes so the check is nearly free, and at streamer priority (below audio).
-		 * Only once the host connects do we switch on the fast RX interrupt for the
-		 * actual transfer -- audio is paused by then, so it costs nothing live. */
+		/* IDLE PATH: scan the ISR-fed RX ring for the 8-byte enter-magic,
+		 * throttled to ~every 64 streamer passes so the check is nearly free.
+		 * (RX interrupts stay enabled from boot — see the init comment: the
+		 * CDC class never receives ANYTHING without them, which is why the
+		 * old poll-only idle could never connect.) */
 		static uint32_t tick;
 		if ((++tick & 0x3Fu) != 0u) return;
 		uint8_t b;
-		while (uart_poll_in(cdc, &b) == 0) {
+		while (ring_buf_get(&g_cdc_rx, &b, 1) == 1) {
 			m = (b == MAGIC[m]) ? (uint8_t)(m + 1) : (b == MAGIC[0] ? 1u : 0u);
 			if (m == 8u) {
 				m = 0;
@@ -1429,8 +1428,8 @@ static void xfer_service(void)
 					g_stop_req = 1;
 					break;
 				}
-				ring_buf_reset(&g_cdc_rx);       /* clear stale RX (ISR was off) */
-				uart_irq_rx_enable(cdc);         /* now arm fast RX for the transfer */
+				/* RX has been armed since boot; anything already queued
+				 * after the magic is the host's first command — keep it. */
 				g_xfer_mode = 1;
 				g_playing = 0;           /* pause the transport during transfer */
 				last = k_uptime_get();
@@ -1443,7 +1442,6 @@ static void xfer_service(void)
 	uint8_t cmd;
 	if (ring_buf_get(&g_cdc_rx, &cmd, 1) != 1) {            /* idle: commit + exit on timeout */
 		if (k_uptime_get() - last > 15000) {
-			uart_irq_rx_disable(cdc);              /* back to the lean poll-only idle */
 			xfer_commit();
 			g_slot_switch_req = 1;                 /* reload tracks for the active song */
 			g_xfer_mode = 0;
@@ -1482,7 +1480,6 @@ static void xfer_service(void)
 		uint8_t h = 'f';
 		cdc_tx(&h, 1);
 	} else if (cmd == 'X') {                               /* commit, then exit transfer mode */
-		uart_irq_rx_disable(cdc);                      /* back to the lean poll-only idle */
 		xfer_commit();
 		g_slot_switch_req = 1;                         /* reload tracks for the active song */
 		g_xfer_mode = 0;
@@ -2154,10 +2151,16 @@ static void usb_audio_start(void)
 	}
 
 #if SP1_XFER_ENABLE
-	/* Register the CDC RX callback but DON'T enable RX interrupts yet: during normal
-	 * looping we poll for the connect-magic (no interrupt cost). The fast RX
-	 * interrupt is enabled only once a transfer starts (see xfer_service). */
+	/* Register the CDC RX callback AND enable RX now. The previous "lean poll"
+	 * idle (RX interrupt off, uart_poll_in scan) could never work on this USB
+	 * stack: the CDC-ACM class only queues its FIRST receive transfer from
+	 * uart_irq_rx_enable(), so with the interrupt off the endpoint never
+	 * accepts a single byte from the host and the connect-magic can never
+	 * arrive (the "transfer tool cannot connect" bug, GitHub issue #1). The
+	 * ISR just moves bytes into a ring; its cost while looping is a few
+	 * microseconds per line the host sends, i.e. zero in normal use. */
 	uart_irq_callback_user_data_set(cdc, cdc_rx_isr, NULL);
+	uart_irq_rx_enable(cdc);
 #endif
 }
 
