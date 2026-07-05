@@ -12,9 +12,8 @@ re-flashing the firmware.
 
 ## What's new in this release
 
-- **48 kHz.** The main build now records and plays at the full 48 kHz — earlier
-  releases ran at 24 kHz for reliability, and that reliability work is done.
-  (A 24 kHz build of the same firmware is still included.)
+- **48 kHz.** The firmware now records and plays at the full 48 kHz — earlier
+  releases ran at half rate for reliability, and that reliability work is done.
 - **Hands-free (latched) recording.** Hold a track button to start a take, then
   let go — it keeps recording until you tap the same button again. Long takes
   no longer mean holding a button down for their whole length.
@@ -51,8 +50,7 @@ device.
 ```
 sp1-tape-looper/
 ├── README.md               you are here
-├── sp1_looper.bin          the main build — 48 kHz (flash this one)
-├── sp1_looper_24kHz.bin    the same firmware at 24 kHz (warm / lo-fi)
+├── sp1_looper.bin          the firmware — flash this one
 └── firmware/               full source code (for reading / rebuilding)
     ├── src/
     │   ├── main.c          the whole looper: audio engine, controls, power, USB
@@ -68,11 +66,6 @@ For normal use, flash `sp1_looper.bin` (Sections 2–3). To read or change how i
 works, start with `firmware/src/main.c`, which opens with a full architecture
 overview.
 
-Both binaries are the same firmware. The 24 kHz build trades the top octave of
-detail (a warm, slightly lo-fi sound) for double the storage headroom. Loops
-recorded by one build are not readable by the other — switching between them
-reformats the loop storage once.
-
 ---
 
 ## 2. Flashing it onto the SP-1
@@ -86,10 +79,9 @@ SP-1 custom firmware) — no soldering or opening the device required:
    powering on) and select the `.bin` file.
 4. Flash, then unplug and replug.
 
-> Note: loops you record survive re-flashing the same build. The first time you
-> install it (coming from the stock firmware, an older release, or the other
-> sample-rate build) it reformats the loop storage once, so anything previously
-> on the device is cleared.
+> Note: loops you record survive re-flashing this firmware. The first time you
+> install it (coming from the stock firmware or an older release) it reformats
+> the loop storage once, so anything previously on the device is cleared.
 
 ---
 
@@ -117,8 +109,8 @@ SP-1 custom firmware) — no soldering or opening the device required:
   MIDI clock; every take after that is free.
 - Only one track records at a time. Recording onto a non-empty track replaces
   it.
-- A take that reaches the per-track maximum (about 5 minutes at 48 kHz, about
-  10 minutes at 24 kHz) finalizes itself.
+- A take that reaches the per-track maximum (about 5 minutes) finalizes
+  itself.
 
 ### Playback
 - PLAY button, tap: play / stop (with a tape-style speed glide).
@@ -159,8 +151,8 @@ SP-1 custom firmware) — no soldering or opening the device required:
 
 ## 4. Audio quality
 
-- Tracks are mono, 16-bit, at 48 kHz (main build) or 24 kHz. Mono (rather than
-  the stock player's stereo) is a storage-bandwidth choice.
+- Tracks are mono, 16-bit, 48 kHz. Mono (rather than the stock player's
+  stereo) is a storage-bandwidth choice.
 - Every playing track is a separate stream read off the flash in real time,
   while the track you are recording is written back. The engine reads a third
   of a second ahead per track into RAM, every flash operation is time-bounded
@@ -240,11 +232,8 @@ load at `0x20000`).
 
 Build knobs:
 
-- `SP1_BUILD_24K` in `firmware/src/sp1_emmc.h` — `0` builds 48 kHz (default),
-  `1` builds 24 kHz. It selects the sample rate and the matching flash-bus
-  clock.
 - `SP1_XFER_ENABLE` in `firmware/src/main.c` — `1` includes the loop-transfer
-  mode (as the shipped builds do); `0` compiles it out entirely.
+  mode (as the shipped build does); `0` compiles it out entirely.
 
 The most important rule when modifying the firmware: the SP-1 has no hardware
 reset, so the firmware must always feed the watchdog and must always offer a
