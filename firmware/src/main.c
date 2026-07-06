@@ -3180,6 +3180,20 @@ static void power_off(void)
 	k_msleep(60);             /* debounce the release */
 
 	shutdown_leds();          /* re-assert dark immediately before sleep */
+
+	/* POWER DOWN THE EXTERNAL CHIPS. SYSTEM_OFF only stops the nRF — the
+	 * speaker amp, the headphone codec and the eMMC I/O rail are separate
+	 * chips, and the retained GPIO levels would otherwise keep them powered
+	 * for days: the "battery drains overnight" reports. A powered amp whose
+	 * clock has been removed can also murmur on its own — the "sound after
+	 * shutdown" reports. Order: amp first, then codec, then the flash rail
+	 * (its cache was flushed in stop_and_flush above). */
+	tas_page(0x00);
+	(void)tas_wr(0x01, 0x01);        /* TAS2505 software reset: every block
+	                                  * back to its powered-down default */
+	gpio_drive_low(CS42_RST_PORT, CS42_RST_PIN);   /* CS42L42 held in reset */
+	emmc_power_down();               /* bus pins released, VCCQ rail off */
+
 	gpio_drive_low(OSC_EN_PORT, OSC_EN_PIN);   /* osc off: it would otherwise
 	                              keep drawing battery through SYSTEM_OFF */
 	pwr_btn_arm_wake();

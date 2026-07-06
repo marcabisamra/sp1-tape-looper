@@ -664,6 +664,22 @@ bool emmc_is_ready(void)
 	return s_ready;
 }
 
+/* Power-off: release the bus pins (floating, input-disconnected — nothing may
+ * back-feed the unpowered rail) and cut the VCCQ I/O rail. Call only AFTER the
+ * final cache flush; the card is gone until the next boot re-runs emmc_init().
+ * Without this the retained-high VCCQ kept the card in standby through
+ * SYSTEM_OFF — part of the "battery drains overnight" reports. */
+void emmc_power_down(void)
+{
+	s_ready = false;
+	nrf_gpio_pin_clear(PIN_EMMC_RST);
+	nrf_gpio_cfg_default(PIN_EMMC_CLK);
+	nrf_gpio_cfg_default(PIN_EMMC_CMD);
+	nrf_gpio_cfg_default(PIN_EMMC_DAT0);
+	nrf_gpio_cfg_default(PIN_EMMC_RST);
+	nrf_gpio_pin_clear(PIN_EMMC_VCCQ);     /* rail off (pin stays an output) */
+}
+
 /* CMD8 SEND_EXT_CSD: an ADTC (read) command -- the card responds R1, then sends a
  * single 512-byte EXT_CSD data block on DAT0 exactly like CMD17. Read-only and
  * safe (no write-path touch). buf must be >= EMMC_BLOCK_SIZE (512). Used at boot

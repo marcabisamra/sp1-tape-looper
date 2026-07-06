@@ -79,6 +79,7 @@ bool emmc_bkops_auto_enable(void);     /* EXT_CSD[163] |= AUTO_EN (SET-BITS; rev
 bool emmc_pon_powered_on(void);        /* EXT_CSD[34]=1 POWERED_ON (boot) */
 bool emmc_pon_power_off_short(void);   /* EXT_CSD[34]=2 POWER_OFF_SHORT (shutdown, after the cache flush) */
 bool emmc_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count);
+void emmc_power_down(void);            /* power-off: release bus pins + cut the VCCQ rail */
 bool emmc_spim_active(void);           /* diag: true = 32MHz SPIM3 DMA path live, false = bit-bang */
 bool emmc_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count);
 
