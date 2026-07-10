@@ -2355,6 +2355,41 @@ static void streamer_thread(void *a, void *b, void *c)
 				struct looptrk *t = &trk[i];
 				if (t->state != TS_PLAY) continue;
 				int32_t avail = (int32_t)(t->p_w - cpos);
+				/* DEEP-DEFICIT SNAP: a long overdub can leave the playing
+				 * tracks SECONDS behind the playhead (their rings starved
+				 * while the recorder owned the bus). Reading through that
+				 * whole deficit sequentially is audio nobody will ever hear
+				 * — and with FOUR playing tracks on a GC-degraded card the
+				 * refill surplus can be ~zero, so the deficit never shrinks
+				 * AT ALL: tracks 1-3 stay silent until one is deleted (the
+				 * community "recording track 4 silences 1-3, delete brings
+				 * them back"). More than one full ring behind -> skip the
+				 * dead history and refill from the live playhead; loop_blk
+				 * below is fully modular, so the loop phase is untouched.
+				 * Recovery becomes one half-ring (~170 ms) regardless of
+				 * how deep the hole was. */
+				if (avail < -(int32_t)RING_SAMPLES ||
+				    avail > (int32_t)RING_SAMPLES) {
+					/* Test against the LIVE playhead, not the round's cpos
+					 * snapshot: a restart/slot-switch during an earlier
+					 * CMD18 in this round resets BOTH cpos and p_w to 0,
+					 * and snapping against the stale snapshot would clobber
+					 * that reset (p_w lands far AHEAD -> ring reads as
+					 * pinned-full -> the mixer replays stale ring content).
+					 * The upper bound is impossible in any healthy state
+					 * (refill never runs more than one ring ahead), so it
+					 * uniquely fingerprints such a clobber and self-heals
+					 * it within one streamer pass. */
+					uint32_t cnow = g_consume_pos;
+					int32_t a2 = (int32_t)(t->p_w - cnow);
+					if (a2 < -(int32_t)RING_SAMPLES ||
+					    a2 > (int32_t)RING_SAMPLES) {
+						uint32_t anchor = (cnow / SAMP_PER_BLK) * SAMP_PER_BLK;
+						t->p_w = anchor;   /* audio thread sees starved either way */
+						a2 = (int32_t)(anchor - cnow);
+					}
+					avail = a2;
+				}
 				if (avail > (int32_t)(RING_SAMPLES - 8u * SAMP_PER_BLK))
 					continue;          /* ring PINNED ~full (<=8 blocks of headroom):
 					                    * the cushion is real at stall onset instead of
@@ -3003,13 +3038,16 @@ static void controls_diag(void)
 	for (int _i = 0; _i < NTRK; _i++)
 		mg[_i] = (int)((int32_t)(trk[_i].p_w - cpos) / (int)(LOOP_RATE / 1000u));
 	printk("LOOPER %dHz song=%d %s hp=%d hpin=%d usb=%d chg=%d batt=%d bpm=%d detbpm=%d vol=%d "
-	       "trk[%s %s %s %s] rec=%d ovr=%u rerr=%u werr=%u marg=[%d %d %d %d]ms stv=[%u %u %u %u] len=[%u %u %u %u] st=[%u %u %u %u] spim=%d cache=%d ckb=%u wbi=%u\n",
+	       "trk[%s %s %s %s] rec=%d mut=%u%u%u%u ovr=%u rerr=%u werr=%u marg=[%d %d %d %d]ms stv=[%u %u %u %u] len=[%u %u %u %u] st=[%u %u %u %u] spim=%d cache=%d ckb=%u wbi=%u\n",
 	       (int)LOOP_RATE, (int)g_slot, g_playing ? "PLAY" : "STOP", g_hp_on, g_hp_in,
 	       usb_present() ? 1 : 0, charging() ? 1 : 0, batt,
 	       g_play_bpm, g_det_bpm, g_master_vol_q8,
 	       tsn[trk[0].state % 5], tsn[trk[1].state % 5],
 	       tsn[trk[2].state % 5], tsn[trk[3].state % 5],
-	       g_rec_track, (unsigned)g_rec_overruns,
+	       g_rec_track,
+	       (unsigned)trk[0].muted, (unsigned)trk[1].muted,
+	       (unsigned)trk[2].muted, (unsigned)trk[3].muted,
+	       (unsigned)g_rec_overruns,
 	       (unsigned)emmc_crc_rd_errs, (unsigned)emmc_crc_wr_errs,
 	       mg[0], mg[1], mg[2], mg[3],
 	       (unsigned)g_starve_cnt[0], (unsigned)g_starve_cnt[1], (unsigned)g_starve_cnt[2], (unsigned)g_starve_cnt[3],
@@ -3826,21 +3864,33 @@ int main(void)
 				for (int k = TRK_1; k <= TRK_PLAY; k++) {
 					if (ep_time[k] > bt) { bt = ep_time[k]; b = k; }
 				}
-				/* Stop-taps must stick: a lazy release that rolls off the
-				 * recording track and dwells on a LOWER band would otherwise
-				 * out-hold the tap and leave the take running to the region
-				 * end. Only bands below the tapped button can be roll-off
-				 * (the ladder never overshoots above the pressed button), and
-				 * >=40 ms committed is beyond any transit blip, so this can
-				 * never redirect a genuine tap on another (higher) track. */
-				if (g_rec_track >= 0 && g_rec_track < NTRK &&
-				    b >= TRK_1 && b < g_rec_track &&
-				    ep_time[g_rec_track] >= 40 &&
-				    ep_time[g_rec_track] * 2 >= bt) {
-					b = g_rec_track; bt = ep_time[b];
+				/* Order matters: first decide the episode is REAL (its
+				 * dominant out-lasts any possible transit blip), THEN decide
+				 * which button owns it. */
+				if (bt < 40) {
+					b = -1;          /* pure transit blip: fire nothing */
+				} else {
+					/* ROLL-OFF ATTRIBUTION: a release sweep only ever dwells
+					 * on bands BELOW the button that was really pressed (the
+					 * ladder cannot overshoot above it, and up-sweep transit
+					 * is wiped at the press edge). So when a lower band
+					 * out-dwelt the HIGHEST committed button, prefer the
+					 * highest — provided it was committed >=24 ms (a real
+					 * contact, longer than debounce noise) and at least half
+					 * the dominant's time. This keeps a quick stop-tap on the
+					 * recording track from becoming a phantom mute with the
+					 * take left running, and equally protects the taps right
+					 * AFTER a take finalizes and lazy PLAY releases — the old
+					 * rule only guarded the recording track, so the "did it
+					 * stop?" and delete taps had no protection at all. */
+					int H = -1;
+					for (int k = TRK_PLAY; k >= TRK_1; k--)
+						if (ep_time[k] >= 24) { H = k; break; }
+					if (H > b && ep_time[H] * 2 >= bt) {
+						b = H; bt = ep_time[H];
+					}
 				}
 				for (int k = TRK_1; k <= TRK_PLAY; k++) ep_time[k] = 0;
-				if (bt < 40) b = -1;     /* pure transit blip: fire nothing */
 				if (b >= TRK_1 && b <= TRK_4) {
 					int ti = b;
 					if (armed_press[ti]) {
