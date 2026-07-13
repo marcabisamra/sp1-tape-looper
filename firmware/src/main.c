@@ -4250,22 +4250,28 @@ int main(void)
 				}
 				ep_play_held = 0;
 			}
-			/* HOLD-ARM: held >= HOLD_RECORD_MS arms recording, always
-			 * LATCHED on release. Two community variants were tried on
-			 * hardware and ROLLED BACK as a pair: the 40 ms empty-track
-			 * instant-arm (its provisional RAM-only phase released each
-			 * take's first ~150 ms to flash as one clumped write burst —
-			 * measurably starving playback at high tape speed) and the
-			 * hold-duration MOMENTARY mode (with a 200 ms arm the latch
-			 * window shrank to a 300 ms sliver, so natural holds stopped
-			 * at release: "hands-free recording is gone"). They only work
-			 * as a pair: redo both atop a trickle-flush provisional, or
-			 * neither. */
+			/* HOLD-ARM, always LATCHED on release. EMPTY tracks arm after
+			 * just 100 ms: a tap has no meaning there (nothing to mute or
+			 * delete), so there is nothing to disambiguate — and 100 ms is
+			 * above the realistic transit-graze range (blips commit
+			 * 24-32 ms; only a deliberately lazy roll dwells ~100 ms+, and
+			 * the episode-end sweep guard cancels those losslessly).
+			 * Unlike the rolled-back 40 ms instant-arm there is NO
+			 * provisional RAM-only phase here — flushing starts
+			 * immediately, so the write pattern is identical to the
+			 * release (the provisional's clumped catch-up burst was what
+			 * starved playback at high tape speed). Content tracks keep
+			 * the full HOLD_RECORD_MS so tap-mute stays instant. The
+			 * hold-duration MOMENTARY variant stays rolled back: with a
+			 * slow arm its latch window collapsed to a sliver and broke
+			 * hands-free recording. */
 			if (committed >= TRK_1 && committed <= TRK_4) {
 				int ti = (int)committed;
+				int empt = (trk[ti].state == TS_EMPTY &&
+					    !(g_slot < NUM_SLOTS && g_meta.slot[g_slot].present[ti]));
 				if (!armed_press[ti] && g_rec_track < 0 &&
 				    trk[ti].state != TS_DONE &&
-				    k_uptime_get() - press_t[ti] >= HOLD_RECORD_MS) {
+				    k_uptime_get() - press_t[ti] >= (empt ? 100 : HOLD_RECORD_MS)) {
 					/* g_rec_track < 0: one take at a time — while a latched
 					 * take runs, holding ANY track does nothing (no phantom
 					 * arm, no forced g_playing). state != TS_DONE: a hold on
