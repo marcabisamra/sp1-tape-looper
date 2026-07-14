@@ -1255,34 +1255,57 @@ static void looper_audio_block(int16_t *s)
 					}
 				}
 				uint32_t len = content;
-				if (g_fixed_len && g_loop_blocks) {
-					/* FIXED-LENGTH mode: the LOOP length snaps UP to a whole
-					 * multiple of track 1, so every track stays locked in
-					 * sync with track 1. The gap [content, len) is not
-					 * recorded or flushed — it plays as synthesised silence
-					 * (see the read paths), so this costs no time and no
-					 * flash writes. First take (content == g_loop_blocks) is
-					 * a no-op. */
-					uint32_t mult = (content + g_loop_blocks - 1u) / g_loop_blocks;
+				uint32_t tgt = content * SAMP_PER_BLK;   /* default: stop now */
+				uint8_t  sil = 1;                        /* pad the final sub-block */
+				if (trk[i].rec_target && !trk[i].rec_silence) {
+					/* SECOND tap while a fixed-mode take is running on to
+					 * the bar line (below): stop IMMEDIATELY — the loop
+					 * keeps the already-snapped bar length; the unfilled
+					 * remainder plays as silence (the old behavior, as an
+					 * escape hatch). */
+					len = trk[i].len_blocks;
+				} else if (g_fixed_len && g_loop_blocks) {
+					/* FIXED mode: round to the NEAREST whole multiple of
+					 * the base — ceil-only rounding gapped BOTH ways
+					 * (community: stop a hair early and the tail padded
+					 * with silence; a hair late and nearly a whole extra
+					 * bar of silence was appended).
+					 *  - stopped EARLY (before the nearest bar): the tap
+					 *    SCHEDULES the stop — recording runs on to the bar
+					 *    line capturing live audio, so the loop ends ON
+					 *    the bar with real sound in it (the emit path
+					 *    fades the final ~2.7 ms into the seam). The track
+					 *    LED stays on until the bar; tap again to force an
+					 *    immediate stop.
+					 *  - stopped LATE (past the nearest bar): snap BACK to
+					 *    it — the overhang stays on flash but is never
+					 *    played (promotion fades the new seam). */
+					uint32_t mult = (content + g_loop_blocks / 2u) / g_loop_blocks;
 					if (mult < 1u) mult = 1u;
-					if (mult * g_loop_blocks <= MAX_LOOP_BLOCKS)
-						len = mult * g_loop_blocks;
-					/* else len stays = content (can't exceed the region). */
+					uint32_t nlen = mult * g_loop_blocks;
+					if (nlen <= MAX_LOOP_BLOCKS) {
+						len = nlen;
+						if (nlen * SAMP_PER_BLK > trk[i].rec_count) {
+							/* EARLY: run on to the bar, capturing live */
+							content = nlen;
+							tgt = nlen * SAMP_PER_BLK;
+							sil = 0;
+						}
+					}
+					/* nlen over the region: len stays = content, stop now */
 				}
 				trk[i].content_blocks = content;     /* audio ends here */
-				trk[i].len_blocks     = len;         /* loop length (>= content) */
-				trk[i].rec_target     = content * SAMP_PER_BLK;  /* -> instant TS_DONE */
-				/* end the live phrase; the recorder pads only the final sub-
-				 * block up to rec_target, then -> TS_DONE. The pad used to be
-				 * hard zeros — an instant cut at the exact stop point, i.e. a
-				 * click baked into the take's loop seam every lap. Fade the
-				 * first 128 pad samples (~2.7 ms) down instead. */
-				trk[i].rec_silence = 1;
-				trk[i].rec_fade = 128;
-				/* the pad is only rec_target - rec_count samples (0..255);
-				 * steepen the slope so the fade always COMPLETES inside it
-				 * (a truncated fade would leave a scaled residual step). */
-				{
+				trk[i].len_blocks     = len;         /* loop length */
+				trk[i].rec_target     = tgt;
+				/* end the live phrase. When padding (immediate stops), the
+				 * pad used to be hard zeros — a click baked into the seam;
+				 * fade the first 128 pad samples (~2.7 ms) down instead. */
+				trk[i].rec_silence = sil;
+				if (sil) {
+					trk[i].rec_fade = 128;
+					/* the pad is only rec_target - rec_count samples
+					 * (0..255); steepen the slope so the fade always
+					 * COMPLETES inside it. */
 					uint32_t pad = trk[i].rec_target - trk[i].rec_count;
 					trk[i].rec_fstep = (pad && pad < 128u)
 						? (uint8_t)((128u + pad - 1u) / pad) : 1u;
@@ -1514,6 +1537,13 @@ static void looper_audio_block(int16_t *s)
 						} else {
 							wsamp = 0;
 						}
+					} else if (rt->rec_target) {
+						/* fixed-mode run-to-the-bar: fade the final ~2.7 ms
+						 * into the bar line so the loop seam can't click */
+						uint32_t rem = rt->rec_target - rt->rec_count;
+						if (rem <= 128u)
+							wsamp = (int16_t)(((int32_t)lsamp *
+									   (int32_t)rem) >> 7);
 					}
 					g_rring[rt->r_w & RRING_MASK] = wsamp;
 					rt->r_w++;
@@ -2450,6 +2480,24 @@ static void streamer_thread(void *a, void *b, void *c)
 					}
 					g_meta_save_req = 1;             /* persist the new recording */
 #if SP1_CODEC == SP1_CODEC_PCM
+					/* TRUNCATED-STOP SEAM (fixed mode, stopped late): the
+					 * played region now ends mid-audio at len_blocks — fade
+					 * its last ~2.7 ms down on flash so the loop seam
+					 * doesn't click. The overhang past len is never read. */
+					if (t->content_blocks > t->len_blocks && t->len_blocks) {
+						uint32_t _bl = trk_blk(slot, (uint32_t)i) +
+							       t->len_blocks - 1u;
+						if (emmc_read_blocks(_bl, batchbuf, 1)) {
+							int16_t *_sm = (int16_t *)batchbuf;
+							for (int _k = 0; _k < 128; _k++) {
+								int _ix = SAMP_PER_BLK - 128 + _k;
+								_sm[_ix] = (int16_t)(((int32_t)_sm[_ix] *
+										      (127 - _k)) >> 7);
+							}
+							if (!emmc_write_blocks(_bl, batchbuf, 1))
+								(void)emmc_write_blocks(_bl, batchbuf, 1);
+						}
+					}
 					/* LOOP-SEAM DECLICK (write side): ramp the take's first
 					 * ~1.3 ms in, ONCE, on flash. Every lap of the loop plays
 					 * last-sample -> first-sample; with a hard start that seam
