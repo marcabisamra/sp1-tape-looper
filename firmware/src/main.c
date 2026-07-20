@@ -778,9 +778,9 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
  * metadata (this OVERWRITES the original TE "ALBUM_PR" index, deleting the songs
  * and reclaiming the space — they couldn't be played anyway), tracks follow.
  * NUM_SLOTS independent songs, each with its own saved BPM + 4 tracks. There are
- * 16 songs shown on the 4 status LEDs in four banks: LED = song % 4; the bank
- * is the LED's temporal pattern — bank 1 solid, bank 2 slow blink (~2 Hz),
- * bank 3 double-flash, bank 4 fast blink (~6 Hz). */
+ * 16 songs shown on the 4 status LEDs with TWO lights: the POSITION LED
+ * (song % 4) is solid and the BANK LED (song / 4) blinks ~2 Hz. When the two
+ * roles land on the same LED (songs 1, 6, 11, 16) it flutters fast (~4 Hz). */
 #define NUM_SLOTS        16u
 #define META_BLOCK       0u
 #define META_BLOCKS      2u     /* 16-song index = 972 B — the exact 2-block maximum */
@@ -3523,32 +3523,32 @@ static void led_cfg_output(const struct led *l)
 static void led_on(int i)  { leds[i].port->OUTSET = (1u << leds[i].pin); }
 static void led_off(int i) { leds[i].port->OUTCLR = (1u << leds[i].pin); }
 static void all_off(void)  { for (int i = 0; i < NUM_LEDS; i++) led_off(i); }
-/* Status row = song indicator, 16 songs on 4 LEDs in 4 banks. LED index =
- * song % 4; the bank is the pattern, alternating RATE and RHYTHM cues so
- * neighbours never blur mid-performance:
- *   bank 1 (songs 1-4):   SOLID                       (as stock)
- *   bank 2 (songs 5-8):   slow blink ~2 Hz            (as the 8-song fork)
- *   bank 3 (songs 9-12):  double-flash  80/80/80/560  (a rhythm, not a rate)
- *   bank 4 (songs 13-16): fast blink ~6 Hz            (unmistakably not-2-Hz)
- * Pure function of (g_slot, uptime): no state, no blocking, ~8 ms resolution.
- * (Same LEDs the power on/off sweep uses.) */
+/* Status row = song indicator, 16 songs via TWO LIGHTS ("scheme E", chosen
+ * in the LED lab): the POSITION LED (song % 4) is SOLID, and the BANK LED
+ * (song / 4) BLINKS ~2 Hz (250 ms on/off). When position == bank — songs 1,
+ * 6, 11 and 16 — one LED carries both roles and simply BLINKS ~2 Hz: "only
+ * one light, and it blinks" reads as position-and-bank-agree.
+ * Read it as: "the steady light says where in the bank, the blinking light
+ * says which bank." Pure function of (g_slot, uptime): no state, no
+ * blocking, ~8 ms resolution. (Same LEDs the power on/off sweep uses.) */
 static void show_song_leds(void)
 {
 	uint32_t slot = g_slot;                 /* volatile: read once */
 	uint32_t pos  = slot & 3u;              /* slot % 4 */
 	uint32_t bank = slot >> 2;              /* 0..3 */
 	uint32_t t    = k_uptime_get_32();
-	int on = 1;
-	if (bank == 1u) {
-		on = ((t / 250u) & 1u) == 0u;
-	} else if (bank == 2u) {
-		uint32_t ph = t % 800u;
-		on = (ph < 80u) || (ph >= 160u && ph < 240u);
-	} else if (bank == 3u) {
-		on = ((t / 83u) & 1u) == 0u;
+	for (int i = 0; i < NUM_LEDS; i++) {
+		int on;
+		if ((uint32_t)i == pos && pos == bank)
+			on = ((t / 250u) & 1u) == 0u;   /* both roles: same ~2 Hz blink */
+		else if ((uint32_t)i == pos)
+			on = 1;                         /* position: solid */
+		else if ((uint32_t)i == bank)
+			on = ((t / 250u) & 1u) == 0u;   /* bank: ~2 Hz blink */
+		else
+			on = 0;
+		on ? led_on(i) : led_off(i);
 	}
-	for (int i = 0; i < NUM_LEDS; i++)
-		((uint32_t)i == pos && on) ? led_on(i) : led_off(i);
 }
 
 static void track_led_on(int i)  { track_leds[i].port->OUTSET = (1u << track_leds[i].pin); }
