@@ -747,7 +747,9 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 #define BEAT_SAMPLES_I2S 35840u                            /* I2S frames / beat (140 blocks ÷256) */
 #define BEAT_SAMPLES_L   (BEAT_SAMPLES_I2S / DECIM)        /* 35840 = 140 blocks (÷256) */
 #define BAR_SAMPLES      (BEAT_SAMPLES_L * 4u)             /* 4 beats — for display / phrasing */
-#define MAX_BEATS        800u                              /* longest loop ~9.9 min @ 80.87 BPM */
+#define MAX_BEATS        400u                              /* longest loop ~5.0 min — halved so 16
+                                                            * songs x 4 tracks fit the 4 GB card with
+                                                            * the same ~49% margin the 8-song build had */
 #define MAX_LOOP_SAMPLES (BEAT_SAMPLES_L * MAX_BEATS)
 /* eMMC blocks for the longest loop. At 800 beats the 4 songs × 4 tracks use ~452 MB
  * (12 kHz) / ~301 MB (8 kHz) of the 4 GB card. RAM is unchanged (always streamed). */
@@ -776,10 +778,12 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
  * metadata (this OVERWRITES the original TE "ALBUM_PR" index, deleting the songs
  * and reclaiming the space — they couldn't be played anyway), tracks follow.
  * NUM_SLOTS independent songs, each with its own saved BPM + 4 tracks. There are
- * 8 songs shown on the 4 status LEDs in two banks: LED = song % 4; songs 1-4
- * display solid (identical to the original), songs 5-8 blink ~2 Hz. */
-#define NUM_SLOTS        8u
+ * 16 songs shown on the 4 status LEDs in four banks: LED = song % 4; the bank
+ * is the LED's temporal pattern — bank 1 solid, bank 2 slow blink (~2 Hz),
+ * bank 3 double-flash, bank 4 fast blink (~6 Hz). */
+#define NUM_SLOTS        16u
 #define META_BLOCK       0u
+#define META_BLOCKS      2u     /* 16-song index = 972 B — the exact 2-block maximum */
 #define SLOT0_BLOCK      4096u  /* 2MB-aligned (block 0 = meta, 1-4095 spare) so every trk_blk stays 2MB-aligned */
 /* FIXED storage signature: reflashing KEEPS the saved songs (the earlier
  * wipe-on-reflash build stamp is gone — user prefers persistence; double-tap a
@@ -796,8 +800,10 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
  * other format's bytes. */
 #if DECIM == 1u
 #  if   SP1_CODEC == SP1_CODEC_PCM
-#define META_MAGIC       0x53453841u                       /* 'SE8A' — 48 kHz, PCM 16-bit, 8-song index */
-#define META_MAGIC_V4    0x53453441u                       /* 'SE4A' — the pre-fork 4-song index (migrated) */
+#define META_MAGIC       0x53453136u                       /* 'SE16' — 48 kHz PCM, 16-song 2-block index,
+                                                            * 400-beat regions (layout differs from SE4A/
+                                                            * SE8A: reformat on first boot — export loops
+                                                            * as WAVs first) */
 #  elif SP1_CODEC == SP1_CODEC_ULAW
 #define META_MAGIC       0x53455534u                       /* 'SEU4' — 48 kHz, u-law 8-bit */
 #  else
@@ -840,11 +846,11 @@ struct meta_blk {
 	                                        * track. Also appended in the tail -> layout-safe; a website
 	                                        * upload zeroes it (0 = full track = correct for uploads). */
 };
-/* The index must fit its single eMMC block. 8 songs = 492 of 512 bytes — the
- * exact maximum. 9+ songs needs a multi-block index format; this guard turns
- * that mistake into a compile error instead of storage corruption. */
-BUILD_ASSERT(sizeof(struct meta_blk) <= EMMC_BLOCK_SIZE,
-	     "meta_blk outgrew eMMC block 0 — needs a multi-block index format");
+/* The index must fit its reserved blocks: 16 songs = 972 of 1024 bytes — the
+ * exact maximum of a 2-block index (17 would need three). Compile error here
+ * beats storage corruption there. */
+BUILD_ASSERT(sizeof(struct meta_blk) <= META_BLOCKS * EMMC_BLOCK_SIZE,
+	     "meta_blk outgrew its reserved index blocks");
 static struct meta_blk   g_meta;
 static volatile uint32_t g_slot;
 static volatile int      g_slot_switch_req;   /* main -> audio: reload tracks for the new slot */
@@ -1878,8 +1884,8 @@ static uint8_t g_xfer_dirty[NUM_SLOTS][NTRK];
  * bus-blocking flush has nothing live to starve. */
 static void xfer_commit(void)
 {
-	static uint8_t mblk[EMMC_BLOCK_SIZE];
-	if (g_emmc_ready && emmc_read_blocks(META_BLOCK, mblk, 1)) {
+	static uint8_t mblk[META_BLOCKS * EMMC_BLOCK_SIZE];
+	if (g_emmc_ready && emmc_read_blocks(META_BLOCK, mblk, META_BLOCKS)) {
 		struct meta_blk *m = (struct meta_blk *)mblk;
 		if (m->magic == META_MAGIC && m->cur_slot < NUM_SLOTS) {
 			uint32_t keep[NUM_SLOTS][NTRK];
@@ -1896,9 +1902,9 @@ static void xfer_commit(void)
 					if (!g_xfer_dirty[s][t])
 						g_meta.trk_content[s][t] = keep[s][t];
 			if (memcmp(mblk, &g_meta, sizeof(g_meta)) != 0) {
-				memset(mblk, 0, EMMC_BLOCK_SIZE);
+				memset(mblk, 0, sizeof(mblk));
 				memcpy(mblk, &g_meta, sizeof(g_meta));
-				(void)emmc_write_blocks(META_BLOCK, mblk, 1);
+				(void)emmc_write_blocks(META_BLOCK, mblk, META_BLOCKS);
 			}
 		}
 	}
@@ -2229,6 +2235,7 @@ static void streamer_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	static uint8_t blk[EMMC_BLOCK_SIZE];
+	static uint8_t metabuf[META_BLOCKS * EMMC_BLOCK_SIZE];  /* 2-block song index */
 	/* Flush the rec ring in MULTI-BLOCK (CMD25) bursts: the card pipelines the
 	 * programming across the burst instead of fully programming each block (~30 ms
 	 * single-block), so the sustained write keeps up with live recording. */
@@ -2283,41 +2290,17 @@ static void streamer_thread(void *a, void *b, void *c)
 	memset(&g_meta, 0, sizeof(g_meta));
 	g_meta.magic = META_MAGIC;
 	for (uint32_t s = 0; s < NUM_SLOTS; s++) g_meta.slot[s].speed_q16 = 65536u;
-	if (g_emmc_ready && emmc_read_blocks(META_BLOCK, blk, 1)) {
-		struct meta_blk *m = (struct meta_blk *)blk;
+	if (g_emmc_ready && emmc_read_blocks(META_BLOCK, metabuf, META_BLOCKS)) {
+		struct meta_blk *m = (struct meta_blk *)metabuf;
 		if (m->magic == META_MAGIC && m->cur_slot < NUM_SLOTS) {
 			memcpy(&g_meta, m, sizeof(g_meta));     /* resume saved songs */
-		} else if (m->magic == META_MAGIC_V4 && m->cur_slot < 4u) {
-			/* MIGRATION from the pre-fork 4-song index: the track
-			 * REGIONS are unchanged (region address depends only on
-			 * slot*NTRK+track), so the four old songs are lifted into
-			 * slots 0-3 of the 8-song index and keep playing; slots
-			 * 4-7 start empty. Field offsets moved because slot[]
-			 * grew, so copy from the old on-disk layout explicitly:
-			 * magic@0 cur@4 slot[4]@8 (44 B each: speed@+0 loop@+4
-			 * present[4]@+8 trk_len[4]@+12 trk_start[4]@+28)
-			 * fixed_len@184 trk_content[4][4]@188. One-time; the
-			 * index is immediately re-persisted with the new magic. */
-			const uint8_t *ob = blk;
-			g_meta.cur_slot = m->cur_slot;
-			for (uint32_t s = 0; s < 4u; s++) {
-				const uint8_t *o = ob + 8u + s * 44u;
-				memcpy(&g_meta.slot[s].speed_q16, o + 0u,  4u);
-				memcpy(&g_meta.slot[s].loop_len,  o + 4u,  4u);
-				memcpy(g_meta.slot[s].present,    o + 8u,  4u);
-				memcpy(g_meta.slot[s].trk_len,    o + 12u, 16u);
-				memcpy(g_meta.slot[s].trk_start,  o + 28u, 16u);
-			}
-			memcpy(&g_meta.fixed_len, ob + 184u, 4u);
-			for (uint32_t s = 0; s < 4u; s++)
-				memcpy(g_meta.trk_content[s], ob + 188u + s * 16u, 16u);
-			memset(blk, 0, EMMC_BLOCK_SIZE);
-			memcpy(blk, &g_meta, sizeof(g_meta));
-			(void)emmc_write_blocks(META_BLOCK, blk, 1);   /* persist as 'SE8A' */
 		} else {
-			memset(blk, 0, EMMC_BLOCK_SIZE);
-			memcpy(blk, &g_meta, sizeof(g_meta));
-			(void)emmc_write_blocks(META_BLOCK, blk, 1);   /* delete old album */
+			/* Unknown/older index (incl. 'SE4A'/'SE8A': their track
+			 * regions were sized for 800-beat takes and don't line up
+			 * with the 400-beat layout) -> one-time format-fresh. */
+			memset(metabuf, 0, sizeof(metabuf));
+			memcpy(metabuf, &g_meta, sizeof(g_meta));
+			(void)emmc_write_blocks(META_BLOCK, metabuf, META_BLOCKS);
 		}
 	}
 	g_slot = g_meta.cur_slot;
@@ -2356,9 +2339,9 @@ static void streamer_thread(void *a, void *b, void *c)
 		if (g_meta_save_req) {                       /* persist songs + BPMs */
 			g_meta_save_req = 0;
 			if (g_emmc_ready) {
-				memset(blk, 0, EMMC_BLOCK_SIZE);
-				memcpy(blk, &g_meta, sizeof(g_meta));
-				(void)emmc_write_blocks(META_BLOCK, blk, 1);
+				memset(metabuf, 0, sizeof(metabuf));
+				memcpy(metabuf, &g_meta, sizeof(g_meta));
+				(void)emmc_write_blocks(META_BLOCK, metabuf, META_BLOCKS);
 				work = true;
 			}
 		}
@@ -3540,16 +3523,30 @@ static void led_cfg_output(const struct led *l)
 static void led_on(int i)  { leds[i].port->OUTSET = (1u << leds[i].pin); }
 static void led_off(int i) { leds[i].port->OUTCLR = (1u << leds[i].pin); }
 static void all_off(void)  { for (int i = 0; i < NUM_LEDS; i++) led_off(i); }
-/* Status row = song indicator, 8 songs on 4 LEDs in 2 banks: LED index =
- * song % 4; bank 0 (songs 1-4) shows SOLID — pixel-identical to the original
- * 4-song firmware — and bank 1 (songs 5-8) BLINKS ~2 Hz (250 ms on/off).
- * Pure function of (g_slot, uptime): no state, no blocking, evaluated every
- * ~8 ms control-loop pass. (Same LEDs the power on/off sweep uses.) */
+/* Status row = song indicator, 16 songs on 4 LEDs in 4 banks. LED index =
+ * song % 4; the bank is the pattern, alternating RATE and RHYTHM cues so
+ * neighbours never blur mid-performance:
+ *   bank 1 (songs 1-4):   SOLID                       (as stock)
+ *   bank 2 (songs 5-8):   slow blink ~2 Hz            (as the 8-song fork)
+ *   bank 3 (songs 9-12):  double-flash  80/80/80/560  (a rhythm, not a rate)
+ *   bank 4 (songs 13-16): fast blink ~6 Hz            (unmistakably not-2-Hz)
+ * Pure function of (g_slot, uptime): no state, no blocking, ~8 ms resolution.
+ * (Same LEDs the power on/off sweep uses.) */
 static void show_song_leds(void)
 {
 	uint32_t slot = g_slot;                 /* volatile: read once */
 	uint32_t pos  = slot & 3u;              /* slot % 4 */
-	int on = (slot < 4u) || (((k_uptime_get_32() / 250u) & 1u) == 0u);
+	uint32_t bank = slot >> 2;              /* 0..3 */
+	uint32_t t    = k_uptime_get_32();
+	int on = 1;
+	if (bank == 1u) {
+		on = ((t / 250u) & 1u) == 0u;
+	} else if (bank == 2u) {
+		uint32_t ph = t % 800u;
+		on = (ph < 80u) || (ph >= 160u && ph < 240u);
+	} else if (bank == 3u) {
+		on = ((t / 83u) & 1u) == 0u;
+	}
 	for (int i = 0; i < NUM_LEDS; i++)
 		((uint32_t)i == pos && on) ? led_on(i) : led_off(i);
 }
