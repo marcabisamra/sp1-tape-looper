@@ -870,6 +870,19 @@ static volatile uint32_t g_p2snap[4];
 static volatile uint32_t g_p2yield, g_p2rfail;
 static volatile int      g_meta_loaded;       /* streamer -> main: g_meta read at boot */
 
+/* Persist the 2-block song index MAGIC-LAST: block 1 (songs 9-16 + tail)
+ * first, then block 0 (magic + songs 1-8). A power cut between the two
+ * writes leaves the old block 0 — the old index stays fully authoritative —
+ * so a torn half-new index is impossible by ordering. (Both writes usually
+ * land in the card's write cache and flush together anyway; this closes the
+ * rare flush-between window. See SP1-SIDE-EFFECTS-AUDIT.md §1.1.) */
+static bool meta_write_blocks(const uint8_t *buf)
+{
+	bool ok1 = emmc_write_blocks(META_BLOCK + 1u, buf + EMMC_BLOCK_SIZE, 1);
+	bool ok0 = emmc_write_blocks(META_BLOCK, buf, 1);
+	return ok0 && ok1;
+}
+
 enum trk_state { TS_EMPTY, TS_ARMED, TS_REC, TS_DONE, TS_PLAY };
 
 struct looptrk {
@@ -1913,7 +1926,7 @@ static void xfer_commit(void)
 			if (memcmp(mblk, &g_meta, sizeof(g_meta)) != 0) {
 				memset(mblk, 0, sizeof(mblk));
 				memcpy(mblk, &g_meta, sizeof(g_meta));
-				(void)emmc_write_blocks(META_BLOCK, mblk, META_BLOCKS);
+				(void)meta_write_blocks(mblk);
 			}
 		}
 	}
@@ -2309,7 +2322,7 @@ static void streamer_thread(void *a, void *b, void *c)
 			 * with the 400-beat layout) -> one-time format-fresh. */
 			memset(metabuf, 0, sizeof(metabuf));
 			memcpy(metabuf, &g_meta, sizeof(g_meta));
-			(void)emmc_write_blocks(META_BLOCK, metabuf, META_BLOCKS);
+			(void)meta_write_blocks(metabuf);
 		}
 	}
 	g_slot = g_meta.cur_slot;
@@ -2350,7 +2363,7 @@ static void streamer_thread(void *a, void *b, void *c)
 			if (g_emmc_ready) {
 				memset(metabuf, 0, sizeof(metabuf));
 				memcpy(metabuf, &g_meta, sizeof(g_meta));
-				(void)emmc_write_blocks(META_BLOCK, metabuf, META_BLOCKS);
+				(void)meta_write_blocks(metabuf);
 				work = true;
 			}
 		}
