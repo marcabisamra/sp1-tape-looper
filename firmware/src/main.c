@@ -853,6 +853,11 @@ struct meta_blk {
 	uint32_t led_full;         /* 0 = dim LEDs (default), 1 = full brightness.
 	                            * Tail-appended like fixed_len -> layout-safe;
 	                            * repaired in xfer_commit like fixed_len. */
+	uint8_t  chop[NUM_SLOTS][2]; /* M7a: per-song chop window: [0]=div (0/1=none,
+	                              * 2..64), [1]=offset. Zeros = unchopped. */
+	uint8_t  song_mode[NUM_SLOTS]; /* M7c: recorded-with mode stamp: 0 = unset
+	                                * (inherit the global preference),
+	                                * 1 = variable, 2 = fixed. */
 };
 /* The index must fit its reserved blocks: 16 songs = 972 of 1024 bytes — the
  * exact maximum of a 2-block index (17 would need three). Compile error here
@@ -1007,10 +1012,16 @@ static int64_t           g_dec_acc;                /* live accumulator for recor
 static uint32_t          g_frames_since;           /* I2S frames since the last loop-sample tick */
 static uint32_t          g_pphase;                 /* Q16 playback phase */
 static volatile uint32_t g_play_speed_q16 = 65536; /* tape speed when playing (Q16, 65536=1.0x); rocker sets */
-static volatile uint8_t  g_fixed_len;              /* 0 = independent/variable loop lengths (default);
-                                                    * 1 = fixed: overdubs snap to a whole multiple of
-                                                    * track 1 so all tracks stay in sync. Toggled live by
-                                                    * the FUNCTION+PLAY gesture; see the control loop. */
+static volatile uint8_t  g_fixed_len;              /* EFFECTIVE mode of the CURRENT song (M7c):
+                                                    * 0 = variable (independent loop lengths),
+                                                    * 1 = fixed (overdubs snap to track 1's base).
+                                                    * = the song's recorded-with stamp when set,
+                                                    * else the global preference below. */
+static volatile uint8_t  g_mode_pref;              /* M7c: global working preference — what empty
+                                                    * songs inherit. Toggling FUNCTION+PLAY on an
+                                                    * EMPTY song sets this; on a RECORDED song it
+                                                    * stamps that song only. Persisted in the
+                                                    * index's fixed_len field. */
 /* Tempo as an INTEGER BPM (rocker steps it 1 BPM per click for fine control).
  * Speed is derived exactly: speed = bpm * 65536 / LOOP_BPM_BASE, so 80 BPM is
  * exactly 1.0x — no detent/snap logic needed. Range 40..120 = 0.5x..1.5x. */
@@ -1229,7 +1240,14 @@ static void looper_audio_block(int16_t *s)
 				any = 1;
 		if (!any) {
 			g_loop_len = 0; g_loop_blocks = 0; g_loop_active = 0;
-			if (g_slot < NUM_SLOTS) g_meta.slot[g_slot].loop_len = 0;
+			if (g_slot < NUM_SLOTS) {
+				g_meta.slot[g_slot].loop_len = 0;
+				g_meta.song_mode[g_slot] = 0;   /* M7c: unstamp */
+				g_meta.chop[g_slot][0] = 0;     /* M7a: unchop  */
+				g_meta.chop[g_slot][1] = 0;
+			}
+			g_chop_div = 1; g_chop_off = 0;
+			g_fixed_len = g_mode_pref;              /* rejoin global */
 		}
 		g_meta_save_req = 1;
 	}
@@ -1304,6 +1322,8 @@ static void looper_audio_block(int16_t *s)
 					tempo_finish();         /* set the detected beat grid + BPM */
 					if (g_slot < NUM_SLOTS) {
 						g_meta.slot[g_slot].loop_len = g_loop_len;
+						g_meta.song_mode[g_slot] =
+							g_fixed_len ? 2u : 1u; /* M7c stamp */
 						g_meta_save_req = 1;
 					}
 				}
@@ -1939,15 +1959,30 @@ static void xfer_commit(void)
 		struct meta_blk *m = (struct meta_blk *)mblk;
 		if (m->magic == META_MAGIC && m->cur_slot < NUM_SLOTS) {
 			uint32_t keep[NUM_SLOTS][NTRK];
+			uint8_t keep_chop[NUM_SLOTS][2];
+			uint8_t keep_mode[NUM_SLOTS];
 			memcpy(keep, g_meta.trk_content, sizeof(keep));
+			memcpy(keep_chop, g_meta.chop, sizeof(keep_chop));
+			memcpy(keep_mode, g_meta.song_mode, sizeof(keep_mode));
 			memcpy(&g_meta, m, sizeof(g_meta));
 			g_slot = g_meta.cur_slot;
 			/* the host only manages the legacy fields (see g_xfer_dirty):
 			 * restore the mode setting and every untouched track's content
 			 * length, then write the repaired index back (skipped when the
 			 * host's copy already matches, e.g. a read-only session). */
-			g_meta.fixed_len = g_fixed_len;
+			g_meta.fixed_len = g_mode_pref;      /* M7c: field = preference */
 			g_meta.led_full = g_led_dim ? 0u : 1u;
+			memcpy(g_meta.chop, keep_chop, sizeof(keep_chop));
+			memcpy(g_meta.song_mode, keep_mode, sizeof(keep_mode));
+			if (g_slot < NUM_SLOTS) {   /* reload effective for current song */
+				uint32_t cd = g_meta.chop[g_slot][0];
+				if (cd < 1u || cd > 64u) cd = 1u;
+				uint32_t co = g_meta.chop[g_slot][1]; if (co >= cd) co = 0u;
+				g_chop_div = cd; g_chop_off = co;
+				g_fixed_len = g_meta.song_mode[g_slot]
+					    ? (g_meta.song_mode[g_slot] == 2u ? 1u : 0u)
+					    : g_mode_pref;
+			}
 			for (int s = 0; s < NUM_SLOTS; s++)
 				for (int t = 0; t < NTRK; t++)
 					if (!g_xfer_dirty[s][t])
@@ -2355,7 +2390,9 @@ static void streamer_thread(void *a, void *b, void *c)
 		}
 	}
 	g_slot = g_meta.cur_slot;
-	g_fixed_len = g_meta.fixed_len ? 1u : 0u;   /* restore the saved length mode */
+	g_mode_pref = g_meta.fixed_len ? 1u : 0u;   /* M7c: global mode preference */
+	g_fixed_len = g_mode_pref;                  /* effective refined when the
+	                                             * current song loads (main) */
 	g_meta_loaded = 1;
 
 	while (1) {
@@ -2603,17 +2640,34 @@ static void streamer_thread(void *a, void *b, void *c)
 					uint32_t _gb   = t->len_blocks ? t->len_blocks
 					               : (g_loop_blocks ? g_loop_blocks : 1u);
 					uint32_t _cdiv = g_chop_div, _coff = g_chop_off;
-					uint32_t _win  = _gb / _cdiv; if (_win == 0u) _win = 1u;
-					uint32_t _wb   = (_coff * _gb) / _cdiv;
-					if (_wb + _win > _gb) _wb = _gb - _win;
+					uint32_t _cyc, _win, _wb, _wper;
+					if (g_fixed_len && g_loop_blocks && _gb >= g_loop_blocks &&
+					    (_gb % g_loop_blocks) == 0u) {
+						_wper = g_loop_blocks;
+						_win = _wper / _cdiv; if (_win == 0u) _win = 1u;
+						_wb = (_coff * _wper) / _cdiv;
+						if (_wb + _win > _wper) _wb = _wper - _win;
+						_cyc = (_gb / _wper) * _win;
+					} else {
+						_wper = _gb;
+						_win = _gb / _cdiv; if (_win == 0u) _win = 1u;
+						_wb = (_coff * _gb) / _cdiv;
+						if (_wb + _win > _gb) _wb = _gb - _win;
+						_cyc = _win;
+					}
 					uint32_t _want = (RING_SAMPLES / 2u) + 16u * SAMP_PER_BLK;
 					if (_want > RING_SAMPLES) _want = RING_SAMPLES - SAMP_PER_BLK;
 					for (uint32_t _got = 0; _got < _want; ) {
 						uint32_t _pwb = _pw / SAMP_PER_BLK;
-						uint32_t _lb  = _wb + (((_pwb % _win) + _win - (t->start_blk % _win)) % _win);
+						uint32_t _c   = ((_pwb % _cyc) + _cyc -
+								 (t->start_blk % _cyc)) % _cyc;
+						uint32_t _lb  = (_c / _win) * _wper + _wb + (_c % _win);
 						uint32_t _n   = 32u;
 						if (_n > (RING_SAMPLES / SAMP_PER_BLK) - 1u) _n = (RING_SAMPLES / SAMP_PER_BLK) - 1u;
-						if (_lb + _n > _wb + _win) _n = _wb + _win - _lb;
+						{
+							uint32_t _we = (_c / _win) * _wper + _wb + _win;
+							if (_lb + _n > _we) _n = _we - _lb;
+						}
 						/* SILENCE PAD (see PASS 2): [content, _gb) is synthesised
 						 * zeros, never read from flash. */
 						uint32_t _content = t->content_blocks ? t->content_blocks : _gb;
@@ -2728,12 +2782,28 @@ static void streamer_thread(void *a, void *b, void *c)
 				 * of the base), not the shared g_loop_blocks. */
 				uint32_t gb = t->len_blocks ? t->len_blocks
 					    : (g_loop_blocks ? g_loop_blocks : 1u);
-				/* GLOBAL CHOP window over this track's own length:
-				 * div=1 -> win=gb, wbase=0 = the original math. */
+				/* CHOP window (M7b, mode-aware). VARIABLE: slice this
+				 * track's OWN length (M5 behavior). FIXED (base known,
+				 * track a whole multiple of it): slice THE BAR — every
+				 * layer plays the same base/div slice OF EACH OF ITS
+				 * BARS, uniform and phase-locked, multi-bar variation
+				 * preserved. div=1 reduces to the original math. */
 				uint32_t cdiv = g_chop_div, coff = g_chop_off;
-				uint32_t win = gb / cdiv; if (win == 0u) win = 1u;
-				uint32_t wbase = (coff * gb) / cdiv;
-				if (wbase + win > gb) wbase = gb - win;
+				uint32_t cyc, win, wbase, wper;
+				if (g_fixed_len && g_loop_blocks && gb >= g_loop_blocks &&
+				    (gb % g_loop_blocks) == 0u) {
+					wper = g_loop_blocks;
+					win = wper / cdiv; if (win == 0u) win = 1u;
+					wbase = (coff * wper) / cdiv;
+					if (wbase + win > wper) wbase = wper - win;
+					cyc = (gb / wper) * win;
+				} else {
+					wper = gb;
+					win = gb / cdiv; if (win == 0u) win = 1u;
+					wbase = (coff * gb) / cdiv;
+					if (wbase + win > gb) wbase = gb - win;
+					cyc = win;
+				}
 				/* BOUNDARY BUDGET: a chunk clipped by the loop wrap or the
 				 * content/silence boundary used to consume this track's
 				 * WHOLE turn in the round — so the only track with a
@@ -2753,10 +2823,12 @@ static void streamer_thread(void *a, void *b, void *c)
 					/* phase-anchored loop position: (pw_block - start_blk)
 					 * mod gb, safe when pw_block < start_blk (restart). */
 					uint32_t pwb = pw / SAMP_PER_BLK;
-					/* phase-anchored position within the CHOP WINDOW
-					 * (win=gb, wbase=0 when unchopped = original). */
-					uint32_t loop_blk = wbase +
-						(((pwb % win) + win - (t->start_blk % win)) % win);
+					/* phase-anchored position along the audible chop
+					 * cycle, tiled onto the region (variable mode:
+					 * wper=gb, cyc=win -> identical to M5). */
+					uint32_t c = ((pwb % cyc) + cyc -
+						      (t->start_blk % cyc)) % cyc;
+					uint32_t loop_blk = (c / win) * wper + wbase + (c % win);
 					uint32_t n = budget;
 					if (n > (RING_SAMPLES / SAMP_PER_BLK) - 1u) n = (RING_SAMPLES / SAMP_PER_BLK) - 1u;
 					/* VARIABLE TOP-UP: fill to ~full (keep a 1-block
@@ -2768,8 +2840,10 @@ static void streamer_thread(void *a, void *b, void *c)
 						if (n > _rb) n = _rb;
 					}
 					if (!n) break;
-					if (loop_blk + n > wbase + win)
-						n = wbase + win - loop_blk;   /* stop at the window wrap */
+					{	/* contiguous run ends at this tile's window edge */
+						uint32_t wend = (c / win) * wper + wbase + win;
+						if (loop_blk + n > wend) n = wend - loop_blk;
+					}
 					/* SILENCE PAD: the loop length can exceed the recorded
 					 * content (fixed mode). [content, gb) was never written
 					 * to flash — read it as synthesised zeros instead of
@@ -3938,7 +4012,13 @@ static void jump_to_slot(uint32_t ns)
 	g_play_bpm = (int)(((uint64_t)g_play_speed_q16 * LOOP_BPM_BASE + 32768u) / 65536u);
 	if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
 	if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
-	g_chop_div = 1; g_chop_off = 0;      /* chop is per-session, per-song */
+	{	/* M7: restore the target song's persisted chop + effective mode */
+		uint32_t cd = g_meta.chop[ns][0]; if (cd < 1u || cd > 64u) cd = 1u;
+		uint32_t co = g_meta.chop[ns][1]; if (co >= cd) co = 0u;
+		g_chop_div = cd; g_chop_off = co;
+		g_fixed_len = g_meta.song_mode[ns]
+			    ? (g_meta.song_mode[ns] == 2u ? 1u : 0u) : g_mode_pref;
+	}
 	g_slot_switch_req = 1;
 	g_meta_save_req = 1;
 }
@@ -4148,6 +4228,14 @@ int main(void)
 		if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
 		if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
 		g_led_dim = g_meta.led_full ? 0u : 1u;   /* restore brightness mode */
+		{	/* M7: current song's persisted chop + effective mode */
+			uint32_t cd = g_meta.chop[g_slot][0]; if (cd < 1u || cd > 64u) cd = 1u;
+			uint32_t co = g_meta.chop[g_slot][1]; if (co >= cd) co = 0u;
+			g_chop_div = cd; g_chop_off = co;
+			g_fixed_len = g_meta.song_mode[g_slot]
+				    ? (g_meta.song_mode[g_slot] == 2u ? 1u : 0u)
+				    : g_mode_pref;
+		}
 		g_slot_switch_req = 1;
 	}
 
@@ -4272,7 +4360,25 @@ int main(void)
 				    k_uptime_get() - combo_start >= 700) {
 					g_fixed_len ^= 1u;
 					combo_fired = 1;
-					g_meta.fixed_len = g_fixed_len;  /* persist across power-off */
+					/* M7c two-layer: on a RECORDED song the toggle
+					 * stamps THAT song only (global untouched); on an
+					 * EMPTY song it sets the global preference that
+					 * empty songs inherit. */
+					{
+						int has = 0;
+						for (int k = 0; k < NTRK; k++)
+							if (trk[k].state != TS_EMPTY ||
+							    (g_slot < NUM_SLOTS &&
+							     g_meta.slot[g_slot].present[k]))
+								has = 1;
+						if (has && g_slot < NUM_SLOTS) {
+							g_meta.song_mode[g_slot] =
+								g_fixed_len ? 2u : 1u;
+						} else {
+							g_mode_pref = g_fixed_len;
+							g_meta.fixed_len = g_fixed_len;
+						}
+					}
 					g_meta_save_req = 1;
 					/* LED feedback: FIXED = all four blink together twice
 					 * ("locked"); VARIABLE = a 1->4->1 sweep ("independent"). */
@@ -4366,6 +4472,11 @@ int main(void)
 						}
 						g_chop_off = (d > 1u) ? (o % d) : 0u;
 						g_chop_div = d;
+						if (g_slot < NUM_SLOTS) { /* M7a: persist per song */
+							g_meta.chop[g_slot][0] = (uint8_t)d;
+							g_meta.chop[g_slot][1] = (uint8_t)g_chop_off;
+							g_meta_save_req = 1;
+						}
 						g_chop_req = 1;           /* engine: snap to it */
 					}
 					led_service();
