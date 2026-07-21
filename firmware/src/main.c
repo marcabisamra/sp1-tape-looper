@@ -990,6 +990,14 @@ static volatile int      g_arm_req[NTRK];         /* main -> engine: track i pre
 static volatile int      g_stop_req;               /* main -> engine: track released (stop rec) */
 static volatile int      g_del_req[NTRK];          /* main -> engine: double-tap = delete track i */
 static volatile int      g_restart_req;            /* main -> engine: hold PLAY = jump to song start */
+/* GLOBAL LOOP CHOP (performance window, scheme A'): play only 1/div of every
+ * track's loop — the off'th slice. Non-destructive playback-window remap in
+ * the streamer's fill math only: recorded audio, loop lengths, beat grid and
+ * MIDI clock are untouched; div=1/off=0 is bit-identical to the original
+ * math. SESSION-ONLY: resets on song switch and power-off. */
+static volatile uint32_t g_chop_div = 1;           /* 1,2,4,... 64 (1 = full loop) */
+static volatile uint32_t g_chop_off = 0;           /* window index: 0..div-1 */
+static volatile int      g_chop_req;               /* main -> engine: window changed, snap rings */
 static volatile uint32_t g_beat_phase;            /* phase within a beat (loop samples), for LEDs */
 static volatile int      g_emmc_ready;
 static volatile int      g_dbg_beat;              /* current beat number (diag) */
@@ -1412,6 +1420,16 @@ static void looper_audio_block(int16_t *s)
 			g_playing = 1;
 			g_midi_start_pending = 1;
 		}
+	}
+
+	/* CHOP CHANGE: drop the (old-window) read-ahead so the new window is
+	 * audible within one refill round (~20-40 ms, boundary-faded by the
+	 * starve machinery) instead of after ~341 ms of stale ring. */
+	if (g_chop_req) {
+		g_chop_req = 0;
+		for (int i = 0; i < NTRK; i++)
+			if (trk[i].state == TS_PLAY)
+				trk[i].p_w = (g_consume_pos / SAMP_PER_BLK) * SAMP_PER_BLK;
 	}
 
 	/* SONG SWITCH: reload the tracks for the newly-selected slot. Tracks that the
@@ -2573,14 +2591,18 @@ static void streamer_thread(void *a, void *b, void *c)
 					uint32_t _pw   = (g_consume_pos / SAMP_PER_BLK) * SAMP_PER_BLK;
 					uint32_t _gb   = t->len_blocks ? t->len_blocks
 					               : (g_loop_blocks ? g_loop_blocks : 1u);
+					uint32_t _cdiv = g_chop_div, _coff = g_chop_off;
+					uint32_t _win  = _gb / _cdiv; if (_win == 0u) _win = 1u;
+					uint32_t _wb   = (_coff * _gb) / _cdiv;
+					if (_wb + _win > _gb) _wb = _gb - _win;
 					uint32_t _want = (RING_SAMPLES / 2u) + 16u * SAMP_PER_BLK;
 					if (_want > RING_SAMPLES) _want = RING_SAMPLES - SAMP_PER_BLK;
 					for (uint32_t _got = 0; _got < _want; ) {
 						uint32_t _pwb = _pw / SAMP_PER_BLK;
-						uint32_t _lb  = ((_pwb % _gb) + _gb - (t->start_blk % _gb)) % _gb;
+						uint32_t _lb  = _wb + (((_pwb % _win) + _win - (t->start_blk % _win)) % _win);
 						uint32_t _n   = 32u;
 						if (_n > (RING_SAMPLES / SAMP_PER_BLK) - 1u) _n = (RING_SAMPLES / SAMP_PER_BLK) - 1u;
-						if (_lb + _n > _gb) _n = _gb - _lb;
+						if (_lb + _n > _wb + _win) _n = _wb + _win - _lb;
 						/* SILENCE PAD (see PASS 2): [content, _gb) is synthesised
 						 * zeros, never read from flash. */
 						uint32_t _content = t->content_blocks ? t->content_blocks : _gb;
@@ -2695,6 +2717,12 @@ static void streamer_thread(void *a, void *b, void *c)
 				 * of the base), not the shared g_loop_blocks. */
 				uint32_t gb = t->len_blocks ? t->len_blocks
 					    : (g_loop_blocks ? g_loop_blocks : 1u);
+				/* GLOBAL CHOP window over this track's own length:
+				 * div=1 -> win=gb, wbase=0 = the original math. */
+				uint32_t cdiv = g_chop_div, coff = g_chop_off;
+				uint32_t win = gb / cdiv; if (win == 0u) win = 1u;
+				uint32_t wbase = (coff * gb) / cdiv;
+				if (wbase + win > gb) wbase = gb - win;
 				/* BOUNDARY BUDGET: a chunk clipped by the loop wrap or the
 				 * content/silence boundary used to consume this track's
 				 * WHOLE turn in the round — so the only track with a
@@ -2714,7 +2742,10 @@ static void streamer_thread(void *a, void *b, void *c)
 					/* phase-anchored loop position: (pw_block - start_blk)
 					 * mod gb, safe when pw_block < start_blk (restart). */
 					uint32_t pwb = pw / SAMP_PER_BLK;
-					uint32_t loop_blk = ((pwb % gb) + gb - (t->start_blk % gb)) % gb;
+					/* phase-anchored position within the CHOP WINDOW
+					 * (win=gb, wbase=0 when unchopped = original). */
+					uint32_t loop_blk = wbase +
+						(((pwb % win) + win - (t->start_blk % win)) % win);
 					uint32_t n = budget;
 					if (n > (RING_SAMPLES / SAMP_PER_BLK) - 1u) n = (RING_SAMPLES / SAMP_PER_BLK) - 1u;
 					/* VARIABLE TOP-UP: fill to ~full (keep a 1-block
@@ -2726,7 +2757,8 @@ static void streamer_thread(void *a, void *b, void *c)
 						if (n > _rb) n = _rb;
 					}
 					if (!n) break;
-					if (loop_blk + n > gb) n = gb - loop_blk;  /* stop at the wrap */
+					if (loop_blk + n > wbase + win)
+						n = wbase + win - loop_blk;   /* stop at the window wrap */
 					/* SILENCE PAD: the loop length can exceed the recorded
 					 * content (fixed mode). [content, gb) was never written
 					 * to flash — read it as synthesised zeros instead of
@@ -3395,7 +3427,7 @@ static void controls_diag(void)
 	for (int _i = 0; _i < NTRK; _i++)
 		mg[_i] = (int)((int32_t)(trk[_i].p_w - cpos) / (int)(LOOP_RATE / 1000u));
 	printk("LOOPER %dHz song=%d %s hp=%d hpin=%d usb=%d chg=%d batt=%d bpm=%d detbpm=%d vol=%d "
-	       "trk[%s %s %s %s] rec=%d mut=%u%u%u%u ovr=%u rerr=%u werr=%u marg=[%d %d %d %d]ms stv=[%u %u %u %u] len=[%u %u %u %u] st=[%u %u %u %u] spim=%d cache=%d ckb=%u wbi=%u\n",
+	       "trk[%s %s %s %s] rec=%d mut=%u%u%u%u ovr=%u rerr=%u werr=%u marg=[%d %d %d %d]ms stv=[%u %u %u %u] len=[%u %u %u %u] st=[%u %u %u %u] spim=%d cache=%d ckb=%u wbi=%u chop=%u/%u\n",
 	       (int)LOOP_RATE, (int)g_slot, g_playing ? "PLAY" : "STOP", g_hp_on, g_hp_in,
 	       usb_present() ? 1 : 0, charging() ? 1 : 0, batt,
 	       g_play_bpm, g_det_bpm, g_master_vol_q8,
@@ -3410,7 +3442,8 @@ static void controls_diag(void)
 	       (unsigned)g_starve_cnt[0], (unsigned)g_starve_cnt[1], (unsigned)g_starve_cnt[2], (unsigned)g_starve_cnt[3],
 	       (unsigned)trk[0].len_blocks, (unsigned)trk[1].len_blocks, (unsigned)trk[2].len_blocks, (unsigned)trk[3].len_blocks,
 	       (unsigned)trk[0].start_blk, (unsigned)trk[1].start_blk, (unsigned)trk[2].start_blk, (unsigned)trk[3].start_blk,
-	       emmc_spim_active() ? 1 : 0, g_cache_on ? 1 : 0, (unsigned)g_cache_kb, (unsigned)emmc_dbg_wr_busy_max);
+	       emmc_spim_active() ? 1 : 0, g_cache_on ? 1 : 0, (unsigned)g_cache_kb, (unsigned)emmc_dbg_wr_busy_max,
+	       (unsigned)g_chop_div, (unsigned)g_chop_off);
 	{
 		/* CPU= per-thread share of the last window, in percent: audio,
 		 * streamer, midi, main, everything-else(usb/idle/isr). Answers
@@ -3894,6 +3927,7 @@ static void jump_to_slot(uint32_t ns)
 	g_play_bpm = (int)(((uint64_t)g_play_speed_q16 * LOOP_BPM_BASE + 32768u) / 65536u);
 	if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
 	if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
+	g_chop_div = 1; g_chop_off = 0;      /* chop is per-session, per-song */
 	g_slot_switch_req = 1;
 	g_meta_save_req = 1;
 }
@@ -4115,6 +4149,10 @@ int main(void)
 	int bj_cnt = 0;                  /*   consecutive passes the candidate has held     */
 	int bj_fired = -1;               /*   band already jumped during this FUNCTION press */
 	int64_t fnp_edge = -1;           /* FUNCTION+PLAY dim toggle: last PLAY press edge */
+	enum vol_btn cp_cand = VOL_NONE; /* FUNCTION+rocker/Vol chop: sticky candidate */
+	int cp_cnt = 0;                  /*   consecutive passes it has held */
+	int cp_dcl_band = -1;            /*   last committed rocker band (double-click) */
+	int64_t cp_dcl_t = 0;            /*   when it committed */
 	uint8_t ctl_flush = 0;      /* looper decode state went stale (FUNCTION page / USB transfer owned the loop) */
 	int64_t last_diag = 0;      /* throttle the control read-out */
 
@@ -4281,6 +4319,50 @@ int main(void)
 				}
 				bj_cand = TRK_NONE; bj_cnt = 0;
 			}
+
+			/* LOOP CHOP (scheme A', collision-audited): while FUNCTION is
+			 * held the Vol/rocker ladder — which stock never reads during
+			 * FUNCTION holds — becomes the chop surface:
+			 *   FWD  = window /2 (shorter)   RWD  = window x2 (longer)
+			 *   Vol+ = shift window right    Vol- = shift window left
+			 *   rocker DOUBLE-CLICK = reset to the full loop
+			 * Sticky 3-pass commit (transit-proof); every commit sets
+			 * combo_seen so the press can never become a power-off; bare
+			 * rocker/Vol behavior outside FUNCTION holds is untouched. */
+			{
+				enum vol_btn vb = decode_vol(ladder_read(&adc_ladder[LAD_VOL]));
+				if (vb != VOL_NONE) {
+					if (vb == cp_cand) { if (cp_cnt < 1000) cp_cnt++; }
+					else { cp_cand = vb; cp_cnt = 1; }
+					if (cp_cnt == 3) {          /* committed press edge */
+						int64_t cnow = k_uptime_get();
+						combo_seen = 1;
+						uint32_t d = g_chop_div, o = g_chop_off;
+						if (vb == VOL_TEMPO_UP || vb == VOL_TEMPO_DOWN) {
+							if (cp_dcl_band == (int)vb &&
+							    cnow - cp_dcl_t <= 400) {
+								d = 1u; o = 0u;   /* double-click: RESET */
+							} else if (vb == VOL_TEMPO_UP) {
+								if (d < 64u) { d <<= 1; o <<= 1; }
+							} else {
+								if (d > 1u) { d >>= 1; o >>= 1; }
+							}
+							cp_dcl_band = (int)vb; cp_dcl_t = cnow;
+						} else if (vb == VOL_UP) {
+							o = (o + 1u) % d;
+						} else {                  /* VOL_DOWN */
+							o = (o + d - 1u) % d;
+						}
+						g_chop_off = (d > 1u) ? (o % d) : 0u;
+						g_chop_div = d;
+						g_chop_req = 1;           /* engine: snap to it */
+					}
+					led_service();
+					k_msleep(25);
+					continue;                 /* chord owns the button */
+				}
+				cp_cand = VOL_NONE; cp_cnt = 0;
+			}
 			if (combo_seen) {
 				/* The combo has been engaged this FUNCTION press: once PLAY
 				 * is lifted, do NOTHING further for the rest of the hold —
@@ -4327,6 +4409,7 @@ int main(void)
 		combo_fired = 0;
 		combo_seen  = 0;
 		bj_cand = TRK_NONE; bj_cnt = 0; bj_fired = -1; fnp_edge = -1;
+		cp_cand = VOL_NONE; cp_cnt = 0; cp_dcl_band = -1;
 
 		/* ---- looper controls + LEDs ---- */
 		{
