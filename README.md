@@ -1,29 +1,24 @@
-# SP-1 Tape Looper
+# SP-1 Tape Looper — 16-song fork
 
-A four-track, tape-machine-style looper for the Teenage Engineering SP-1.
+A tape-machine-style looper for the Teenage Engineering SP-1: four loop
+tracks per song, sixteen remembered songs in four banks.
 
-This is custom firmware that turns the SP-1 stem player into a hands-on tool for
-building layered loops. You feed audio in over USB-C (the SP-1 appears on your
-computer or phone as a USB sound card / speaker), record loops with the four
-track buttons, and they play back layered together through the speaker or
+This is custom firmware that turns the SP-1 stem player into a hands-on tool
+for building layered loops. You feed audio in over USB-C (the SP-1 appears on
+your computer or phone as a USB sound card / speaker), record loops with the
+four track buttons, and they play back layered together through the speaker or
 headphones. The rocker changes playback speed and pitch together, like tape.
-Loops are saved to the SP-1's internal flash, so they survive power-off and
-re-flashing the firmware.
+Everything — loops, tempo/pitch, chop and loop mode — persists per song on the
+SP-1's internal flash, surviving power-off and re-flashing.
 
-## About this fork (16-song edition)
+## About this fork
 
-This fork extends Technics' looper (chattock on GitHub) — author of both
-the upstream firmware and the dim-LED build this fork merges — into a
-16-song performance sketchbook:
-16 remembered songs in 4 banks (FUNCTION cycles banks, FUNCTION+Track
-jumps straight to one), per-song memory of tempo, chop window and
-fixed/variable mode, a global loop chop, press-accurate loop capture,
-always-dim LEDs with an FN+PLAY double-tap toggle, a battery gauge
-while charging, and full-scale headphone volume. See CHANGELOG.md for
-the complete list, credits, and compatibility notes (the SE16 index is
-a format break from stock - export your songs first via the transfer
-page). This fork's transfer page (16-song aware):
-https://marcabisamra.github.io/sp1-tape-looper/
+Forked from Technics' looper (chattock on GitHub) — author of both the
+upstream firmware and the dim-LED build this fork merges. Everything added
+is listed under Features below, and per release in CHANGELOG.md.
+Compatibility: the SE16 index is a format break from stock — export your
+songs first via the transfer page. This fork's transfer page (16-song
+aware): https://marcabisamra.github.io/sp1-tape-looper/
 
 Build it yourself: Zephyr v4.3.1 + SDK 0.17.4, apply
 zephyr-patches/uac2-windows-fs-feedback.patch to the Zephyr tree, then
