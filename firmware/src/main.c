@@ -1035,6 +1035,9 @@ static volatile int g_play_bpm = 80;
  * (the rocker still does tape varispeed); it's the metronome grid only. */
 static volatile uint32_t g_beat_samples = BEAT_SAMPLES_L;
 static volatile int      g_det_bpm;       /* diag: last detected BPM (0 = none) */
+static volatile int      g_tempo_fresh;   /* THIS take's tempo_finish() succeeded
+                                           * (guards the first-take beat snap
+                                           * against stale grids) */
 /* PRECOMPUTED MIDI-clock divisor: loop-samples per 24-PPQN tick = g_beat_samples/24.
  * Recomputed ONLY when the tempo is (re)detected, NOT per audio sample -- so the
  * detected tempo costs one divide once, not a runtime divide 48000x/sec on every
@@ -1061,6 +1064,7 @@ static void tempo_reset(void)
 {
 	memset((void *)&g_tempo, 0, sizeof(g_tempo));
 	g_tempo.active = 1;
+	g_tempo_fresh = 0;
 }
 static inline void tempo_feed(int16_t sv, uint32_t pos)
 {
@@ -1098,6 +1102,7 @@ static void tempo_finish(void)
 	g_beat_samples = beat;
 	g_midi_div = (beat + 12u) / 24u;          /* precompute once: no per-sample divide */
 	g_det_bpm = (int)(((uint64_t)LOOP_RATE * 60u + beat / 2u) / beat);
+	g_tempo_fresh = 1;
 }
 /* Boot STOPPED (no auto-play): the saved song loads paused; PLAY (tap=resume,
  * hold=from the top) or recording starts the tape. The device used to blast the
@@ -1299,9 +1304,35 @@ static void looper_audio_block(int16_t *s)
 				if (content < 1u) content = 1u;
 				else if (content > MAX_LOOP_BLOCKS) content = MAX_LOOP_BLOCKS;
 				if (g_loop_len == 0u) {
+					/* R3 (perfect-loop): the FIRST take defines the
+					 * loop, so give it the courtesy HEAD gave overdubs
+					 * (nearest-bar): run the estimator, and if THIS
+					 * take yielded a confident FRESH beat (>=4 onset
+					 * gaps, successful fold) and the length sits
+					 * within ~12.5% of a whole BEAT multiple, snap to
+					 * it. Beat-granular (odd meters survive); sparse /
+					 * ambient takes never detect -> never snap. */
+					tempo_finish();         /* set the detected beat grid + BPM */
+					if (g_tempo_fresh && g_tempo.n >= 4u && g_beat_samples) {
+						uint32_t bs = g_beat_samples;
+						uint32_t cs = content * SAMP_PER_BLK;
+						uint32_t beats = (cs + bs / 2u) / bs;
+						if (beats >= 1u) {
+							uint32_t snap = beats * bs;
+							uint32_t diff = snap > cs ? snap - cs
+								      : cs - snap;
+							if (diff * 8u <= bs) {
+								uint32_t nb =
+								  (snap + SAMP_PER_BLK - 1u)
+								  / SAMP_PER_BLK;
+								if (nb >= 1u &&
+								    nb <= MAX_LOOP_BLOCKS)
+									content = nb;
+							}
+						}
+					}
 					g_loop_len = content * SAMP_PER_BLK;
 					g_loop_blocks = content;
-					tempo_finish();         /* set the detected beat grid + BPM */
 					if (g_slot < NUM_SLOTS) {
 						g_meta.slot[g_slot].loop_len = g_loop_len;
 						g_meta_save_req = 1;
@@ -1310,6 +1341,10 @@ static void looper_audio_block(int16_t *s)
 				uint32_t len = content;
 				uint32_t tgt = content * SAMP_PER_BLK;   /* default: stop now */
 				uint8_t  sil = 1;                        /* pad the final sub-block */
+				if (tgt > trk[i].rec_count)
+					sil = 0;   /* R3 snapped UP: run on to the beat
+					            * line capturing live (the fixed-mode
+					            * run-on mechanic) */
 				if (trk[i].rec_target && !trk[i].rec_silence) {
 					/* SECOND tap while a fixed-mode take is running on to
 					 * the bar line (below): stop IMMEDIATELY — the loop
@@ -4651,10 +4686,10 @@ int main(void)
 			 * duration (50-150 ms, different every time) no longer
 			 * stretches the loop. CRITICAL: armed_press excludes the
 			 * press that ARMED this take — releasing the arming hold
-			 * stays latched (it must never read as a stop; without this
-			 * the arm cancelled itself ~50 ms after arming). The
-			 * episode-end handler above swallows this press's release;
-			 * R2 backdates the remaining constant. */
+			 * stays latched (without this the arm cancelled itself
+			 * ~50 ms after arming: the M6 flash-and-die regression).
+			 * The episode-end handler above swallows this press's
+			 * release; R2 backdates the remaining constant. */
 			if (committed >= TRK_1 && committed <= TRK_4) {
 				int ti = (int)committed;
 				if (ti != stop_tap_trk && !armed_press[ti] &&
