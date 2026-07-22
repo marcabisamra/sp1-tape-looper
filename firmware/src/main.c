@@ -894,6 +894,14 @@ static volatile uint32_t g_grid_beat_frames;  /* I2S frames per grid beat (curre
 static volatile uint64_t g_grid_next_tick;    /* next 24-PPQN tick, sample-clock domain */
 static volatile uint8_t  g_grid_active;       /* current song has a live grid */
 static volatile uint8_t  g_grid_save_req;     /* control -> streamer: write block 2 */
+/* M8b quantized capture: with a grid, arming PUNCHES IN on the next bar line
+ * (auto-start-on-sound is bypassed) and the stop rounds to the nearest grid
+ * BEAT — reusing fixed mode's run-on/snap-back machinery with the tapped beat
+ * as the base. Lengths quantize to a block-rounded beat so all grid takes are
+ * multiples of the SAME base = mutually locked forever. */
+static volatile uint64_t g_grid_punch_at;      /* sample-clock of the scheduled punch-in (0 = none) */
+static volatile uint8_t  g_gridrec;            /* current take was grid-punched */
+static volatile uint32_t g_gridrec_beat_samps; /* grid beat in STORED samples at punch speed */
 /* PASS 2 forensics (printed + zeroed each diag window): blocks delivered per
  * track, dead-history snaps per track, and round aborts (rec yield / read fail). */
 static volatile uint32_t g_p2blk[4];
@@ -1301,6 +1309,7 @@ static void looper_audio_block(int16_t *s)
 				trk[i].state = (g_slot < NUM_SLOTS && g_meta.slot[g_slot].present[i])
 					       ? TS_PLAY : TS_EMPTY;
 				g_rec_track = -1;
+				g_grid_punch_at = 0;   /* M8b: cancel the scheduled punch */
 				if (g_loop_len == 0u) {
 					/* A sole-track re-record ARM reset the song grid and the
 					 * playhead. A cancel must UNDO that damage: restore the
@@ -1343,9 +1352,52 @@ static void looper_audio_block(int16_t *s)
 						   / SAMP_PER_BLK;
 				if (content < 1u) content = 1u;
 				else if (content > MAX_LOOP_BLOCKS) content = MAX_LOOP_BLOCKS;
+				/* M8b QUANTIZED STOP: a grid-punched take rounds to the
+				 * NEAREST grid beat. The beat is block-rounded ONCE and
+				 * shared by every grid take -> all lengths are multiples
+				 * of the same base and stay locked to each other. */
+				uint32_t glen = 0, gbb = 0;
+				if (g_gridrec && g_gridrec_beat_samps) {
+					gbb = (g_gridrec_beat_samps + SAMP_PER_BLK / 2u)
+					      / SAMP_PER_BLK;
+					if (gbb < 1u) gbb = 1u;
+					uint32_t gm = (content + gbb / 2u) / gbb;
+					if (gm < 1u) gm = 1u;
+					uint32_t nearest = gm * gbb;
+					if (g_loop_len == 0u) {
+						/* M8b-r3 FIRST TAKE: TRIM-BACK policy — the
+						 * stop is instant and a loop can never
+						 * contain silence. Run on only in the
+						 * "nailed it" window (last ~15% of a beat);
+						 * otherwise snap DOWN to the last whole
+						 * beat (overhang stays on flash, unplayed).
+						 * Tap-tempo drift made the old run-to-the-
+						 * line wait long enough to read as "still
+						 * recording" (user report). */
+						uint32_t fl = (content / gbb) * gbb;
+						uint32_t win = (gbb * 4u) / 25u;
+						if (content < gbb)
+							glen = gbb;     /* degenerate: complete 1 beat */
+						else if (nearest > fl &&
+						         (nearest - content) <= win)
+							glen = nearest; /* tiny run-on to the line */
+						else
+							glen = fl;      /* trim back — instant */
+					} else {
+						glen = nearest;         /* overdub: fixed-style */
+					}
+					if (glen > MAX_LOOP_BLOCKS) glen = 0;  /* fall back free */
+				}
 				if (g_loop_len == 0u) {
-					g_loop_len = content * SAMP_PER_BLK;
-					g_loop_blocks = content;
+					uint32_t base = glen ? glen : content;
+					g_loop_len = base * SAMP_PER_BLK;
+					g_loop_blocks = base;
+					if (glen && gbb) {
+						/* the TAPPED grid defines the beat — exact
+						 * stored-domain beat, not the estimator */
+						g_beat_samples = g_gridrec_beat_samps;
+						g_midi_div = g_gridrec_beat_samps / 24u;
+					} else
 					tempo_finish();         /* set the detected beat grid + BPM */
 					if (g_slot < NUM_SLOTS) {
 						g_meta.slot[g_slot].loop_len = g_loop_len;
@@ -1365,6 +1417,33 @@ static void looper_audio_block(int16_t *s)
 					 * remainder plays as silence (the old behavior, as an
 					 * escape hatch). */
 					len = trk[i].len_blocks;
+					if (g_gridrec && g_gridrec_beat_samps) {
+						/* M8b-r3: on a GRID take the escape trims to
+						 * the last WHOLE beat instead of amputating
+						 * mid-beat and leaving a silent tail. */
+						uint32_t bb2 = (g_gridrec_beat_samps +
+								SAMP_PER_BLK / 2u) / SAMP_PER_BLK;
+						if (bb2 >= 1u) {
+							uint32_t fl2 = ((trk[i].rec_count /
+									 SAMP_PER_BLK) / bb2) * bb2;
+							if (fl2 >= bb2) {
+								len = fl2;
+								content = fl2;
+								tgt = fl2 * SAMP_PER_BLK;
+							}
+						}
+					}
+				} else if (glen) {
+					/* M8b: grid take — same early/late machinery as
+					 * fixed mode, with the tapped beat as the base:
+					 * EARLY -> run on to the grid line capturing live;
+					 * LATE -> snap back (overhang never plays). */
+					len = glen;
+					if (glen * SAMP_PER_BLK > trk[i].rec_count) {
+						content = glen;
+						tgt = glen * SAMP_PER_BLK;
+						sil = 0;
+					}
 				} else if (g_fixed_len && g_loop_blocks) {
 					/* FIXED mode: round to the NEAREST whole multiple of
 					 * the base — ceil-only rounding gapped BOTH ways
@@ -1402,6 +1481,7 @@ static void looper_audio_block(int16_t *s)
 				 * pad used to be hard zeros — a click baked into the seam;
 				 * fade the first 128 pad samples (~2.7 ms) down instead. */
 				trk[i].rec_silence = sil;
+				g_gridrec = 0;
 				if (sil) {
 					trk[i].rec_fade = 128;
 					/* the pad is only rec_target - rec_count samples
@@ -1461,6 +1541,29 @@ static void looper_audio_block(int16_t *s)
 		if (g_slot < NUM_SLOTS)   /* M7-r4: a fresh take is audible — unmute */
 			g_meta.song_mode[g_slot] &= (uint8_t)~(uint8_t)(0x10u << i);
 		trk[i].wait_peak = 0; trk[i].wait_ticks = 0;
+		if (g_grid_active && g_grid_beat_frames) {
+			if (g_loop_len == 0u) {
+				/* M8b-r5: the FIRST take punches IMMEDIATELY. The
+				 * punch re-anchors the downbeat anyway, so waiting
+				 * for the tapped lattice bought nothing — the phase
+				 * was discarded one line later (r2 contradiction;
+				 * felt as "aggressive waiting", user report). Story:
+				 * taps teach TEMPO, your first take places the
+				 * downbeat, overdubs wait for your bar. Remaining
+				 * first-take latency = the ~130 ms arm constant. */
+				g_grid_punch_at = g_sample_clock ? g_sample_clock : 1u;
+			} else {
+				/* OVERDUBS: next BAR line — aligning to the
+				 * existing material is the whole point. The armed
+				 * LED fast-blinks the count-in. */
+				uint64_t unit = (uint64_t)g_grid_beat_frames * 4u;
+				uint64_t off = g_sample_clock - g_grid_anchor;
+				g_grid_punch_at = g_grid_anchor +
+					((off + unit - 1u) / unit) * unit;
+			}
+		} else {
+			g_grid_punch_at = 0;
+		}
 		/* NOTE: len_blocks/start_blk are NOT reset here -- they are set when the
 		 * first sound lands (TS_REC). Leaving them intact means a re-record that
 		 * is cancelled (released before any sound) returns the track to PLAY with
@@ -1610,9 +1713,18 @@ static void looper_audio_block(int16_t *s)
 					 * cancel; the blinking LED shows it is armed. */
 					struct looptrk *rt = &trk[rt_i];
 					int32_t aa = lsamp < 0 ? -lsamp : lsamp;
-					/* trigger directly on the first sample past threshold (no
-					 * running-peak tracking needed) -- one less op per armed sample */
-					if (aa >= SOUND_THRESHOLD) {
+					int trigger;
+					if (g_grid_active && g_grid_beat_frames && g_grid_punch_at) {
+						/* M8b PUNCH-IN: start on the scheduled bar
+						 * line, not on sound (block-granular; the
+						 * stop is sample-exact relative to it). */
+						trigger = (g_sample_clock >= g_grid_punch_at);
+					} else {
+						/* trigger directly on the first sample past
+						 * threshold (no running-peak tracking) */
+						trigger = (aa >= SOUND_THRESHOLD);
+					}
+					if (trigger) {
 						if (g_loop_len == 0u) {
 							/* first take: this sound is loop position 0 */
 							g_consume_pos = 0; g_midi_start_pending = 1; g_midi_cnt = 0;
@@ -1636,6 +1748,22 @@ static void looper_audio_block(int16_t *s)
 							rt->start_blk = g_consume_pos / SAMP_PER_BLK;
 						}
 						rt->r_w = 0; rt->r_r = 0; rt->rec_count = 0; rt->rec_silence = 0;
+						if (g_grid_active && g_grid_beat_frames && g_grid_punch_at) {
+							/* M8b: beat length in STORED samples at
+							 * the punch-in tape speed (recording
+							 * follows the tape). */
+							g_gridrec_beat_samps = (uint32_t)
+								(((uint64_t)g_grid_beat_frames *
+								  g_cur_speed_q16) >> 16);
+							g_gridrec = 1;
+							if (g_loop_len == 0u)
+								/* M8b-r2: your first loop IS the
+								 * downbeat from here on */
+								g_grid_anchor = g_grid_punch_at;
+						} else {
+							g_gridrec = 0;
+						}
+						g_grid_punch_at = 0;
 						rt->state = TS_REC;
 					}
 				}
@@ -3949,8 +4077,27 @@ static void led_service(void)
 				                          : track_led_off(i);
 		} else for (int i = 0; i < NUM_TRACK_LEDS; i++) {
 			uint8_t st = trk[i].state;
-			if (st == TS_REC || st == TS_DONE)      track_led_on(i);
-			else if (st == TS_ARMED)                (on_beat ? track_led_on(i) : track_led_off(i));
+			if (st == TS_REC && trk[i].rec_target && !trk[i].rec_silence &&
+			    g_grid_active && g_grid_beat_frames) {
+				/* grid run-on ("finishing the beat"): double-blink so
+				 * continued recording reads deliberate, not stuck */
+				uint64_t ph3 = g_sample_clock - g_grid_anchor;
+				uint32_t hb2 = g_grid_beat_frames / 2u;
+				((hb2 && (uint32_t)(ph3 % hb2) < hb2 / 4u)
+					? track_led_on(i) : track_led_off(i));
+			}
+			else if (st == TS_REC || st == TS_DONE) track_led_on(i);
+			else if (st == TS_ARMED) {
+				int ab = on_beat;
+				if (g_grid_punch_at && g_grid_active && g_grid_beat_frames) {
+					/* waiting for the punch-in: blink at HALF-beat
+					 * rate — clearly alive, clearly on purpose */
+					uint64_t ph2 = g_sample_clock - g_grid_anchor;
+					uint32_t hb = g_grid_beat_frames / 2u;
+					if (hb) ab = ((uint32_t)(ph2 % hb) < hb / 4u);
+				}
+				(ab ? track_led_on(i) : track_led_off(i));
+			}
 			else if (st == TS_PLAY && !trk[i].muted && !g_playing)
 				track_led_on(i);   /* stopped: content reads solid, not
 				                    * frozen-dark like an empty track */
@@ -5021,20 +5168,29 @@ int main(void)
 				if (!armed_press[ti] && ti != stop_tap_trk &&
 				    g_rec_track < 0 &&
 				    trk[ti].state != TS_DONE &&
-				    k_uptime_get() - press_t[ti] >= (empt ? 100 : HOLD_RECORD_MS)) {
+				    k_uptime_get() - press_t[ti] >=
+				        (empt ? 100
+				              : ((g_grid_active && g_grid_beat_frames)
+				                 ? 120 : HOLD_RECORD_MS))) {
+					/* gridded songs: re-record hold trimmed 180->120 ms
+					 * (M8b-r5) — the punch waits for the bar anyway, so
+					 * the shorter hold only shrinks the felt constant;
+					 * tap-mute disambiguation still has 120 ms. */
 					/* g_rec_track < 0: one take at a time — while a latched
 					 * take runs, holding ANY track does nothing (no phantom
 					 * arm, no forced g_playing). state != TS_DONE: a hold on
 					 * a just-auto-finalized take (user trying to stop it)
 					 * must not silently arm a latched re-record that would
 					 * overwrite the take it is still flushing.
-					 * ti != stop_tap_trk: the press that STOPPED a take is
-					 * SPENT — R1 stops fire at press-down, so the finger is
-					 * still on the button while the take flushes; once back
-					 * in TS_PLAY the TS_DONE guard no longer covers it and
-					 * a deliberate 200-400 ms stop press re-armed a
-					 * re-record over the fresh loop. Arming needs a FRESH
-					 * press (latch clears at episode end). */
+					 * ti != stop_tap_trk (M8b-r4): the press that STOPPED a
+					 * take is SPENT — R1 stops fire at press-down, so the
+					 * finger is still on the button while the take flushes;
+					 * once it lands back in TS_PLAY the TS_DONE guard no
+					 * longer covers it, and a deliberate 200-400 ms stop
+					 * press re-armed a re-record that overwrote the loop
+					 * just made (user report; the grid punch then started
+					 * it recording all by itself). Arming requires a FRESH
+					 * press — the latch clears at episode end. */
 					armed_press[ti] = 1;
 					tap_deadline[ti] = 0;            /* a hold cancels a pending single-tap */
 					g_arm_req[ti] = 1;
