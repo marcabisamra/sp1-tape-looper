@@ -3867,6 +3867,9 @@ static void led_service(void)
 			uint8_t st = trk[i].state;
 			if (st == TS_REC || st == TS_DONE)      track_led_on(i);
 			else if (st == TS_ARMED)                (on_beat ? track_led_on(i) : track_led_off(i));
+			else if (st == TS_PLAY && !trk[i].muted && !g_playing)
+				track_led_on(i);   /* stopped: content reads solid, not
+				                    * frozen-dark like an empty track */
 			else if (st == TS_PLAY && on_beat && !trk[i].muted) track_led_on(i);
 			else if (st == TS_PLAY && trk[i].muted) track_led_ghost(i);
 			else                                    track_led_off(i);
