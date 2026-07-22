@@ -3669,6 +3669,17 @@ static enum vol_btn decode_vol(int v)
                                     * latency multiplies a frame's brightness
                                     * 10-80x = visible flicker. 60 us is both
                                     * brighter and 10x less jitter-sensitive.) */
+#define LED_GHOST_FRAME_DIV  5u    /* GHOST class: muted-but-loaded tracks lit
+                                    * ONE frame in five using the SAME proven
+                                    * 60 us window as normal dim -> 1/5 of dim
+                                    * brightness (~1.2% of solid), refresh 200 Hz
+                                    * (still far above flicker perception), ZERO
+                                    * new edge timing. History: an 8 us second
+                                    * CC window flickered (two independent IRQ
+                                    * entry jitters on a narrow width) and a
+                                    * 20 us in-ISR capture-spin failed to boot
+                                    * on hardware — this design reuses only
+                                    * field-proven mechanisms. */
 #define LED_PWM_TIMER      NRF_TIMER3
 #define LED_PWM_TIMER_IRQn TIMER3_IRQn
 /* every LED pin on each port (leds[]+track_leds[]) — for the OFF phase */
@@ -3676,6 +3687,8 @@ static enum vol_btn decode_vol(int v)
 #define LED_ALL_P1 ((1u<<13)|(1u<<12)|(1u<<15)|(1u<<14))
 static volatile uint32_t g_led_p0_on;   /* P0 LED pins logically lit */
 static volatile uint32_t g_led_p1_on;   /* P1 LED pins logically lit */
+static volatile uint32_t g_led_p0_ghost; /* P0 pins lit at GHOST duty */
+static volatile uint32_t g_led_p1_ghost; /* P1 pins lit at GHOST duty */
 
 /* DIRECT ISR (required for IRQ_ZERO_LATENCY): pure register IO, no kernel
  * calls, returns 0 = never asks for a reschedule. */
@@ -3684,19 +3697,27 @@ ISR_DIRECT_DECLARE(led_pwm_isr)
 	if (LED_PWM_TIMER->EVENTS_COMPARE[1]) {         /* period wrap: render shadow */
 		LED_PWM_TIMER->EVENTS_COMPARE[1] = 0;
 		(void)LED_PWM_TIMER->EVENTS_COMPARE[1];
-		NRF_P0->OUTSET = g_led_p0_on;
-		NRF_P0->OUTCLR = LED_ALL_P0 & ~g_led_p0_on;
-		NRF_P1->OUTSET = g_led_p1_on;
-		NRF_P1->OUTCLR = LED_ALL_P1 & ~g_led_p1_on;
+		static uint32_t gframe;
+		uint32_t gon = ((++gframe % LED_GHOST_FRAME_DIV) == 0u);
+		uint32_t s0 = g_led_p0_on | (gon ? (g_led_p0_ghost & ~g_led_p0_on) : 0u);
+		uint32_t s1 = g_led_p1_on | (gon ? (g_led_p1_ghost & ~g_led_p1_on) : 0u);
+		NRF_P0->OUTSET = s0;
+		NRF_P0->OUTCLR = LED_ALL_P0 & ~s0;
+		NRF_P1->OUTSET = s1;
+		NRF_P1->OUTCLR = LED_ALL_P1 & ~s1;
 	}
 	if (LED_PWM_TIMER->EVENTS_COMPARE[0]) {         /* on-time elapsed */
 		LED_PWM_TIMER->EVENTS_COMPARE[0] = 0;
 		(void)LED_PWM_TIMER->EVENTS_COMPARE[0];
 		if (g_led_dim) {                        /* dim: dark for the rest of
-		                                         * the frame. Full mode: skip
-		                                         * the clear -> LEDs solid. */
+		                                         * the frame. Full mode: only
+		                                         * ghost pins go dark — solid
+		                                         * LEDs stay lit. */
 			NRF_P0->OUTCLR = LED_ALL_P0;
 			NRF_P1->OUTCLR = LED_ALL_P1;
+		} else {
+			NRF_P0->OUTCLR = g_led_p0_ghost & ~g_led_p0_on;
+			NRF_P1->OUTCLR = g_led_p1_ghost & ~g_led_p1_on;
 		}
 	}
 	return 0;
@@ -3767,13 +3788,26 @@ static void show_song_leds(void)
 
 static void track_led_on(int i)
 {
-	if (track_leds[i].port == NRF_P0) g_led_p0_on |= (1u << track_leds[i].pin);
-	else                              g_led_p1_on |= (1u << track_leds[i].pin);
+	if (track_leds[i].port == NRF_P0) { g_led_p0_on |= (1u << track_leds[i].pin);
+	                                    g_led_p0_ghost &= ~(1u << track_leds[i].pin); }
+	else                              { g_led_p1_on |= (1u << track_leds[i].pin);
+	                                    g_led_p1_ghost &= ~(1u << track_leds[i].pin); }
 }
 static void track_led_off(int i)
 {
-	if (track_leds[i].port == NRF_P0) g_led_p0_on &= ~(1u << track_leds[i].pin);
-	else                              g_led_p1_on &= ~(1u << track_leds[i].pin);
+	if (track_leds[i].port == NRF_P0) { g_led_p0_on &= ~(1u << track_leds[i].pin);
+	                                    g_led_p0_ghost &= ~(1u << track_leds[i].pin); }
+	else                              { g_led_p1_on &= ~(1u << track_leds[i].pin);
+	                                    g_led_p1_ghost &= ~(1u << track_leds[i].pin); }
+}
+/* GHOST: barely-lit = this track HAS content but is muted (sleeping). The
+ * fix for "muted and empty look identical" — community request. */
+static void track_led_ghost(int i)
+{
+	if (track_leds[i].port == NRF_P0) { g_led_p0_ghost |= (1u << track_leds[i].pin);
+	                                    g_led_p0_on &= ~(1u << track_leds[i].pin); }
+	else                              { g_led_p1_ghost |= (1u << track_leds[i].pin);
+	                                    g_led_p1_on &= ~(1u << track_leds[i].pin); }
 }
 static void track_all_off(void)  { for (int i = 0; i < NUM_TRACK_LEDS; i++) track_led_off(i); }
 
@@ -3821,6 +3855,7 @@ static void led_service(void)
 			if (st == TS_REC || st == TS_DONE)      track_led_on(i);
 			else if (st == TS_ARMED)                (on_beat ? track_led_on(i) : track_led_off(i));
 			else if (st == TS_PLAY && on_beat && !trk[i].muted) track_led_on(i);
+			else if (st == TS_PLAY && trk[i].muted) track_led_ghost(i);
 			else                                    track_led_off(i);
 		}
 	}
