@@ -4,6 +4,16 @@ All notable changes in this fork of Technics' sp1-tape-looper
 (chattock on GitHub).
 Base: upstream commit c60941c (2026-07-14).
 
+## [1.2.3] - 2026-07-23
+
+### Fixed
+- The brightness setting now covers every light the device shows. The
+  charging gauge, the power-ON sweep and the FUNCTION-hold power-off
+  sequence all ran dim regardless of the saved mode, because they lit
+  before the index holding the setting had been read. The index reader now
+  starts ahead of standby and the saved mode is applied before each of
+  those moments (including button wake-ups, which skip standby entirely).
+
 ## [1.2.2] - 2026-07-23
 
 ### Added
