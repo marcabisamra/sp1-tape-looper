@@ -2090,6 +2090,17 @@ static bool emmc_busy_abort_chk(void)
  * ring to the card; on DONE, finish the tail then switch the track to PLAY. */
 static K_THREAD_STACK_DEFINE(streamer_stack, 4096);  /* 4096: the eMMC driver is -O2 here, so its read/send_command/crc chain inlines into a deeper frame on this thread */
 static struct k_thread streamer_tcb;
+static uint8_t g_streamer_started;   /* v1.2.3: streamer may start EARLY (standby) */
+static void streamer_thread(void *a, void *b, void *c);
+static void streamer_start(void)
+{
+	if (g_streamer_started) return;
+	g_streamer_started = 1;
+	k_thread_create(&streamer_tcb, streamer_stack, K_THREAD_STACK_SIZEOF(streamer_stack),
+			streamer_thread, NULL, NULL, NULL,
+			K_PRIO_PREEMPT(5), 0, K_NO_WAIT);
+}
+static volatile uint8_t g_usb_up;    /* usb_audio_start() completed (gates xfer polling) */
 
 #if SP1_XFER_ENABLE
 /* ISR: drain the CDC RX FIFO into the ring buffer (host -> device bytes). */
@@ -2616,8 +2627,11 @@ static void streamer_thread(void *a, void *b, void *c)
 #if SP1_XFER_ENABLE
 		/* Website loop transfer: scan for the connect-magic / run one command
 		 * per pass. While a transfer is active the transport is paused and
-		 * the streamer serves ONLY the transfer (audio is silent anyway). */
-		xfer_service();
+		 * the streamer serves ONLY the transfer (audio is silent anyway).
+		 * v1.2.3: gated on USB being up — the streamer can now run during
+		 * charge-standby, before usb_audio_start(). */
+		if (g_usb_up)
+			xfer_service();
 #endif
 		if (g_xfer_mode) { k_msleep(1); continue; }
 
@@ -3442,10 +3456,10 @@ static void audio_init(void)
 	 * every take = THE 4-track crackle. Shared state with the USB threads is
 	 * one SPSC ring buffer and one mem-slab, both preemption-safe. */
 
-	/* eMMC streamer: preemptible + below the audio thread so audio always wins. */
-	k_thread_create(&streamer_tcb, streamer_stack, K_THREAD_STACK_SIZEOF(streamer_stack),
-			streamer_thread, NULL, NULL, NULL,
-			K_PRIO_PREEMPT(5), 0, K_NO_WAIT);
+	/* eMMC streamer: preemptible + below the audio thread so audio always
+	 * wins. Guarded: in the charge-standby path it was already started
+	 * early so the gauge can read the saved brightness (v1.2.3). */
+	streamer_start();
 
 	/* MIDI clock + PO sync out over the SYNC jack (TimK pins). The MIDI byte TX
 	 * is now clocked by a hardware timer (midi_timer_init) so it no longer masks
@@ -4532,6 +4546,15 @@ int main(void)
 	 * Idempotent (pure register config); the original call later is unchanged. */
 	controls_init();
 
+	/* EARLY streamer start (v1.2.3): the saved brightness lives in the song
+	 * index, and only the streamer reads the eMMC — but it used to be created
+	 * AFTER standby, so the charging gauge could never see the setting and
+	 * always showed the dim default (user report). Started here it inits the
+	 * eMMC, loads the index (g_meta_loaded -> the standby loop applies
+	 * led_full), then idles; the audio_init call is guarded against a double
+	 * create, and its transfer polling waits for USB (g_usb_up). */
+	streamer_start();
+
 	/* ---- CHARGE-STANDBY: the device no longer springs to life on its own ----
 	 * Plugging USB in (or finishing a flash, or inserting a battery) lands here:
 	 * silent, looper untouched, LED 1 blinking while charging / solid when full.
@@ -4549,6 +4572,14 @@ int main(void)
 		uint32_t blink = 0;
 		while (1) {
 			feed_wdt();
+			/* v1.2.3-r7: apply the saved brightness at the TOP of the
+			 * standby loop so EVERY branch honors it — the r5 apply sat
+			 * inside the gauge branch only, so the hold-to-turn-on
+			 * feedback and the turn-on transition stayed dim (user
+			 * report). The early streamer (r6) has the index loaded
+			 * well inside the 600 ms hold. */
+			if (g_meta_loaded)
+				g_led_dim = g_meta.led_full ? 0u : 1u;
 			if (pwr_pressed()) {
 				if (hold_t < 0) hold_t = k_uptime_get();
 				else if (k_uptime_get() - hold_t >= 600)
@@ -4574,6 +4605,13 @@ int main(void)
 				 * empty end is a ~3.35 V physics estimate pending a real
 				 * low reading. Spread at 25/50/75% of that range. Refine
 				 * batt_thr once a near-empty batt= value is logged. */
+				/* v1.2.3: standby (charging) runs BEFORE the boot
+				 * block that applies the saved brightness, so the
+				 * gauge always showed the dim default even in full
+				 * mode (user report). Apply it here as soon as the
+				 * streamer has the index; idempotent per pass. */
+				if (g_meta_loaded)
+					g_led_dim = g_meta.led_full ? 0u : 1u;
 				static const int batt_thr[3] = { 2020, 2140, 2260 };
 				static int bavg = -1;   /* smoothed reading (EMA over ~10 passes) */
 				static int blvl = 0;    /* sticky displayed level (hysteresis) */
@@ -4621,6 +4659,7 @@ int main(void)
 	audio_init();                   /* osc on, TAS2505 configured, I2S running  */
 	hp_init();                      /* headphone codec on (always-on, TimK's driver) */
 	usb_audio_start();              /* device_next: UAC2 audio-in + CDC console  */
+	g_usb_up = 1;                   /* streamer may poll the transfer page now */
 	feed_wdt();
 
 	/* HEADPHONE AUTO-MUTE boot state: start muted if headphones are already in. */
@@ -4636,6 +4675,17 @@ int main(void)
 		tas_set_speaker(!g_hp_in);
 	}
 #endif
+
+	/* v1.2.3-r8: apply the saved brightness BEFORE the power-ON sweep.
+	 * Button wakes skip standby entirely, so none of the standby-loop
+	 * applies run on the battery power-on path — the sweep rendered three
+	 * lines before the meta-wait and always used the dim default (user
+	 * report, third location of the same boot-ordering gap). The early
+	 * streamer has the index long before this point; the bounded wait is
+	 * effectively zero. */
+	for (int bw = 0; bw < 100 && !g_meta_loaded; bw++) { feed_wdt(); k_msleep(5); }
+	if (g_meta_loaded)
+		g_led_dim = g_meta.led_full ? 0u : 1u;
 
 	/* ---- power-ON indication: sweep the LEDs on, then clear ---- */
 	for (int i = 0; i < NUM_LEDS; i++) {
