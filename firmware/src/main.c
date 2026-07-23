@@ -913,7 +913,6 @@ static volatile uint32_t g_gridrec_beat_samps; /* grid beat in STORED samples at
  * tape + resyncs the loop start to the tapped downbeat at the next bar). */
 static volatile uint64_t g_grid_next_bar;      /* next bar line, sample-clock domain */
 static volatile uint64_t g_grid_resync_at;     /* pending loop-restart at this bar (0 = none) */
-static volatile uint8_t  g_mute_pend[NTRK];    /* mute toggle waiting for the bar */
 /* PASS 2 forensics (printed + zeroed each diag window): blocks delivered per
  * track, dead-history snaps per track, and round aborts (rec yield / read fail). */
 static volatile uint32_t g_p2blk[4];
@@ -2005,21 +2004,12 @@ static void looper_audio_block(int16_t *s)
 		}
 		/* M8c: BAR-LINE service — launch-quantized mutes apply here, and a
 		 * pending beatmatch resync restarts the loops on the tapped "1".
-		 * Bars are ~2 s and blocks ~5 ms: one crossing per block, max. */
+		 * Bars are ~2 s and blocks ~5 ms: one crossing per block, max.
+		 * (v2.0.0: launch-quantized MUTES were removed after live testing —
+		 * a bar is up to ~5 s of felt lag; mutes are instant everywhere
+		 * now, like 1.x. The bar service keeps only the beatmatch resync;
+		 * recording punch-ins stay bar-quantized via g_grid_punch_at.) */
 		if (g_grid_next_bar && g_sample_clock >= g_grid_next_bar) {
-			for (int mi = 0; mi < NTRK; mi++) {
-				if (!g_mute_pend[mi]) continue;
-				g_mute_pend[mi] = 0;
-				if (trk[mi].state == TS_PLAY) {
-					trk[mi].muted = !trk[mi].muted;
-					if (g_slot < NUM_SLOTS) {   /* persist (M7-r4 nibble) */
-						uint8_t mb = (uint8_t)(0x10u << mi);
-						if (trk[mi].muted) g_meta.song_mode[g_slot] |= mb;
-						else               g_meta.song_mode[g_slot] &= (uint8_t)~mb;
-						g_meta_save_req = 1;
-					}
-				}
-			}
 			if (g_grid_resync_at && g_sample_clock >= g_grid_resync_at) {
 				g_grid_resync_at = 0;
 				g_restart_req = 1;      /* loops from the top, ON the "1" */
@@ -4154,14 +4144,7 @@ static void led_service(void)
 				                          : track_led_off(i);
 		} else for (int i = 0; i < NUM_TRACK_LEDS; i++) {
 			uint8_t st = trk[i].state;
-			if (g_mute_pend[i] && g_grid_active && g_grid_beat_frames) {
-				/* M8c: mute/unmute waiting for the bar — fast blink */
-				uint64_t ph4 = g_sample_clock - g_grid_anchor;
-				uint32_t hb3 = g_grid_beat_frames / 2u;
-				((hb3 && (uint32_t)(ph4 % hb3) < hb3 / 4u)
-					? track_led_on(i) : track_led_off(i));
-			}
-			else if (st == TS_REC && trk[i].rec_target && !trk[i].rec_silence &&
+			if (st == TS_REC && trk[i].rec_target && !trk[i].rec_silence &&
 			    g_grid_active && g_grid_beat_frames) {
 				/* grid run-on ("finishing the beat"): double-blink so
 				 * continued recording reads deliberate, not stuck */
@@ -4456,7 +4439,6 @@ static void jump_to_slot(uint32_t ns)
 			g_grid_next_bar = 0;
 		}
 		g_grid_resync_at = 0;
-		for (int pi = 0; pi < NTRK; pi++) g_mute_pend[pi] = 0;
 	}
 	g_slot_switch_req = 1;
 	g_meta_save_req = 1;
@@ -5329,17 +5311,12 @@ int main(void)
 						tap_deadline[ti] = 0;   /* 2nd tap -> DELETE */
 						g_del_req[ti] = 1;
 						trk[ti].muted = 0;
-						g_mute_pend[ti] = 0;    /* M8c: cancel pending */
-					} else if (g_grid_active && g_grid_beat_frames &&
-						   trk[ti].state == TS_PLAY) {
-						/* M8c LAUNCH QUANTIZE: the mute waits for
-						 * the bar line (the engine applies + then
-						 * persists it). Tapping again while pending
-						 * cancels. LED fast-blinks the wait. */
-						g_mute_pend[ti] = !g_mute_pend[ti];
-						tap_deadline[ti] = tnow + DTAP_GAP_MS;
 					} else {
-						trk[ti].muted = !trk[ti].muted;  /* tap -> mute */
+						/* tap -> mute, INSTANT on gridded and
+						 * ungridded songs alike (v2.0.0: the M8c
+						 * bar-wait was removed after live testing —
+						 * see the bar-service note). */
+						trk[ti].muted = !trk[ti].muted;
 						if (g_slot < NUM_SLOTS) {  /* M7-r4: remember per song */
 							uint8_t mb = (uint8_t)(0x10u << ti);
 							if (trk[ti].muted) g_meta.song_mode[g_slot] |= mb;
@@ -5409,13 +5386,17 @@ int main(void)
 				    g_rec_track < 0 &&
 				    trk[ti].state != TS_DONE &&
 				    k_uptime_get() - press_t[ti] >=
-				        (empt ? 100
-				              : ((g_grid_active && g_grid_beat_frames)
-				                 ? 120 : HOLD_RECORD_MS))) {
-					/* gridded songs: re-record hold trimmed 180->120 ms
-					 * (M8b-r5) — the punch waits for the bar anyway, so
-					 * the shorter hold only shrinks the felt constant;
-					 * tap-mute disambiguation still has 120 ms. */
+				        (empt ? 100 : HOLD_RECORD_MS)) {
+					/* v2.0.0: the gridded re-record hold is HOLD_RECORD_MS
+					 * again. M8b-r5 trimmed it to 120 ms ("the punch waits
+					 * for the bar anyway") but real taps measure 50-150 ms
+					 * (the R1 notes), so the top of the tap band was ARMING
+					 * RE-RECORDS on gridded songs — eating the 2nd tap of
+					 * double-tap delete and zeroing its window (user found
+					 * it as "delete works worse on gridded songs"). The
+					 * 60 ms the trim saved was invisible anyway: an overdub
+					 * punch waits for the bar regardless. Empty tracks keep
+					 * the 100 ms instant arm (a tap means nothing there). */
 					/* g_rec_track < 0: one take at a time — while a latched
 					 * take runs, holding ANY track does nothing (no phantom
 					 * arm, no forced g_playing). state != TS_DONE: a hold on
