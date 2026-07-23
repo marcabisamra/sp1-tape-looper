@@ -4,6 +4,24 @@ All notable changes in this fork of Technics' sp1-tape-looper
 (chattock on GitHub).
 Base: upstream commit c60941c (2026-07-14).
 
+## [2.0.0] - 2026-07-23
+
+### Added
+- Takes up to ~7.5 minutes per track at 1.0x (MAX_BEATS 400 -> 600), on all
+  16 songs — 72.9% of the card, ~1 GB spare. Recording follows tape speed,
+  so a slowed tape stretches that further (about 15 minutes at half speed).
+- Transfer page: a Download all button exports every track with content in
+  one click (the browser asks once for multi-download permission).
+
+### BREAKING — export your songs before flashing
+- The track regions grew, so the on-flash layout changed (new index magic
+  'SL16'). First boot on v2.0.0 reformats loop storage: export everything
+  as WAVs on your old firmware, flash, then re-upload. The transfer page
+  needs no update — it reads the layout from the device, so it speaks old
+  and new firmware automatically. Tapped grids survive the trip; saved tape
+  speeds reset to 1.0x (uploads are rate-compensated, so songs still sound
+  the same).
+
 ## [1.2.4] - 2026-07-23
 
 ### Added

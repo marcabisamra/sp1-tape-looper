@@ -16,9 +16,11 @@ SP-1's internal flash, surviving power-off and re-flashing.
 Forked from Technics' looper (chattock on GitHub) — author of both the
 upstream firmware and the dim-LED build this fork merges. Everything added
 is listed under Features below, and per release in CHANGELOG.md.
-Compatibility: the SE16 index is a format break from stock — export your
-songs first via the transfer page. This fork's transfer page (16-song
-aware): https://marcabisamra.github.io/sp1-tape-looper/
+Compatibility: the SL16 index is a format break from stock — and updating
+from fork v1.x is one too (v2.0.0 grew the track regions): export your
+songs as WAVs first, flash, then re-upload. The transfer page handles old
+and new firmware automatically, and grids survive the trip. This fork's
+transfer page (16-song aware): https://marcabisamra.github.io/sp1-tape-looper/
 
 Build it yourself: Zephyr v4.3.1 + SDK 0.17.4, apply
 zephyr-patches/uac2-windows-fs-feedback.patch to the Zephyr tree, then
@@ -58,7 +60,10 @@ What this fork adds on top of the upstream looper:
   device or power off while still plugged in.
 - **Full-scale headphones** — the −19 dB output pad in the codec init is
   gone; max headphone volume matches the stock firmware.
-- **Transfer page, fork edition** — 16-song aware, and WAVs round-trip at the
+- **Long takes** — up to ~7.5 minutes per track at 1.0x (about 15 with the
+  tape at half speed), on all 16 songs.
+- **Transfer page, fork edition** — 16-song aware, with one-click Download
+  all, and WAVs round-trip at the
   pitch you actually hear on the device (fixes the upstream export-pitch
   bug): <https://marcabisamra.github.io/sp1-tape-looper/>
 
@@ -184,8 +189,9 @@ SP-1 custom firmware) — no soldering or opening the device required:
   MIDI clock; every take after that is free.
 - Only one track records at a time. Recording onto a non-empty track replaces
   it.
-- A take that reaches the per-track maximum (about 5 minutes) finalizes
-  itself.
+- A take that reaches the per-track maximum (about 7.5 minutes at 1.0x —
+  longer if the tape is slowed, since recording follows tape speed)
+  finalizes itself.
 
 ### Playback
 - PLAY button, tap: play / stop (with a tape-style speed glide).
