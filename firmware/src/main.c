@@ -3894,16 +3894,16 @@ static enum vol_btn decode_vol(int v)
  * shadow at a low duty cycle. Single writer (control thread), ISR only
  * reads. ~1 kHz frame = flicker-free. LED_PWM_ON_US is the brightness. */
 #define LED_PWM_PERIOD_US 1000u    /* 1 kHz frame */
-#define LED_PWM_ON_US       52u    /* ~5.2% duty — a hair dimmer than the old
-                                    * 60 on the track row. Floor note: at 6 us,
-                                    * IRQ-entry jitter of +/-3 us is a 10-80x
-                                    * brightness swing = flicker; at 52 us it
-                                    * vanishes under the eye's averaging. */
+#define LED_PWM_ON_US       52u    /* ~5.2% duty — v1.2.2: a hair dimmer than
+                                    * the old 60 on the track row. Floor: at
+                                    * 6 us, IRQ-entry jitter of +/-3 us is a
+                                    * 10-80x brightness swing = flicker; at
+                                    * 36 us it is +/-8% before the eye's ~10-
+                                    * frame averaging — invisible. */
 #define LED_STATUS_ON_US    66u    /* the SONG/status row runs a longer window
                                     * than the track row: slightly brighter
-                                    * side lights. CC2 second window — wide =
-                                    * jitter-immune (unlike the 8 us ghost
-                                    * experiments). */
+                                    * side lights relative to the tracks. CC2
+                                    * mechanism, wide-window = jitter-immune. */
 #define LED_GHOST_FRAME_DIV  5u    /* GHOST class: muted-but-loaded tracks lit
                                     * ONE frame in five using the SAME proven
                                     * 60 us window as normal dim -> 1/5 of dim
@@ -4170,6 +4170,49 @@ static void led_service(void)
 			else                                    track_led_off(i);
 		}
 	}
+}
+
+/* FN+PLAY mode toggle (v1.2.2: fires on PLAY RELEASE, 0.7-5 s of hold —
+ * holding through 5 s becomes the brightness toggle instead). M7c two-layer
+ * semantics + the LED confirm, verbatim from the old in-hold body. */
+static void feed_wdt(void);
+static void fnp_mode_toggle(void)
+{
+	g_fixed_len ^= 1u;
+	{
+		int has = 0;
+		for (int k = 0; k < NTRK; k++)
+			if (trk[k].state != TS_EMPTY ||
+			    (g_slot < NUM_SLOTS &&
+			     g_meta.slot[g_slot].present[k]))
+				has = 1;
+		if (has && g_slot < NUM_SLOTS) {
+			g_meta.song_mode[g_slot] = (uint8_t)
+				((g_meta.song_mode[g_slot] & 0xF0u) |
+				 (g_fixed_len ? 2u : 1u));
+		} else {
+			g_mode_pref = g_fixed_len;
+			g_meta.fixed_len = g_fixed_len;
+		}
+	}
+	g_meta_save_req = 1;
+	all_off(); track_all_off();
+	if (g_fixed_len) {
+		for (int r = 0; r < 2; r++) {
+			for (int i = 0; i < NUM_LEDS; i++) led_on(i);
+			feed_wdt(); k_msleep(150);
+			for (int i = 0; i < NUM_LEDS; i++) led_off(i);
+			feed_wdt(); k_msleep(120);
+		}
+	} else {
+		for (int i = 0; i < NUM_LEDS; i++) {
+			led_on(i); feed_wdt(); k_msleep(110); led_off(i);
+		}
+		for (int i = NUM_LEDS - 2; i >= 0; i--) {
+			led_on(i); feed_wdt(); k_msleep(90); led_off(i);
+		}
+	}
+	all_off();
 }
 
 /* ---------- watchdog ---------- */
@@ -4638,6 +4681,7 @@ int main(void)
 	int64_t tap_first = 0, tap_last = 0;  /* M8a FN-tap tempo run */
 	int      tap_n = 0;
 	uint64_t tap_first_s = 0;             /* sample-clock at first tap */
+	int      fnp_low = 0;                 /* PLAY-release debounce (passes) */
 	int64_t combo_start = -1;   /* FUNCTION+PLAY: when the combo was first seen */
 	uint8_t combo_fired = 0;    /* mode already toggled this combo press */
 	uint8_t combo_seen  = 0;    /* PLAY was seen at all during this FUNCTION press */
@@ -4734,16 +4778,14 @@ int main(void)
 			 * power-off), and the FUNCTION-release song-change is suppressed. */
 			int fraw = ladder_read(&adc_ladder[LAD_TRACKS]);
 			if (fraw > 1600) {
+				fnp_low = 0;
 				combo_seen = 1;
 				if (combo_start < 0) {           /* fresh PLAY press edge */
 					int64_t fnp_now = k_uptime_get();
-					/* DIM TOGGLE — FUNCTION + PLAY DOUBLE-TAP: a second
-					 * PLAY press edge within 450 ms flips dim<->full
-					 * (persisted). Distinct from the 0.7 s CONTINUOUS
-					 * hold (loop-length toggle, untouched); firing also
-					 * blocks that hold-toggle for the rest of this press
-					 * so one gesture can't do both. The brightness
-					 * change itself is the feedback. */
+					/* FUNCTION + PLAY DOUBLE-TAP = snap to 1.0x. A
+					 * second PLAY press edge within 450 ms fires it
+					 * and blocks the hold tiers for this press so one
+					 * gesture can't do two things. */
 					if (fnp_edge >= 0 && fnp_now - fnp_edge <= 450 &&
 					    !combo_fired) {
 						/* M8c: SNAP TO 1.0x — instant return to
@@ -4761,53 +4803,34 @@ int main(void)
 					combo_start = fnp_now;
 				}
 				if (!combo_fired &&
-				    k_uptime_get() - combo_start >= 700) {
-					g_fixed_len ^= 1u;
-					combo_fired = 1;
-					/* M7c two-layer: on a RECORDED song the toggle
-					 * stamps THAT song only (global untouched); on an
-					 * EMPTY song it sets the global preference that
-					 * empty songs inherit. */
-					{
-						int has = 0;
-						for (int k = 0; k < NTRK; k++)
-							if (trk[k].state != TS_EMPTY ||
-							    (g_slot < NUM_SLOTS &&
-							     g_meta.slot[g_slot].present[k]))
-								has = 1;
-						if (has && g_slot < NUM_SLOTS) {
-							g_meta.song_mode[g_slot] = (uint8_t)
-								((g_meta.song_mode[g_slot] & 0xF0u) |
-								 (g_fixed_len ? 2u : 1u));
-						} else {
-							g_mode_pref = g_fixed_len;
-							g_meta.fixed_len = g_fixed_len;
-						}
-					}
+				    k_uptime_get() - combo_start >= 5000) {
+					/* v1.2.2: HOLD THROUGH 5 s = BRIGHTNESS toggle,
+					 * firing WITHOUT release — the light change is
+					 * the confirm and the press is spent. The mode
+					 * toggle moved to PLAY-RELEASE (0.7-5 s), so a
+					 * hold that reaches 5 s never flips the mode. */
+					g_led_dim ^= 1u;
+					g_meta.led_full = g_led_dim ? 0u : 1u;
 					g_meta_save_req = 1;
-					/* LED feedback: FIXED = all four blink together twice
-					 * ("locked"); VARIABLE = a 1->4->1 sweep ("independent"). */
-					all_off(); track_all_off();
-					if (g_fixed_len) {
-						for (int r = 0; r < 2; r++) {
-							for (int i = 0; i < NUM_LEDS; i++) led_on(i);
-							feed_wdt(); k_msleep(150);
-							for (int i = 0; i < NUM_LEDS; i++) led_off(i);
-							feed_wdt(); k_msleep(120);
-						}
-					} else {
-						for (int i = 0; i < NUM_LEDS; i++) {
-							led_on(i); feed_wdt(); k_msleep(110); led_off(i);
-						}
-						for (int i = NUM_LEDS - 2; i >= 0; i--) {
-							led_on(i); feed_wdt(); k_msleep(90); led_off(i);
-						}
-					}
-					all_off();
+					combo_fired = 1;
 				}
 				k_msleep(25);
 				continue;                /* combo owns the button */
 			}
+			if (combo_start >= 0) {
+				/* v1.2.2-r4: DEBOUNCED release — the shared ladder can
+				 * dip below the PLAY band for a stray pass mid-hold,
+				 * which used to reset the 5 s clock (user: "brightness
+				 * takes ~7 s"). Only 3 consecutive low passes count as
+				 * a real release. */
+				if (++fnp_low < 3) { k_msleep(25); continue; }
+				if (!combo_fired) {
+					int64_t fnp_held = k_uptime_get() - combo_start;
+					if (fnp_held >= 350 && fnp_held < 5000)
+						fnp_mode_toggle();  /* mode fires on RELEASE */
+				}
+			}
+			fnp_low = 0;
 			combo_start = -1;            /* PLAY not held */
 
 			/* BANK JUMP — FUNCTION + Track N -> first song of bank N (M4b).
@@ -4946,6 +4969,16 @@ int main(void)
 		}
 
 		if (press_start >= 0) {                  /* just released */
+			/* v1.2.2-r4: releasing FUNCTION first (or both together —
+			 * the natural way to end the chord) must ALSO fire the
+			 * release-toggle; before, only a PLAY-first release did,
+			 * so the gesture silently aborted most of the time (user:
+			 * "mode takes ~4 s" = retries until a lucky stagger). */
+			if (combo_start >= 0 && !combo_fired) {
+				int64_t fnp_held2 = k_uptime_get() - combo_start;
+				if (fnp_held2 >= 350 && fnp_held2 < 5000)
+					fnp_mode_toggle();
+			}
 			if (!combo_seen &&
 			    (k_uptime_get() - press_start) < 600) {
 				/* M8a: FN-tap = TAP TEMPO (navigation moved into the
