@@ -212,10 +212,11 @@ SP-1 custom firmware) — no soldering or opening the device required:
   track slices its own length.
 
 ### Lights and battery
-- LEDs are always dim (comfortable indoors). Full brightness for direct
-  sunlight lives on the transfer page's hidden settings panel (open the
-  page with #settings after the URL) — applied live at transfer commit and
-  remembered across power-off.
+- LEDs run dim, with the song/status row a touch brighter than the track
+  row. For direct sunlight, hold **FUNCTION + PLAY through 5 seconds** —
+  brightness flips right at the 5-second mark, no release needed — or use
+  the transfer page's hidden settings panel (open the page with #settings).
+  Both persist across power-off.
 - A muted track that HAS content glows faintly — dark = empty, faint = loaded
   but muted, pulsing = playing. No more guessing what's sleeping under a song.
 - Charging in standby shows a battery gauge: 1–4 LEDs for the level, with the
@@ -271,8 +272,10 @@ SP-1 custom firmware) — no soldering or opening the device required:
   4/4; accepted range is roughly 50–200 BPM.
 
 ### Loop-length mode (FUNCTION + PLAY)
-- Hold **FUNCTION and PLAY together** for about a second to toggle between
-  **variable** and **fixed** loop lengths.
+- Hold **FUNCTION and PLAY together** and release — any time between ~1/3 s
+  and 5 s, either finger first — to toggle between **variable** and
+  **fixed** loop lengths. (Holding through 5 s becomes the brightness
+  toggle instead; the mode is left alone.)
 - The lights confirm the new mode: **all four blink together twice = fixed**
   (every overdub snaps to a whole multiple of track 1, locked in sync); **a
   1→4 sweep = variable** (every take keeps its own length and free-runs).

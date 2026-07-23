@@ -4,6 +4,23 @@ All notable changes in this fork of Technics' sp1-tape-looper
 (chattock on GitHub).
 Base: upstream commit c60941c (2026-07-14).
 
+## [1.2.2] - 2026-07-23
+
+### Added
+- The on-device brightness toggle returns, without spending a new gesture:
+  hold FUNCTION+PLAY through 5 seconds and dim/full flips on the spot (no
+  release needed). The transfer page's #settings switch remains; both
+  persist.
+
+### Changed
+- The fixed/variable mode toggle now fires on RELEASE of the FUNCTION+PLAY
+  chord (350 ms tap-filter up to 5 s, either finger first — previously only
+  a PLAY-first release fired it, so the natural both-together release
+  silently aborted). Release detection is ladder-debounced so a stray dip
+  can't restart the 5 s clock.
+- Dim levels tuned: track row 52 us (a hair below the classic 60); the
+  song/status row runs its own 66 us window (slightly brighter side lights).
+
 ## [1.2.1] - 2026-07-23
 
 ### Fixed
