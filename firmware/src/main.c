@@ -4371,6 +4371,17 @@ static void power_off(void)
 	                              keep drawing battery through SYSTEM_OFF */
 	pwr_btn_arm_wake();
 	feed_wdt();
+	if (usb_present()) {
+		/* v1.2.4: powering OFF while PLUGGED lands in the charge-standby
+		 * gauge, exactly like plugging in an off device. SYSTEM_OFF with
+		 * VBUS already high has no wake edge — the device just went dark
+		 * until a replug (user request). A clean soft reset boots into
+		 * standby instead: RESETREAS is cleared every boot, so only SREQ
+		 * is set and the standby gate (!(OFF|DOG)) admits it; the external
+		 * chips we just powered down stay down through standby, same as a
+		 * cold plug-in. Unplugging from that standby SYSTEM_OFFs cleanly. */
+		NVIC_SystemReset();
+	}
 	NRF_POWER->RESETREAS = 0xFFFFFFFFu;   /* best practice before SYSTEM_OFF */
 	__DSB();
 	NRF_POWER->SYSTEMOFF = 1u;
