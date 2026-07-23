@@ -76,6 +76,12 @@
 
   <div class="songs" id="songs"></div>
   <div class="log" id="log"></div>
+
+  <div id="settings" style="display:none;margin-top:14px;padding:12px 14px;border:1px solid var(--line);border-radius:10px">
+    <b>Device settings</b> <span style="opacity:.6;font-size:.85em">(hidden panel — you found #settings)</span><br>
+    <label style="display:block;margin-top:8px"><input type="checkbox" id="ledfull">
+      Full LED brightness — for direct sunlight. The device is always-dim otherwise.</label>
+  </div>
 </div>
 
 <script>
@@ -236,6 +242,29 @@ function parseMeta(b){
   }
   return m;
 }
+/* ---- hidden #settings panel: the device is always-dim since v1.2.0; the
+ * led_full byte (offset 8 + numSlots*SLOT_SZ + 1, after fixed_len) is now
+ * OWNED by this page — the firmware adopts it at transfer commit. ---- */
+function syncSettings(){
+  const panel = document.getElementById('settings');
+  if (location.hash !== '#settings'){ panel.style.display='none'; return; }
+  panel.style.display = 'block';
+  const cb = document.getElementById('ledfull');
+  const OFF = 8 + layout.numSlots*SLOT_SZ + 1;
+  cb.checked = !!(meta && meta.raw && meta.raw[OFF]);
+  cb.onchange = async () => {
+    if (!meta || !meta.raw){ log("Connect to the device first.", "err"); return; }
+    meta.raw[OFF] = cb.checked ? 1 : 0;
+    const mb = buildMeta(meta);
+    if (layout.numSlots > 8) await writeBlock(1, mb.slice(512, 1024));
+    await writeBlock(0, mb.slice(0, 512));
+    await commitToDevice();
+    log(cb.checked ? "Full brightness ON — applied to the device."
+                   : "Back to dim — applied.", "ok");
+  };
+}
+window.addEventListener('hashchange', syncSettings);
+
 function buildMeta(m){
   // start from the device's own block so fields this tool doesn't manage
   // (loop-length mode, and anything added later) survive an upload untouched
@@ -308,6 +337,7 @@ async function refresh(){
     b0 = joined;
   }
   meta = parseMeta(b0);
+  syncSettings();
   if (meta.magic !== layout.magic) log("Note: the index block looks unformatted/empty.", "err");
   render();
 }
