@@ -902,6 +902,12 @@ static volatile uint8_t  g_grid_save_req;     /* control -> streamer: write bloc
 static volatile uint64_t g_grid_punch_at;      /* sample-clock of the scheduled punch-in (0 = none) */
 static volatile uint8_t  g_gridrec;            /* current take was grid-punched */
 static volatile uint32_t g_gridrec_beat_samps; /* grid beat in STORED samples at punch speed */
+/* M8c: performance layer. Mute/unmute WAITS for the bar line on gridded songs
+ * (launch quantize); a tap run over EXISTING loops beatmatches (retunes the
+ * tape + resyncs the loop start to the tapped downbeat at the next bar). */
+static volatile uint64_t g_grid_next_bar;      /* next bar line, sample-clock domain */
+static volatile uint64_t g_grid_resync_at;     /* pending loop-restart at this bar (0 = none) */
+static volatile uint8_t  g_mute_pend[NTRK];    /* mute toggle waiting for the bar */
 /* PASS 2 forensics (printed + zeroed each diag window): blocks delivered per
  * track, dead-history snaps per track, and round aborts (rec yield / read fail). */
 static volatile uint32_t g_p2blk[4];
@@ -1756,10 +1762,14 @@ static void looper_audio_block(int16_t *s)
 								(((uint64_t)g_grid_beat_frames *
 								  g_cur_speed_q16) >> 16);
 							g_gridrec = 1;
-							if (g_loop_len == 0u)
+							if (g_loop_len == 0u) {
 								/* M8b-r2: your first loop IS the
 								 * downbeat from here on */
 								g_grid_anchor = g_grid_punch_at;
+								{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
+			  g_grid_next_bar = g_grid_anchor +
+				(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
+							}
 						} else {
 							g_gridrec = 0;
 						}
@@ -1986,6 +1996,29 @@ static void looper_audio_block(int16_t *s)
 		while (g_sample_clock >= g_grid_next_tick) {
 			g_grid_next_tick += gtick;
 			g_midi_clk_produced++;
+		}
+		/* M8c: BAR-LINE service — launch-quantized mutes apply here, and a
+		 * pending beatmatch resync restarts the loops on the tapped "1".
+		 * Bars are ~2 s and blocks ~5 ms: one crossing per block, max. */
+		if (g_grid_next_bar && g_sample_clock >= g_grid_next_bar) {
+			for (int mi = 0; mi < NTRK; mi++) {
+				if (!g_mute_pend[mi]) continue;
+				g_mute_pend[mi] = 0;
+				if (trk[mi].state == TS_PLAY) {
+					trk[mi].muted = !trk[mi].muted;
+					if (g_slot < NUM_SLOTS) {   /* persist (M7-r4 nibble) */
+						uint8_t mb = (uint8_t)(0x10u << mi);
+						if (trk[mi].muted) g_meta.song_mode[g_slot] |= mb;
+						else               g_meta.song_mode[g_slot] &= (uint8_t)~mb;
+						g_meta_save_req = 1;
+					}
+				}
+			}
+			if (g_grid_resync_at && g_sample_clock >= g_grid_resync_at) {
+				g_grid_resync_at = 0;
+				g_restart_req = 1;      /* loops from the top, ON the "1" */
+			}
+			g_grid_next_bar += (uint64_t)g_grid_beat_frames * 4u;
 		}
 	}
 	/* Beat-phase display computed ONCE per block now (was per loop-sample). It
@@ -4077,7 +4110,14 @@ static void led_service(void)
 				                          : track_led_off(i);
 		} else for (int i = 0; i < NUM_TRACK_LEDS; i++) {
 			uint8_t st = trk[i].state;
-			if (st == TS_REC && trk[i].rec_target && !trk[i].rec_silence &&
+			if (g_mute_pend[i] && g_grid_active && g_grid_beat_frames) {
+				/* M8c: mute/unmute waiting for the bar — fast blink */
+				uint64_t ph4 = g_sample_clock - g_grid_anchor;
+				uint32_t hb3 = g_grid_beat_frames / 2u;
+				((hb3 && (uint32_t)(ph4 % hb3) < hb3 / 4u)
+					? track_led_on(i) : track_led_off(i));
+			}
+			else if (st == TS_REC && trk[i].rec_target && !trk[i].rec_silence &&
 			    g_grid_active && g_grid_beat_frames) {
 				/* grid run-on ("finishing the beat"): double-blink so
 				 * continued recording reads deliberate, not stuck */
@@ -4310,9 +4350,15 @@ static void jump_to_slot(uint32_t ns)
 			g_grid_anchor = g_sample_clock;
 			g_grid_next_tick = g_sample_clock;
 			g_grid_active = 1;
+			{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
+			  g_grid_next_bar = g_grid_anchor +
+				(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
 		} else {
 			g_grid_active = 0;
+			g_grid_next_bar = 0;
 		}
+		g_grid_resync_at = 0;
+		for (int pi = 0; pi < NTRK; pi++) g_mute_pend[pi] = 0;
 	}
 	g_slot_switch_req = 1;
 	g_meta_save_req = 1;
@@ -4536,6 +4582,9 @@ int main(void)
 				g_grid_anchor = g_sample_clock;
 				g_grid_next_tick = g_sample_clock;
 				g_grid_active = 1;
+				{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
+			  g_grid_next_bar = g_grid_anchor +
+				(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
 			}
 		}
 		g_slot_switch_req = 1;
@@ -4870,6 +4919,18 @@ int main(void)
 					if (mean >= 300 && mean <= 1200) {  /* 50..200 BPM */
 						uint32_t bpmq8 =
 							(uint32_t)((60000LL << 8) / mean);
+						/* M8c BEATMATCH: if this song already has
+						 * loops, the tap run means "match THIS" —
+						 * capture their native tempo first. */
+						uint32_t native_q8 = 0;
+						if (g_loop_len > 0u) {
+							if (g_grid_bpm_q8[g_slot])
+								native_q8 = g_grid_bpm_q8[g_slot];
+							else if (g_beat_samples)
+								native_q8 = (uint32_t)
+									((48000ULL * 60u * 256u) /
+									 g_beat_samples);
+						}
 						g_grid_bpm_q8[g_slot] = (uint16_t)bpmq8;
 						g_grid_beat_frames = (uint32_t)
 							((48000ULL * 60u * 256u) / bpmq8);
@@ -4877,6 +4938,26 @@ int main(void)
 						g_grid_next_tick = g_sample_clock;
 						g_grid_active = 1;
 						g_grid_save_req = 1;
+						{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
+			  g_grid_next_bar = g_grid_anchor +
+				(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
+						if (native_q8) {
+							/* retune the tape so the loops play at
+							 * the tapped tempo (vinyl rules: pitch
+							 * moves too), clamped to the physical
+							 * 0.5-1.5x range, and restart the loops
+							 * on the tapped downbeat at the next
+							 * bar line — tempo AND phase matched. */
+							uint64_t sp = ((uint64_t)bpmq8 << 16) /
+								      native_q8;
+							if (sp < 32768u) sp = 32768u;
+							else if (sp > 98304u) sp = 98304u;
+							g_play_speed_q16 = (uint32_t)sp;
+							g_play_bpm = (int)((sp * 80u + 32768u) >> 16);
+							if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
+							if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
+							g_grid_resync_at = g_grid_next_bar;
+						}
 					}
 				}
 			}
@@ -5098,6 +5179,15 @@ int main(void)
 						tap_deadline[ti] = 0;   /* 2nd tap -> DELETE */
 						g_del_req[ti] = 1;
 						trk[ti].muted = 0;
+						g_mute_pend[ti] = 0;    /* M8c: cancel pending */
+					} else if (g_grid_active && g_grid_beat_frames &&
+						   trk[ti].state == TS_PLAY) {
+						/* M8c LAUNCH QUANTIZE: the mute waits for
+						 * the bar line (the engine applies + then
+						 * persists it). Tapping again while pending
+						 * cancels. LED fast-blinks the wait. */
+						g_mute_pend[ti] = !g_mute_pend[ti];
+						tap_deadline[ti] = tnow + DTAP_GAP_MS;
 					} else {
 						trk[ti].muted = !trk[ti].muted;  /* tap -> mute */
 						if (g_slot < NUM_SLOTS) {  /* M7-r4: remember per song */
