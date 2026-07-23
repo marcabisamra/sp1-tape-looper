@@ -2176,7 +2176,7 @@ static void xfer_commit(void)
 			 * length, then write the repaired index back (skipped when the
 			 * host's copy already matches, e.g. a read-only session). */
 			g_meta.fixed_len = g_mode_pref;      /* M7c: field = preference */
-			g_meta.led_full = g_led_dim ? 0u : 1u;
+			g_led_dim = g_meta.led_full ? 0u : 1u;   /* M8c: site owns it */
 			memcpy(g_meta.chop, keep_chop, sizeof(keep_chop));
 			memcpy(g_meta.song_mode, keep_mode, sizeof(keep_mode));
 			if (g_slot < NUM_SLOTS) {   /* reload effective for current song */
@@ -4702,9 +4702,15 @@ int main(void)
 					 * change itself is the feedback. */
 					if (fnp_edge >= 0 && fnp_now - fnp_edge <= 450 &&
 					    !combo_fired) {
-						g_led_dim ^= 1u;
-						g_meta.led_full = g_led_dim ? 0u : 1u;
-						g_meta_save_req = 1;
+						/* M8c: SNAP TO 1.0x — instant return to
+						 * native speed/pitch after beatmatching or
+						 * rocker wandering ("tap to match,
+						 * double-tap to come home"). Replaces the
+						 * dim toggle: the device is always-dim now;
+						 * full brightness lives on the transfer
+						 * page (led_full byte, adopted below). */
+						g_play_speed_q16 = 65536u;
+						g_play_bpm = 80;
 						combo_fired = 1;
 					}
 					fnp_edge = fnp_now;
