@@ -4508,11 +4508,31 @@ int main(void)
 				 * low reading. Spread at 25/50/75% of that range. Refine
 				 * batt_thr once a near-empty batt= value is logged. */
 				static const int batt_thr[3] = { 2020, 2140, 2260 };
+				static int bavg = -1;   /* smoothed reading (EMA over ~10 passes) */
+				static int blvl = 0;    /* sticky displayed level (hysteresis) */
 				int braw = ladder_read(&adc_ladder[LAD_BATT]);
-				int lvl = 1;
 				if (braw >= 0)
+					bavg = (bavg < 0) ? braw
+					     : bavg + (braw - bavg) / 8;
+				if (bavg >= 0) {
+					/* v1.2.1 gauge fix (user report: LED 2 flickered
+					 * while charging near-empty): a SINGLE raw sample
+					 * per pass with no hysteresis let ADC noise +
+					 * charger ripple flip the level ~25x/s at a
+					 * threshold — the boundary LED strobed between
+					 * off and blinking. Smooth first, then only move
+					 * the level once the average clears a threshold
+					 * by ±18 counts (a step is ~120 counts wide). */
+					int nl = 1;
 					for (int k = 0; k < 3; k++)
-						if (braw > batt_thr[k]) lvl = k + 2;
+						if (bavg > batt_thr[k]) nl = k + 2;
+					if (blvl == 0)      blvl = nl;   /* first read seeds */
+					else if (nl > blvl && bavg > batt_thr[blvl - 1] + 18)
+						blvl = nl;
+					else if (nl < blvl && bavg < batt_thr[blvl - 2] - 18)
+						blvl = nl;
+				}
+				int lvl = blvl ? blvl : 1;
 				int bl = ((++blink / 12u) & 1u) == 0u;
 				for (int i = 0; i < NUM_LEDS; i++) {
 					int on;
