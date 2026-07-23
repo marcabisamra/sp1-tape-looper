@@ -4,9 +4,21 @@ All notable changes in this fork of Technics' sp1-tape-looper
 (chattock on GitHub).
 Base: upstream commit c60941c (2026-07-14).
 
-## [Unreleased]
+## [1.2.0] - 2026-07-23
 
 ### Added
+- Launch-quantized mutes: on gridded songs, mute/unmute waits for the next
+  bar line (fast-blinking while pending; tap again to cancel) — layer moves
+  land exactly on the "1", Ableton-style. Ungridded songs mute instantly.
+- Tap-to-beatmatch: a tap run over existing loops retunes the tape to the
+  tapped tempo (clamped 0.5-1.5x, vinyl-style pitch) and restarts the loops
+  on the tapped downbeat at the next bar — tempo and phase matched in one
+  gesture. Works from a tapped grid or a first-take-derived tempo.
+- FUNCTION + double-tap PLAY now snaps the tape to exactly 1.0x / 80 BPM —
+  "tap to match, double-tap to come home". (This replaces the dim toggle.)
+- Transfer page: hidden settings panel (open with #settings) with a full-LED-
+  brightness switch for direct sunlight; the firmware adopts the setting at
+  transfer commit. The device itself is always-dim now.
 - Tapped grid (phase 1): tap FUNCTION 4+ times to give a song a tempo grid —
   first tap = downbeat, lights become a metronome, the bank light blinks on
   the beat, MIDI clock locks to the tapped tempo (runs while stopped). Tempo

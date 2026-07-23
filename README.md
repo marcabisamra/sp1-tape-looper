@@ -212,8 +212,10 @@ SP-1 custom firmware) — no soldering or opening the device required:
   track slices its own length.
 
 ### Lights and battery
-- LEDs run dim by default; FUNCTION + double-tap PLAY toggles dim/full
-  (remembered across power-off).
+- LEDs are always dim (comfortable indoors). Full brightness for direct
+  sunlight lives on the transfer page's hidden settings panel (open the
+  page with #settings after the URL) — applied live at transfer commit and
+  remembered across power-off.
 - A muted track that HAS content glows faintly — dark = empty, faint = loaded
   but muted, pulsing = playing. No more guessing what's sleeping under a song.
 - Charging in standby shows a battery gauge: 1–4 LEDs for the level, with the
@@ -254,10 +256,19 @@ SP-1 custom firmware) — no soldering or opening the device required:
   the count-in); their stops snap to beat multiples of the same base, so
   every loop stays locked. A second tap during any count-out trims to a
   whole beat. Songs without a grid record exactly as before.
+- **Mutes wait for the bar** on gridded songs (launch quantize): tap to
+  mute/unmute and the track fast-blinks until the next bar line, then
+  switches exactly on the "1". Tap again while blinking to cancel. Songs
+  without a grid mute instantly, as always.
+- **Tap-to-beatmatch:** once a song has loops, a fresh 4+ tap run means
+  "match THIS": the tape retunes so your loops play at the tapped tempo
+  (vinyl-style — pitch moves too, clamped to the 0.5–1.5x range) and the
+  loops restart from their top on your tapped downbeat at the next bar —
+  tempo and phase matched in one gesture. FUNCTION + double-tap PLAY snaps
+  back to exactly 1.0x: tap to match, double-tap to come home.
 - The grid's tempo is remembered per song across power-off; its downbeat
   re-anchors to your next tap run (or to your first take). Bars are fixed
-  4/4; accepted range is roughly 50–200 BPM. The tape speed is untouched —
-  the grid is the metronome, not the varispeed.
+  4/4; accepted range is roughly 50–200 BPM.
 
 ### Loop-length mode (FUNCTION + PLAY)
 - Hold **FUNCTION and PLAY together** for about a second to toggle between
