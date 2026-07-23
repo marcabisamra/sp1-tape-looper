@@ -3894,12 +3894,16 @@ static enum vol_btn decode_vol(int v)
  * shadow at a low duty cycle. Single writer (control thread), ISR only
  * reads. ~1 kHz frame = flicker-free. LED_PWM_ON_US is the brightness. */
 #define LED_PWM_PERIOD_US 1000u    /* 1 kHz frame */
-#define LED_PWM_ON_US       60u    /* ~6% duty — clearly dim, no sparkle.
-                                    * (6u was TechnicsOP's untested "lowest
-                                    * glow": at 6 us on-time, ordinary IRQ
-                                    * latency multiplies a frame's brightness
-                                    * 10-80x = visible flicker. 60 us is both
-                                    * brighter and 10x less jitter-sensitive.) */
+#define LED_PWM_ON_US       52u    /* ~5.2% duty — a hair dimmer than the old
+                                    * 60 on the track row. Floor note: at 6 us,
+                                    * IRQ-entry jitter of +/-3 us is a 10-80x
+                                    * brightness swing = flicker; at 52 us it
+                                    * vanishes under the eye's averaging. */
+#define LED_STATUS_ON_US    66u    /* the SONG/status row runs a longer window
+                                    * than the track row: slightly brighter
+                                    * side lights. CC2 second window — wide =
+                                    * jitter-immune (unlike the 8 us ghost
+                                    * experiments). */
 #define LED_GHOST_FRAME_DIV  5u    /* GHOST class: muted-but-loaded tracks lit
                                     * ONE frame in five using the SAME proven
                                     * 60 us window as normal dim -> 1/5 of dim
@@ -3920,6 +3924,8 @@ static volatile uint32_t g_led_p0_on;   /* P0 LED pins logically lit */
 static volatile uint32_t g_led_p1_on;   /* P1 LED pins logically lit */
 static volatile uint32_t g_led_p0_ghost; /* P0 pins lit at GHOST duty */
 static volatile uint32_t g_led_p1_ghost; /* P1 pins lit at GHOST duty */
+static uint32_t g_led_sta_p0, g_led_sta_p1;   /* status-row pins (init-computed) */
+static uint32_t g_led_trk_p0, g_led_trk_p1;   /* track-row pins  (init-computed) */
 
 /* DIRECT ISR (required for IRQ_ZERO_LATENCY): pure register IO, no kernel
  * calls, returns 0 = never asks for a reschedule. */
@@ -3937,18 +3943,26 @@ ISR_DIRECT_DECLARE(led_pwm_isr)
 		NRF_P1->OUTSET = s1;
 		NRF_P1->OUTCLR = LED_ALL_P1 & ~s1;
 	}
-	if (LED_PWM_TIMER->EVENTS_COMPARE[0]) {         /* on-time elapsed */
+	if (LED_PWM_TIMER->EVENTS_COMPARE[0]) {         /* track-row on-time up */
 		LED_PWM_TIMER->EVENTS_COMPARE[0] = 0;
 		(void)LED_PWM_TIMER->EVENTS_COMPARE[0];
-		if (g_led_dim) {                        /* dim: dark for the rest of
-		                                         * the frame. Full mode: only
-		                                         * ghost pins go dark — solid
-		                                         * LEDs stay lit. */
-			NRF_P0->OUTCLR = LED_ALL_P0;
-			NRF_P1->OUTCLR = LED_ALL_P1;
+		if (g_led_dim) {                        /* dim: track row goes dark;
+		                                         * the status row stays lit
+		                                         * until CC2. Full mode: only
+		                                         * ghost pins go dark. */
+			NRF_P0->OUTCLR = g_led_trk_p0;
+			NRF_P1->OUTCLR = g_led_trk_p1;
 		} else {
 			NRF_P0->OUTCLR = g_led_p0_ghost & ~g_led_p0_on;
 			NRF_P1->OUTCLR = g_led_p1_ghost & ~g_led_p1_on;
+		}
+	}
+	if (LED_PWM_TIMER->EVENTS_COMPARE[2]) {         /* status-row on-time up */
+		LED_PWM_TIMER->EVENTS_COMPARE[2] = 0;
+		(void)LED_PWM_TIMER->EVENTS_COMPARE[2];
+		if (g_led_dim) {
+			NRF_P0->OUTCLR = g_led_sta_p0;
+			NRF_P1->OUTCLR = g_led_sta_p1;
 		}
 	}
 	return 0;
@@ -3961,9 +3975,19 @@ static void led_pwm_init(void)
 	LED_PWM_TIMER->PRESCALER = 4;                    /* 16 MHz/16 = 1 us tick */
 	LED_PWM_TIMER->CC[0]     = LED_PWM_ON_US;        /* -> OFF phase */
 	LED_PWM_TIMER->CC[1]     = LED_PWM_PERIOD_US;    /* -> wrap + ON phase */
+	LED_PWM_TIMER->CC[2]     = LED_STATUS_ON_US;     /* -> status-row OFF */
 	LED_PWM_TIMER->SHORTS    = TIMER_SHORTS_COMPARE1_CLEAR_Msk;
 	LED_PWM_TIMER->INTENSET  = TIMER_INTENSET_COMPARE0_Msk |
-				   TIMER_INTENSET_COMPARE1_Msk;
+				   TIMER_INTENSET_COMPARE1_Msk |
+				   TIMER_INTENSET_COMPARE2_Msk;
+	for (int li = 0; li < NUM_LEDS; li++) {
+		if (leds[li].port == NRF_P0) g_led_sta_p0 |= (1u << leds[li].pin);
+		else                         g_led_sta_p1 |= (1u << leds[li].pin);
+	}
+	for (int li = 0; li < NUM_TRACK_LEDS; li++) {
+		if (track_leds[li].port == NRF_P0) g_led_trk_p0 |= (1u << track_leds[li].pin);
+		else                               g_led_trk_p1 |= (1u << track_leds[li].pin);
+	}
 	IRQ_DIRECT_CONNECT(LED_PWM_TIMER_IRQn, 0, led_pwm_isr, IRQ_ZERO_LATENCY);
 	irq_enable(LED_PWM_TIMER_IRQn);
 	LED_PWM_TIMER->TASKS_CLEAR = 1;
