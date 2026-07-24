@@ -1044,10 +1044,12 @@ static volatile int      g_restart_req;            /* main -> engine: hold PLAY 
  * track's loop — the off'th slice. Non-destructive playback-window remap in
  * the streamer's fill math only: recorded audio, loop lengths, beat grid and
  * MIDI clock are untouched; div=1/off=0 is bit-identical to the original
- * math. SESSION-ONLY: resets on song switch and power-off. */
+ * math. Persisted per song since M7a (index chop[] bytes). */
 static volatile uint32_t g_chop_div = 1;           /* 1,2,4,... 64 (1 = full loop) */
 static volatile uint32_t g_chop_off = 0;           /* window index: 0..div-1 */
 static volatile int      g_chop_req;               /* main -> engine: window changed, snap rings */
+static volatile uint8_t  g_dip_req;                /* M10: controls -> mixer, declick dip at a chop edit */
+static volatile uint8_t  g_off_fade;               /* M10: power-off fade — master to 0 and HOLD */
 static volatile uint32_t g_beat_phase;            /* phase within a beat (loop samples), for LEDs */
 static volatile int      g_emmc_ready;
 static volatile int      g_dbg_beat;              /* current beat number (diag) */
@@ -1980,13 +1982,31 @@ static void looper_audio_block(int16_t *s)
 	{
 		/* the VOL buttons step ~3 dB at a time — ramp each step across the
 		 * block instead of applying it as a hard gain jump (a click). */
+		/* M10: a declick/fade ENVELOPE rides on the master gain. A chop
+		 * edit dips it to 0 (the per-block interpolation below turns that
+		 * into a ~5 ms ramp) and it recovers over ~27 ms — masking the
+		 * window-jump discontinuity that used to click. Power-off fades
+		 * it out over ~85 ms and HOLDS, so the codecs are shut down on
+		 * silence. Envelope and master fold into ONE interpolated gain:
+		 * the per-frame cost is unchanged. */
+		static int32_t env_q8 = 256;
+		if (g_off_fade) {
+			env_q8 -= (env_q8 > 16) ? 16 : env_q8;
+		} else if (g_dip_req) {
+			g_dip_req = 0;
+			env_q8 = 0;
+		} else if (env_q8 < 256) {
+			env_q8 += 48;
+			if (env_q8 > 256) env_q8 = 256;
+		}
 		const int32_t mv = (int32_t)g_master_vol_q8;
-		static int32_t mv_prev;
-		const int32_t md = mv - mv_prev;
-		const int32_t m0 = mv_prev;
-		mv_prev = mv;
+		const int32_t ge = (mv * env_q8) >> 8;
+		static int32_t ge_prev;
+		const int32_t gd = ge - ge_prev;
+		const int32_t g0 = ge_prev;
+		ge_prev = ge;
 		for (uint32_t f = 0; f < BLK_FRAMES; f++) {
-			int32_t m = md ? (m0 + ((md * (int32_t)(f + 1)) >> 8)) : mv;
+			int32_t m = gd ? (g0 + ((gd * (int32_t)(f + 1)) >> 8)) : ge;
 			int16_t out = soft_limit((mix32[f] * m) >> 8);
 			s[2 * f] = out; s[2 * f + 1] = out;
 		}
@@ -4320,6 +4340,10 @@ static void stop_and_flush(void)
 /* ---------- power off ---------- */
 static void power_off(void)
 {
+	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
+	                                      * codecs power down on silence — the
+	                                      * fade completes during the flush and
+	                                      * LED sweep below */
 	stop_and_flush();                    /* never lose an in-progress recording */
 
 	/* shutdown sweep across BOTH rows, then force EVERY LED dark before
@@ -4350,6 +4374,15 @@ static void power_off(void)
 	 * clock has been removed can also murmur on its own — the "sound after
 	 * shutdown" reports. Order: amp first, then codec, then the flash rail
 	 * (its cache was flushed in stop_and_flush above). */
+	/* M10: the mix has been silent for a while (fade above); now put both
+	 * output stages in their own MUTE — registers our init already uses —
+	 * so the drivers discharge quietly instead of stepping to ground
+	 * (the power-off pop, user report). */
+	(void)cs42_wr16(0x2001, 0x0D);   /* CS42L42 HP Control: mute all */
+	tas_page(0x01);
+	(void)tas_wr(0x30, 0x00);        /* TAS2505 Class-D driver: mute (P1/R48) */
+	feed_wdt();
+	k_msleep(30);
 	tas_page(0x00);
 	(void)tas_wr(0x01, 0x01);        /* TAS2505 software reset: every block
 	                                  * back to its powered-down default */
@@ -4743,6 +4776,8 @@ int main(void)
 	int cp_cnt = 0;                  /*   consecutive passes it has held */
 	int cp_dcl_band = -1;            /*   last committed rocker band (double-click) */
 	int64_t cp_dcl_t = 0;            /*   when it committed */
+	int cp_rep_at = 0;               /*   M10 glide: cp_cnt of the next auto-repeat */
+	int cp_rep_iv = 0;               /*   M10 glide: repeat interval, in ~25 ms passes */
 	uint8_t ctl_flush = 0;      /* looper decode state went stale (FUNCTION page / USB transfer owned the loop) */
 	int64_t last_diag = 0;      /* throttle the control read-out */
 
@@ -4964,6 +4999,32 @@ int main(void)
 							g_meta_save_req = 1;
 						}
 						g_chop_req = 1;           /* engine: snap to it */
+						g_dip_req = 1;            /* M10: declick the jump */
+						cp_rep_at = cp_cnt + 18;  /* M10: first repeat ~450 ms in */
+						cp_rep_iv = 10;           /*      then ~250 ms, accelerating */
+					} else if (cp_cnt > 3 && cp_rep_at && cp_cnt >= cp_rep_at &&
+						   (vb == VOL_UP || vb == VOL_DOWN) &&
+						   g_chop_div > 1u) {
+						/* M10 HOLD-TO-GLIDE: keep shifting while the chord
+						 * is held — declicked whole-window steps at an
+						 * accelerating rate read as a tape scrub across
+						 * the loop. Only the SHIFT buttons repeat: a
+						 * repeating halve/double would sweep the whole
+						 * div range in a blink. Double-click detection
+						 * keys on press EDGES, so repeats can't fake it. */
+						uint32_t d2 = g_chop_div;
+						uint32_t o2 = g_chop_off;
+						o2 = (vb == VOL_UP) ? (o2 + 1u) % d2
+						                    : (o2 + d2 - 1u) % d2;
+						g_chop_off = o2;
+						if (g_slot < NUM_SLOTS) {
+							g_meta.chop[g_slot][1] = (uint8_t)o2;
+							g_meta_save_req = 1;  /* writer coalesces */
+						}
+						g_chop_req = 1;
+						g_dip_req = 1;
+						cp_rep_at = cp_cnt + cp_rep_iv;
+						if (cp_rep_iv > 5) cp_rep_iv--;   /* floor ~125 ms */
 					}
 					led_service();
 					k_msleep(25);
