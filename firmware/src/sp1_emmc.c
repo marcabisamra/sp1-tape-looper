@@ -1124,6 +1124,8 @@ bool emmc_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t count)
 	return emmc_read_blocks_raw(block_addr, buf, count);
 }
 
+#define SP1_ASYNC_WRITE 1   /* W3 flag: 0 restores the sync write path */
+bool emmc_write_blocks_async(uint32_t blk, const uint8_t *buf, uint32_t count);
 bool emmc_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count)
 {
 	if (!s_ready) {
@@ -1137,6 +1139,9 @@ bool emmc_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count)
 		}
 		return write_data_block(buf);
 	}
+#if SP1_ASYNC_WRITE
+	return emmc_write_blocks_async(block_addr, buf, count);
+#endif
 	if (!send_command_retry(25, block_addr, r1, 4)) {   /* see CMD18: settle-miss retry */
 		return false;
 	}
@@ -1166,4 +1171,517 @@ bool emmc_write_blocks(uint32_t block_addr, const uint8_t *buf, uint32_t count)
 	 * the existing miss/retry path. */
 	(void)dat0_busy_wait_impl(500000u, false);
 	return true;
+}
+
+
+/* ==================== M50 ASYNC READ PORT (BENCH ONLY) ====================
+ * Transliterated from TimK's reference driver (KB assets, storagethingies
+ * EmmcDriver.cpp, credited "Tim Knapen's eMMC driver implementation").
+ * Mechanism: PWM0 drives CLK one period per hunt burst (seq word 0x8004,
+ * COUNTERTOP 8); GPIOTE ch0 watches DAT0 HiToLo (the start bit); PPI ch0
+ * wires GPIOTE -> PWM TASKS_STOP so the clock freezes ON the start bit;
+ * the STOPPED ISR hands off to SPIM3 DMA (512+2 bytes straight into the
+ * caller's buffer); ENDRX ISR advances and re-arms the hunt. The caller
+ * sleeps on a semaphore. CPU per block: two short ISRs. */
+#define M50_PIN_CLK   6u
+#define M50_PIN_DAT0  7u
+static volatile uint8_t  m50_state;     /* 0 idle, 1 busy, 2 done */
+static volatile uint8_t  m50_waiting, m50_ok;
+static uint8_t          *m50_buf;
+static uint32_t          m50_nblk, m50_idx;
+static struct k_sem      m50_sem;
+static uint8_t           m50_init_done;
+static uint16_t __aligned(4) m50_pwm_seq = 0x8004;   /* reference value */
+volatile uint32_t g_m50_wait_bursts, g_m50_pwm_stops, g_m50_blk_irqs;
+volatile uint32_t g_m50_f_busy, g_m50_f_c23, g_m50_f_c18, g_m50_last_r1;
+
+uint8_t m54_tails[32][2];   /* M54 tails (M71r5: 32 = a whole turn) */
+static void m50_start_wait_burst(void);
+
+static void m50_start_block_receive(void)
+{
+	if (!m50_buf || m50_idx >= m50_nblk) {
+		m50_ok = 0; m50_state = 2; k_sem_give(&m50_sem); return;
+	}
+	/* zero-copy DMA into the caller's buffer; the 2-byte CRC tail of
+	 * each block lands in the next block's slot and is overwritten —
+	 * the LAST block's tail needs +2 bytes of slack (caller provides). */
+	/* r6: spim_xfer attaches PSEL per transfer — a WRITE leaves MOSI
+	 * on DAT0 and MISO disconnected (samples ZEROS). Re-orient for
+	 * receive before every DMA arm. */
+	NRF_SPIM3->PSEL.MOSI = 0xFFFFFFFFu;
+	NRF_SPIM3->PSEL.MISO = PIN_EMMC_DAT0;
+	NRF_SPIM3->RXD.PTR    = (uint32_t)(m50_buf + m50_idx * 512u);
+	NRF_SPIM3->RXD.MAXCNT = 514;
+	NRF_SPIM3->TXD.MAXCNT = 0;
+	NRF_SPIM3->EVENTS_END = 0;
+	NRF_SPIM3->EVENTS_ENDRX = 0;
+	NRF_SPIM3->INTENCLR = 0xFFFFFFFF;
+	NRF_SPIM3->INTENSET = SPIM_INTENSET_ENDRX_Msk;
+	NRF_SPIM3->ENABLE = 7;
+	NRF_SPIM3->TASKS_START = 1;
+}
+
+static void m50_start_wait_burst(void)
+{
+	m50_waiting = 1;
+	g_m50_wait_bursts++;
+	NRF_SPIM3->INTENCLR = 0xFFFFFFFF;
+	NRF_SPIM3->ENABLE = 0;
+	NRF_GPIOTE->EVENTS_IN[0] = 0;
+	NRF_PWM0->EVENTS_STOPPED = 0;
+	NRF_PWM0->ENABLE = 1;   /* r2: take the pin for this burst only */
+	NRF_PWM0->INTENSET = 2;                  /* STOPPED */
+	NRF_PWM0->TASKS_SEQSTART[0] = 1;
+}
+
+static void m50_pwm_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+	if (!NRF_PWM0->EVENTS_STOPPED) return;
+	g_m50_pwm_stops++;
+	NRF_PWM0->EVENTS_STOPPED = 0;
+	NRF_PWM0->INTENCLR = 2;
+	NRF_PWM0->ENABLE = 0;   /* r2: release the CLK pin */
+	if (!m50_waiting || m50_state != 1) return;
+	m50_waiting = 0;
+	m50_start_block_receive();
+}
+
+static void m50_spim_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+	/* r4: clear + disarm FIRST, on every path — a pending ENDRX with
+	 * INTEN still set re-enters this ISR forever (the r3 WDT storm). */
+	if (!NRF_SPIM3->EVENTS_ENDRX) { NRF_SPIM3->INTENCLR = 0xFFFFFFFF; return; }
+	NRF_SPIM3->EVENTS_ENDRX = 0;
+	NRF_SPIM3->EVENTS_END = 0;
+	if (m50_state != 1) { NRF_SPIM3->INTENCLR = 0xFFFFFFFF; NRF_SPIM3->ENABLE = 0; return; }
+	g_m50_blk_irqs++;
+	if (m50_idx < 32u) {   /* M54: stash CRC tail before next DMA (r5) */
+		m54_tails[m50_idx][0] = m50_buf[m50_idx * 512u + 512u];
+		m54_tails[m50_idx][1] = m50_buf[m50_idx * 512u + 513u];
+	}
+	NRF_SPIM3->ENABLE = 0;
+	m50_idx++;
+	if (m50_idx >= m50_nblk) {
+		NRF_SPIM3->INTENCLR = 0xFFFFFFFF;   /* r4: disarm before handoff */
+		m50_ok = 1; m50_state = 2; k_sem_give(&m50_sem); return;
+	}
+	m50_start_wait_burst();
+}
+
+void emmc_m50_setup(void)
+{
+	if (m50_init_done) return;
+	k_sem_init(&m50_sem, 0, 1);
+	/* PWM0: one clock period per SEQSTART on the CLK pin */
+	NRF_PWM0->PSEL.OUT[0] = (0u << 31) | (0u << 5) | M50_PIN_CLK; /* Connected, port 0 */
+	NRF_PWM0->PSEL.OUT[1] = (1u << 31);
+	NRF_PWM0->PSEL.OUT[2] = (1u << 31);
+	NRF_PWM0->PSEL.OUT[3] = (1u << 31);
+	NRF_PWM0->MODE = 0;                       /* Up */
+	NRF_PWM0->PRESCALER = 0;                  /* 16 MHz */
+	NRF_PWM0->COUNTERTOP = 8;                 /* 2 MHz hunt clock */
+	NRF_PWM0->LOOP = 0;
+	NRF_PWM0->DECODER = 0;
+	NRF_PWM0->SEQ[0].PTR = (uint32_t)&m50_pwm_seq;
+	NRF_PWM0->SEQ[0].CNT = 1;
+	NRF_PWM0->SEQ[0].REFRESH = 0;
+	NRF_PWM0->SEQ[0].ENDDELAY = 0;
+	NRF_PWM0->EVENTS_STOPPED = 0;
+	NRF_PWM0->INTENCLR = 0xFFFFFFFF;
+	NRF_PWM0->ENABLE = 0;   /* r2: enabled ONLY during a hunt burst — an enabled PWM owns the CLK pin */
+	/* GPIOTE ch0: DAT0 falling edge = the start bit */
+	NRF_GPIOTE->EVENTS_IN[0] = 0;
+	NRF_GPIOTE->CONFIG[0] = (1u << 0)         /* MODE Event */
+	                      | (M50_PIN_DAT0 << 8)
+	                      | (2u << 16);       /* POLARITY HiToLo */
+	/* PPI ch0: start bit stops the hunt clock IN HARDWARE */
+	NRF_PPI->CH[0].EEP = (uint32_t)&NRF_GPIOTE->EVENTS_IN[0];
+	NRF_PPI->CH[0].TEP = (uint32_t)&NRF_PWM0->TASKS_STOP;
+	NRF_PPI->FORK[0].TEP = 0;
+	NRF_PPI->CHENSET = 1;
+	{ void w3_isr_hookup(void); w3_isr_hookup(); }
+	m50_init_done = 1;
+}
+
+/* Start an async multi-block read. buffer needs n*512+2 bytes. */
+int emmc_m50_read_async(uint32_t blk, uint8_t *buf, uint32_t n)
+{
+	uint8_t r1[6];
+	if (m50_state == 1 || !buf || !n) return 0;
+	m50_state = 1; m50_buf = buf; m50_nblk = n; m50_idx = 0; m50_ok = 0;
+	k_sem_reset(&m50_sem);
+	if (!dat0_busy_wait_us(100000u)) { g_m50_f_busy++; goto fail; }
+	if (!send_command_retry(23, n, r1, 2)) { g_m50_f_c23++; g_m50_last_r1 = r1[0]; goto fail; }
+	if (!send_command_retry(18, blk, r1, 2)) { g_m50_f_c18++; g_m50_last_r1 = r1[0]; goto fail; }
+	m50_start_wait_burst();
+	return 1;
+fail:
+	(void)send_command_retry(12, 0, r1, 1);   /* r2: never leave the card mid-state */
+	for (int i = 0; i < 16; i++) clk_pulse();
+	m50_state = 0;
+	return 0;
+}
+
+/* Wait for completion. 1 = ok, 0 = failed, -1 = timeout (torn down). */
+int emmc_m50_wait(int ms)
+{
+	if (k_sem_take(&m50_sem, K_MSEC(ms)) != 0) {
+		uint8_t r1[6];
+		NRF_PWM0->INTENCLR = 2;
+		NRF_PWM0->ENABLE = 0;
+		NRF_SPIM3->INTENCLR = 0xFFFFFFFF;
+		NRF_SPIM3->ENABLE = 0;
+		m50_waiting = 0;
+		(void)send_command_retry(12, 0, r1, 2);   /* stop a stuck stream */
+		for (int i = 0; i < 16; i++) clk_pulse();
+		m50_state = 0;
+		return -1;
+	}
+	{ int ok = m50_ok;
+	  NRF_SPIM3->INTENCLR = 0xFFFFFFFF;          /* r4: belt and suspenders */
+	  NRF_PWM0->INTENCLR = 2;
+	  for (int i = 0; i < 16; i++) clk_pulse();  /* post-read clocks (reference) */
+	  m50_state = 0;
+	  return ok ? 1 : 0; }
+}
+
+
+/* M54: bench access to the driver's slice-by-4 CRC16 */
+void emmc_m54_crc_init(void) { crc16_tab_init(); }
+uint16_t emmc_m54_crc16(const uint8_t *d, uint32_t n) { return crc16(d, n); }
+/* ==== W1-r2: ISR-CHAIN WRITE ENGINE (bench-only build) ==============
+ * §38's one change: the chain advances in ISRs, never in a thread.
+ *   thread: CMD25 -> aw2_start_tx(block 0) -> sem_take(2 s)
+ *   SPIM END ISR: teardown (r4 rule: clear+disarm on EVERY path),
+ *     end bit + 16-clock CRC-status hand-clock (verbatim from W1,
+ *     proven werr=0 over 142,416 blocks; measured 16 us/blk),
+ *     then: DAT0 high -> advance; DAT0 low -> hardware busy hunt
+ *   busy hunt: PWM0 free-runs CLK (LOOPSDONE->SEQSTART short);
+ *     GPIOTE ch1 (LoToHi on DAT0) -> PPI ch1 -> PWM TASKS_STOP;
+ *     PWM STOPPED ISR books the busy time and advances.
+ *   (read port uses GPIOTE ch0/PPI ch0 HiToLo — ch1 keeps W2's
+ *    concurrent-read future open. PWM enabled only while hunting:
+ *    an enabled PWM owns the CLK pin — gotcha #1.)
+ * Time base: DWT->CYCCNT 64 MHz, /64 -> us, accumulated in us. */
+volatile uint32_t g_aw2_tx_us, g_aw2_st_us, g_aw2_bz_us, g_aw2_bz_max;
+volatile uint32_t g_aw2_werr, g_aw2_bzto, g_aw2_blk, g_aw2_irqs;
+static volatile uint8_t  aw2_state;          /* 0 idle, 1 run, 2 done */
+static volatile uint8_t  aw2_ok;
+static const uint8_t    *aw2_frames;
+static uint32_t          aw2_n, aw2_idx, aw2_t0, aw2_bz_t0;
+static struct k_sem      aw2_sem;
+static uint8_t           aw2_init;
+static uint16_t __aligned(4) aw2_pwm_seq = 0x8004;   /* 288 reference */
+
+void aw2_build_frame(uint8_t *f, const uint8_t *data);
+static const uint8_t *aw3_src;   /* W3: raw 512-stride source */
+static void aw2_start_tx(void)
+{
+	const uint8_t *f;
+	if (aw3_src) {
+		aw2_build_frame((uint8_t *)s_dma_tx, aw3_src + aw2_idx * 512u);
+		f = (const uint8_t *)s_dma_tx;
+	} else {
+		f = aw2_frames + aw2_idx * 516u;
+	}
+	DAT0_OUT();
+	RDAT_HIGH();
+	RCLK_LOW();
+	/* spim_xfer's exact recipe (dump 152-162), interrupt-driven */
+	NRF_SPIM3->PSEL.MOSI = PIN_EMMC_DAT0;
+	NRF_SPIM3->PSEL.MISO = 0xFFFFFFFFu;
+	NRF_SPIM3->ENABLE    = 7;
+	NRF_SPIM3->TXD.PTR    = (uint32_t)f;
+	NRF_SPIM3->TXD.MAXCNT = 516;
+	NRF_SPIM3->RXD.PTR    = 0;
+	NRF_SPIM3->RXD.MAXCNT = 0;
+	NRF_SPIM3->EVENTS_END = 0;
+	NRF_SPIM3->INTENCLR = 0xFFFFFFFF;
+	NRF_SPIM3->INTENSET = SPIM_INTENSET_END_Msk;
+	aw2_t0 = DWT->CYCCNT;
+	NRF_SPIM3->TASKS_START = 1;
+}
+
+static void aw2_advance(void)
+{
+	aw2_idx++;
+	if (aw2_idx >= aw2_n) {
+		aw2_ok = 1; aw2_state = 2; k_sem_give(&aw2_sem); return;
+	}
+	aw2_start_tx();
+}
+
+static void aw2_hunt_arm(void)
+{
+	NRF_GPIOTE->EVENTS_IN[1] = 0;
+	NRF_PPI->CHENSET = 2;                /* ch1: DAT0 rise -> PWM STOP */
+	NRF_PWM0->EVENTS_STOPPED = 0;
+	NRF_PWM0->INTENCLR = 0xFFFFFFFF;
+	NRF_PWM0->INTENSET = 2;              /* STOPPED */
+	NRF_PWM0->SHORTS = (1u << 2);        /* LOOPSDONE -> SEQSTART0 */
+	NRF_PWM0->LOOP = 1;
+	NRF_PWM0->ENABLE = 1;
+	NRF_PWM0->TASKS_SEQSTART[0] = 1;
+	/* race close: DAT0 rose between check and arm -> edge missed.
+	 * Stop by hand; the STOPPED ISR advances either way. */
+	if (READ_DAT0())
+		NRF_PWM0->TASKS_STOP = 1;
+}
+
+static void aw2_spim_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+	if (!NRF_SPIM3->EVENTS_END) { NRF_SPIM3->INTENCLR = 0xFFFFFFFF; return; }
+	NRF_SPIM3->EVENTS_END = 0;
+	NRF_SPIM3->INTENCLR = 0xFFFFFFFF;
+	NRF_SPIM3->ENABLE = 0;
+	if (aw2_state != 1)
+		return;
+	g_aw2_irqs++;
+	g_aw2_tx_us += (DWT->CYCCNT - aw2_t0) / 64u;
+	const uint32_t hd = g_emmc_clk_half_us;
+	uint32_t t0 = DWT->CYCCNT;
+	HALF(hd); EDGE_SETTLE();
+	RCLK_HIGH(); HALF(hd); RCLK_LOW();   /* end bit (W1 verbatim) */
+	DAT0_IN();
+	int st = -1;
+	for (int i = 0; i < 16; i++) {
+		RCLK_HIGH(); HALF(hd); EDGE_SETTLE();
+		int s0 = (int)RDAT_GET();
+		RCLK_LOW(); HALF(hd);
+		if (!s0) {
+			st = 0;
+			for (int k = 0; k < 3; k++) {
+				RCLK_HIGH(); HALF(hd); EDGE_SETTLE();
+				st = (st << 1) | (int)RDAT_GET();
+				RCLK_LOW(); HALF(hd);
+			}
+			break;
+		}
+	}
+	g_aw2_st_us += (DWT->CYCCNT - t0) / 64u;
+	if (st != 2) {
+		g_aw2_werr++; aw2_ok = 0; aw2_state = 2;
+		k_sem_give(&aw2_sem); return;
+	}
+	/* two clocks so the card can assert busy (W1 verbatim) */
+	RCLK_HIGH(); HALF(hd); RCLK_LOW();
+	RCLK_HIGH(); HALF(hd); RCLK_LOW();
+	if (READ_DAT0()) { g_aw2_blk++; aw2_advance(); return; }
+	aw2_bz_t0 = DWT->CYCCNT;
+	aw2_hunt_arm();
+}
+
+static void aw2_pwm_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+	if (!NRF_PWM0->EVENTS_STOPPED) { NRF_PWM0->INTENCLR = 0xFFFFFFFF; return; }
+	NRF_PWM0->EVENTS_STOPPED = 0;
+	NRF_PWM0->INTENCLR = 0xFFFFFFFF;
+	NRF_PWM0->SHORTS = 0;
+	NRF_PWM0->LOOP = 0;
+	NRF_PWM0->ENABLE = 0;                /* release the CLK pin */
+	NRF_PPI->CHENCLR = 2;
+	if (aw2_state != 1)
+		return;
+	if (!READ_DAT0()) {                  /* stopped but still busy: rearm */
+		aw2_hunt_arm();
+		return;
+	}
+	uint32_t bz = (DWT->CYCCNT - aw2_bz_t0) / 64u;
+	g_aw2_bz_us += bz;
+	if (bz > g_aw2_bz_max) g_aw2_bz_max = bz;
+	g_aw2_blk++;
+	aw2_advance();
+}
+
+void aw2_setup(void)
+{
+	if (aw2_init) return;
+	k_sem_init(&aw2_sem, 0, 1);
+	/* DWT cycle counter on (64 MHz time base) */
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	/* W3-r2: never reset CYCCNT -- tree-wide M73/M81 time base (artifact #10) */
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+	/* PWM0: 288's reference hunt-clock config, one period per loop */
+	NRF_PWM0->PSEL.OUT[0] = (0u << 31) | (0u << 5) | 6u;  /* CLK P0.6 */
+	NRF_PWM0->PSEL.OUT[1] = (1u << 31);
+	NRF_PWM0->PSEL.OUT[2] = (1u << 31);
+	NRF_PWM0->PSEL.OUT[3] = (1u << 31);
+	NRF_PWM0->MODE = 0;
+	NRF_PWM0->PRESCALER = 0;
+	NRF_PWM0->COUNTERTOP = 8;            /* 2 MHz */
+	NRF_PWM0->LOOP = 0;
+	NRF_PWM0->DECODER = 0;
+	NRF_PWM0->SEQ[0].PTR = (uint32_t)&aw2_pwm_seq;
+	NRF_PWM0->SEQ[0].CNT = 1;
+	NRF_PWM0->SEQ[0].REFRESH = 0;
+	NRF_PWM0->SEQ[0].ENDDELAY = 0;
+	NRF_PWM0->EVENTS_STOPPED = 0;
+	NRF_PWM0->INTENCLR = 0xFFFFFFFF;
+	NRF_PWM0->ENABLE = 0;
+	/* GPIOTE ch1: DAT0 RISING edge = busy release (ch0 stays free
+	 * for the read port's start-bit hunt — W2 runs both) */
+	NRF_GPIOTE->EVENTS_IN[1] = 0;
+	NRF_GPIOTE->CONFIG[1] = (1u << 0)             /* MODE Event */
+	                      | ((uint32_t)PIN_EMMC_DAT0 << 8)
+	                      | (1u << 16);           /* POLARITY LoToHi */
+	NRF_PPI->CH[1].EEP = (uint32_t)&NRF_GPIOTE->EVENTS_IN[1];
+	NRF_PPI->CH[1].TEP = (uint32_t)&NRF_PWM0->TASKS_STOP;
+	NRF_PPI->FORK[1].TEP = 0;
+	{ void w3_isr_hookup(void); w3_isr_hookup(); }
+	aw2_init = 1;
+}
+
+void aw2_build_frame(uint8_t *f, const uint8_t *data)
+{
+	uint16_t crc = crc16(data, EMMC_BLOCK_SIZE);
+	f[0] = 0xFF;
+	f[1] = 0xFE;
+	memcpy(&f[2], data, EMMC_BLOCK_SIZE);
+	f[2 + EMMC_BLOCK_SIZE]     = (uint8_t)(crc >> 8);
+	f[2 + EMMC_BLOCK_SIZE + 1] = (uint8_t)crc;
+}
+
+static void aw2_disarm_all(void)
+{
+	NRF_SPIM3->INTENCLR = 0xFFFFFFFF;
+	NRF_SPIM3->ENABLE = 0;
+	NRF_PWM0->INTENCLR = 0xFFFFFFFF;
+	NRF_PWM0->SHORTS = 0;
+	NRF_PWM0->LOOP = 0;
+	NRF_PWM0->TASKS_STOP = 1;
+	for (int g = 0; g < 100000 && !NRF_PWM0->EVENTS_STOPPED; g++) { }
+	NRF_PWM0->EVENTS_STOPPED = 0;
+	NRF_PWM0->ENABLE = 0;
+	NRF_PPI->CHENCLR = 2;
+}
+
+/* frames: n pre-built 516-byte frames, packed. Thread-paced only at
+ * the burst edges (CMD25 / CMD12 + R1b) — never per block. */
+bool aw2_write_burst(uint32_t blk, const uint8_t *frames, uint32_t n)
+{
+	uint8_t r1[6];
+	if (!send_command_retry(25, blk, r1, 4)) return false;
+	aw2_frames = frames; aw2_n = n; aw2_idx = 0; aw2_ok = 0;
+	k_sem_reset(&aw2_sem);
+	aw2_state = 1;
+	aw2_start_tx();
+	if (k_sem_take(&aw2_sem, K_MSEC(2000)) != 0) {
+		aw2_state = 0;
+		aw2_disarm_all();
+		g_aw2_bzto++;
+		(void)send_command_retry(12, 0, r1, 3);
+		(void)dat0_busy_wait_impl(500000u, false);
+		return false;
+	}
+	aw2_state = 0;
+	(void)send_command_retry(12, 0, r1, 3);
+	(void)dat0_busy_wait_impl(500000u, false);
+	return aw2_ok != 0;
+}
+
+/* ==== W3: emmc_write_blocks' multi-block body on the chain =========
+ * Contract preserved from the sync path (WRITE-DRIVER-DUMP 1140-1168):
+ * CMD25 entry, 250 ms whole-burst deadline (emmc_dbg_busy_timeouts++,
+ * false), CMD12 on every exit path, bounded R1b wait ONLY on success,
+ * false => caller's idempotent retry. PPI ch0 parked during the burst
+ * (W2-proven). Sole-owner rule makes this collision-free with reads. */
+bool emmc_write_blocks_async(uint32_t blk, const uint8_t *buf, uint32_t count)
+{
+	uint8_t r1[6];
+	aw2_setup();
+	if (!send_command_retry(25, blk, r1, 4)) {
+		return false;
+	}
+	NRF_PPI->CHENCLR = 1;
+	aw3_src = buf; aw2_frames = NULL; aw2_n = count; aw2_idx = 0; aw2_ok = 0;
+	k_sem_reset(&aw2_sem);
+	aw2_state = 1;
+	aw2_start_tx();
+	int rc = k_sem_take(&aw2_sem, K_MSEC(250));
+	aw2_state = 0;
+	aw3_src = NULL;
+	NRF_PPI->CHENSET = 1;
+	if (rc != 0) {
+		aw2_disarm_all();
+		emmc_dbg_busy_timeouts++;
+		(void)send_command_retry(12, 0, r1, 3);
+		return false;
+	}
+	if (!aw2_ok) {
+		(void)send_command_retry(12, 0, r1, 3);
+		return false;
+	}
+	(void)send_command_retry(12, 0, r1, 3);
+	(void)dat0_busy_wait_impl(500000u, false);
+	return true;
+}
+
+/* ==== W3-r4: split burst API for the flush pipeline ================
+ * start() returns with the chain IN FLIGHT (frames built per block in
+ * the ISR from aw3_src); the caller may touch RAM (pack the next
+ * page) but NOT the bus until wait(). Same deadline/CMD12 contract
+ * as emmc_write_blocks_async. */
+bool aw3_burst_start(uint32_t blk, const uint8_t *buf, uint32_t count)
+{
+	uint8_t r1[6];
+	aw2_setup();
+	if (!send_command_retry(25, blk, r1, 4)) return false;
+	NRF_PPI->CHENCLR = 1;
+	aw3_src = buf; aw2_frames = NULL; aw2_n = count; aw2_idx = 0; aw2_ok = 0;
+	k_sem_reset(&aw2_sem);
+	aw2_state = 1;
+	aw2_start_tx();
+	return true;
+}
+bool aw3_burst_wait(void)
+{
+	uint8_t r1[6];
+	int rc = k_sem_take(&aw2_sem, K_MSEC(250));
+	aw2_state = 0;
+	aw3_src = NULL;
+	NRF_PPI->CHENSET = 1;
+	if (rc != 0) {
+		aw2_disarm_all();
+		emmc_dbg_busy_timeouts++;
+		(void)send_command_retry(12, 0, r1, 3);
+		return false;
+	}
+	(void)send_command_retry(12, 0, r1, 3);
+	(void)dat0_busy_wait_impl(500000u, false);
+	return aw2_ok != 0;
+}
+
+/* ==== W3 dispatcher: one storage owner (looper.html sole-owner rule)
+ * means read and write bursts never overlap; route the shared
+ * SPIM3/PWM0 interrupts on port state. Idle default: clear + disarm
+ * (the r4 rule) so a stray event can never storm. */
+static void w3_spim_isr(const void *arg)
+{
+	if (m50_state == 1) { m50_spim_isr(arg); return; }
+	if (aw2_state == 1) { aw2_spim_isr(arg); return; }
+	NRF_SPIM3->EVENTS_END = 0;
+	NRF_SPIM3->EVENTS_ENDRX = 0;
+	NRF_SPIM3->INTENCLR = 0xFFFFFFFF;
+}
+static void w3_pwm_isr(const void *arg)
+{
+	if (m50_state == 1) { m50_pwm_isr(arg); return; }
+	if (aw2_state == 1) { aw2_pwm_isr(arg); return; }
+	NRF_PWM0->EVENTS_STOPPED = 0;
+	NRF_PWM0->INTENCLR = 0xFFFFFFFF;
+}
+void w3_isr_hookup(void)
+{
+	static uint8_t w3_hooked;
+	if (w3_hooked) return;
+	IRQ_CONNECT(SPIM3_IRQn, 3, w3_spim_isr, NULL, 0);
+	IRQ_CONNECT(PWM0_IRQn, 3, w3_pwm_isr, NULL, 0);
+	irq_enable(SPIM3_IRQn);
+	irq_enable(PWM0_IRQn);
+	w3_hooked = 1;
 }

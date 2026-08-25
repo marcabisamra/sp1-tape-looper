@@ -725,8 +725,9 @@ static volatile uint32_t g_usb_hiwat;              /* diag: window MAX usb-in ri
 #define SP1_CODEC_PCM    0
 #define SP1_CODEC_ULAW   1
 #define SP1_CODEC_ADPCM  2
+#define SP1_CODEC_A7    3u   /* M63b: SP1-ADPCM7, the FROZEN 3.0 codec */
 #ifndef SP1_CODEC
-#define SP1_CODEC        SP1_CODEC_PCM    /* FULL 16-BIT PCM — the proven WORKING.bin
+#define SP1_CODEC        SP1_CODEC_A7    /* FULL 16-BIT PCM — the proven WORKING.bin
                                            * format (magic SE4A). The u-law/ADPCM
                                            * compressed builds never worked right on
                                            * the user's hardware; do not rebase on
@@ -738,8 +739,10 @@ static volatile uint32_t g_usb_hiwat;              /* diag: window MAX usb-in ri
 #define SAMP_PER_BLK     (EMMC_BLOCK_SIZE)                 /* 512 samp / block (8-bit) */
 #elif SP1_CODEC == SP1_CODEC_ADPCM
 #define SAMP_PER_BLK     1016u                             /* 4B hdr + 508 nibble-bytes = 1016 samp / block (4-bit IMA) */
+#elif SP1_CODEC == SP1_CODEC_A7
+#define SAMP_PER_BLK     280u   /* FRAMES/block: 16 B hdr + 70x7 B payload (spec 4.1b) */
 #else
-#error "SP1_CODEC must be 0 (PCM), 1 (ULAW) or 2 (ADPCM)"
+#error "SP1_CODEC must be 0 (PCM), 1 (ULAW), 2 (ADPCM) or 3 (A7)"
 #endif
 /* ---- storage codec pack/unpack (full bodies just before streamer_thread) ----
  * codec_pack:   int16 ring -> flash bytes  (encode), one CMD25 burst of n blocks
@@ -780,7 +783,7 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
  * since been removed; the alignment is harmless and is kept so the on-card
  * layout / META_MAGIC do not change.) */
 #define TRACK_BLOCKS     ((((MAX_LOOP_BLOCKS + 8u) + 4095u) / 4096u) * 4096u)
-#define RING_SAMPLES     16384u                            /* ~341 ms read-ahead @48k (reverted 8192->16384 to give the compressed codecs comfortable play-ring margin) */
+#define RING_SAMPLES     8192u   /* M63a: STEREO FRAMES (~170 ms @48k; was 16384 mono) */                            /* ~341 ms read-ahead @48k (reverted 8192->16384 to give the compressed codecs comfortable play-ring margin) */
 #define RING_MASK        (RING_SAMPLES - 1u)
 /* Play-ring critical margin for scheduling decisions: 128 ms expressed in
  * samples at the loop rate — EXPLICIT and codec-independent (the old
@@ -814,7 +817,7 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
  * other format's bytes. */
 #if DECIM == 1u
 #  if   SP1_CODEC == SP1_CODEC_PCM
-#define META_MAGIC       0x53383136u                       /* 'S816' — 48 kHz PCM, 16-song 2-block index,
+#define META_MAGIC       0x53453341 /* 'SE3A' (was 'S816'): a build switch reformats */u                       /* 'S816' — 48 kHz PCM, 16-song 2-block index,
                                                             * 643-beat (8:00) regions. TRACK_BLOCKS
                                                             * differs from earlier layouts, so this is a
                                                             * format break: any other index reads as
@@ -889,6 +892,53 @@ struct meta_blk {
 BUILD_ASSERT(sizeof(struct meta_blk) <= META_BLOCKS * EMMC_BLOCK_SIZE,
 	     "meta_blk outgrew its reserved index blocks");
 static struct meta_blk   g_meta;
+/* ==== M72: the v3 PER-TRACK EXTENDED TABLE (blocks 3-5), M61-proven.
+ * Self-validating (magic+sum): stale stock bytes read as "no table".
+ * Carries SAMPLE-EXACT anchors/lengths across power cycles — closes
+ * the <=2.7 ms block-rounding reload limit (Phase-B), which the v3
+ * codec's bigger blocks would have widened to 5.83 ms. Streamer owns
+ * writes; audio reads with a consistency cross-check, so a torn or
+ * stale entry degrades to the block-derived value, never worse. ==== */
+#define X3_MAGIC   0x53453358u        /* 'SE3X' */
+#define X3_VER     1u
+/* Card-table codec numbering (FREEZES AT SHIP -- see 414 header).
+ * 0 PCM16, 1 u-law, 2 IMA4, 3 SP1-ADPCM5, 4 SP1-ADPCM7.
+ * NOT the same namespace as the build-time SP1_CODEC_* selector,
+ * where A7 == 3. Do not merge them. */
+#define X3_CODEC_A7 4u
+#define X3_BLK     3u
+#define X3_NBLK    3u
+struct x3_trk {
+	uint32_t start_samps;
+	uint32_t len_samps;
+	uint32_t content_blocks;
+	uint8_t  codec_id;            /* 0 PCM16 1 u-law 2 IMA4 3 A5 4 A7 */
+	uint8_t  flags;               /* bit0 stereo content */
+	uint8_t  pan;
+	uint8_t  rsv;
+};
+struct x3_tab {
+	uint32_t magic;
+	uint16_t ver;
+	uint16_t sum;                 /* over the entry bytes only */
+	uint32_t rsv0, rsv1;
+	struct x3_trk t[NUM_SLOTS][NTRK];
+};
+static struct x3_tab g_x3;
+static volatile uint8_t g_x3_ok;
+static uint16_t x3_sum(const struct x3_tab *tb)
+{
+	const uint8_t *p = (const uint8_t *)&tb->t[0][0];
+	uint32_t n = (uint32_t)sizeof(tb->t), i;
+	uint16_t s = 0;
+	for (i = 0; i < n; i++) s = (uint16_t)(s + p[i]);
+	return s;
+}
+static int x3_valid(const struct x3_tab *tb)
+{
+	return tb->magic == X3_MAGIC && tb->ver == X3_VER &&
+	       tb->sum == x3_sum(tb);
+}
 static volatile uint32_t g_slot;
 static volatile int      g_slot_switch_req;   /* main -> audio: reload tracks for the new slot */
 static volatile int      g_meta_save_req;     /* -> streamer: persist g_meta to eMMC */
@@ -1080,6 +1130,240 @@ static volatile uint64_t g_grid_resync_at;     /* pending loop-restart at this b
 static volatile uint32_t g_p2blk[4];
 static volatile uint32_t g_p2snap[4];
 static volatile uint32_t g_p2yield, g_p2rfail;
+static volatile uint32_t g_prime_ovf;   /* M63b-r2: prime room clip bit */
+/* M63b-r4 PHASE TIMING: cycles spent per streamer phase, so the
+ * codec cost stops being an argument and becomes a number.
+ *
+ * Use DWT->CYCCNT (64 MHz core), NOT k_cycle_get_32(). The tree
+ * says at the eMMC CRC counters that k_cycle_get_32 runs on the
+ * 32768 Hz RTC, ~30.5 us resolution -- coarser than a whole block
+ * decode. The audio engine already profiles with DWT for exactly
+ * this reason ('(DWT->CYCCNT - _c0) / 64u; 64 MHz -> us'), and
+ * CYCCNT is enabled once at init. 1000x the resolution, and it
+ * kills the 32768/1000 = 32 integer-division bias too.
+ *
+ * Accumulate in uint64_t: at 64 MHz a uint32_t of CYCLES saturates
+ * after only 67 s of accumulated phase time, which a real run
+ * exceeds. The per-call DELTA is always short, so it stays 32-bit
+ * and wraps correctly. */
+/* M95-B: the inner-loop probes run 384x/block at 1.5x and cost an
+ * estimated 220-500 us -- six DWT->CYCCNT PPB loads plus two volatile
+ * uint64 RMWs per iteration, and they pin r11 hard enough to force two
+ * stack spills, partly undoing the M93 hoist. Set to 1 to profile
+ * PASS A's interior again. M81/M8X/M8Y are BLOCK-level and unaffected,
+ * so `a=` still measures PASS A either way. */
+#define M82_PROBES 0
+static volatile uint64_t g_t_rd, g_t_dc, g_t_en, g_t_wr;
+/* M95-A: CORNER-GATED twins of the M73 phase timers.
+ * The originals are cumulative-since-boot, which dilutes the corner
+ * across all the idle time around it -- artifact #6, the same defect
+ * that made `CPU aud=` disagree with the 1 ms census. These accumulate
+ * ONLY while the corner condition holds, so they answer the question
+ * the ~35%% design target never actually answered.
+ * Counts ride alongside so cost-per-unit is derivable, which is what
+ * turns "what the streamer GOT" into "what the streamer NEEDS". */
+static volatile uint64_t g_t_rd_cx, g_t_dc_cx, g_t_en_cx, g_t_wr_cx;
+static volatile uint32_t g_t_rd_cxn, g_t_dc_cxn, g_t_en_cxn, g_t_wr_cxn;
+static volatile uint32_t g_dcc;   /* M75: a7_decode_block calls */
+static volatile uint32_t g_dcu, g_dcp, g_dcr; /* M76: by caller */
+static volatile uint8_t g_cap_stereo = 1u;  /* M63b-2 step 1: R=L
+                                              * capture. Ring is mono
+                                              * (M91); the encoder's
+                                              * stereo branch reads
+                                              * ring[fi] for BOTH L and
+                                              * R by construction, so
+                                              * setting this flag stamps
+                                              * takes stereo with R = L
+                                              * identical. Step 2 will
+                                              * add a real R source. */
+/* M80: cumulative DWT time inside the two UAC2 callbacks. */
+static volatile uint64_t g_t_cb, g_t_sof;
+/* M81: per-phase time in looper_audio_block. Cumulative + max. */
+static volatile uint64_t g_ph[4];
+static volatile uint32_t g_phmax[4];
+/* M8X: the same four phases, but advancing ONLY at the corner.
+ * g_ph[] is cumulative from boot and a 58 s corner vanishes into
+ * the average -- the same dilution that made W4C useless until
+ * W4X gated it. Gate the instrument on the condition. */
+static volatile uint64_t g_cph[4];
+static volatile uint32_t g_cph_n, g_cph_blk;
+/* M8Y: identical to M8X except the gate -- high speed but NOT
+ * recording. Differencing the two isolates the record path's cost
+ * at speed from the speed-scaled walk itself. */
+static volatile uint64_t g_dph[4];
+static volatile uint32_t g_dph_blk;
+static volatile uint64_t g_pa82[2];  /* M82: PASS A sub-spans */
+static volatile uint32_t g_t1min = 0xFFFFFFFFu; /* M86 min cyc/call */
+static volatile uint32_t g_enmin = 0xFFFFFFFFu; /* M88 min cyc/emit */
+static volatile uint32_t g_dbg_rw, g_dbg_rr, g_dbg_rc; /* M86-r2 raw */
+static volatile uint32_t g_w4_pk, g_w4_pb, g_w4_sq, g_w4_tq; /* W4P */
+/* ==== S1: SHADOW CACHE state (design doc SP1-SHADOW-CACHE-DESIGN) ====
+ * Shadow region: past the layout tail, SEC_COUNT-gated at boot.
+ * 256 ring samples per 512-B shadow block; per-track watermark in
+ * FRAMES (multiple of 256), contiguous-from-0. Disposable. */
+#define SHW_BASE        (SLOT0_BLOCK + (uint32_t)NUM_SLOTS * NTRK * TRACK_BLOCKS + 131072u)
+#define SHW_TRK_BLOCKS  (TRACK_BLOCKS * 3u)
+#define SHW_TRK(t)      (SHW_BASE + (uint32_t)(t) * SHW_TRK_BLOCKS)
+/* ==== S8Q: 8-bit stereo shadow codec (Stage 1) =====================
+ * Sector: 512 B = 12 B header + 250 stereo frames x 2 B.
+ * Header: tag 0x38 | u16 idx | bases (baseL<<4|baseR) | 32x2-bit offs.
+ * s8q_sub[] is the ONE source of truth for sub-block sizes on both
+ * the encode and decode side: divmod(250,16) -> 10x16 then 6x15.
+ * Headroom 4 is the PROVABLE no-clip bound: the shaper clamp is
+ * 4<<sh, so a sample lands at most 4 steps over its peak; 127-4=123.
+ * e1 RESETS at every sub-block boundary -- carrying it across a
+ * step-size change is invalid (bit three times on 2026-08-25).
+ * Host reference + verifier: 454-s8q-packer-check.command. */
+static const uint8_t s8q_sub[16] = {16,16,16,16,16,16,16,16,16,16,
+                                    15,15,15,15,15,15};
+
+static void s8q_enc_sector(const int16_t *sp, uint32_t mask, uint32_t f0,
+                           uint16_t idx, uint8_t *out)
+{
+	uint8_t offs[32];
+	out[0] = 0x38u; out[1] = (uint8_t)idx; out[2] = (uint8_t)(idx >> 8);
+	out[3] = 0u;
+	for (uint32_t c = 0; c < 2u; c++) {
+		uint8_t want[16]; uint8_t wmax = 0u; uint32_t f = f0;
+		for (uint32_t b = 0; b < 16u; b++) {
+			uint32_t pk = 0u;
+			for (uint32_t i2 = 0; i2 < s8q_sub[b]; i2++, f++) {
+				int32_t v = sp[(f & mask) * 2u + c];
+				if (v < 0) v = -v;
+				if ((uint32_t)v > pk) pk = (uint32_t)v;
+			}
+			uint8_t sh = 0u;
+			while ((pk >> sh) > 123u) sh++;
+			want[b] = sh; if (sh > wmax) wmax = sh;
+		}
+		uint8_t base = (wmax > 3u) ? (uint8_t)(wmax - 3u) : 0u;
+		out[3] |= (c == 0u) ? (uint8_t)(base << 4) : base;
+		f = f0;
+		for (uint32_t b = 0; b < 16u; b++) {
+			uint8_t sh = (want[b] < base) ? base :
+			             ((want[b] > (uint8_t)(base + 3u)) ?
+			              (uint8_t)(base + 3u) : want[b]);
+			offs[c * 16u + b] = (uint8_t)(sh - base);
+			int32_t e1 = 0, lim = 4 << sh, half = (1 << sh) >> 1;
+			for (uint32_t i2 = 0; i2 < s8q_sub[b]; i2++, f++) {
+				int32_t v = (int32_t)sp[(f & mask) * 2u + c] - e1;
+				if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+				int32_t q = (v + half) >> sh;
+				if (q > 127) q = 127; else if (q < -128) q = -128;
+				e1 = (q << sh) - v;
+				if (e1 > lim) e1 = lim; else if (e1 < -lim) e1 = -lim;
+				out[12u + (f - f0) * 2u + c] = (uint8_t)q;
+			}
+		}
+	}
+	for (uint32_t j = 0; j < 8u; j++)
+		out[4u + j] = (uint8_t)((offs[j*4u] << 6) | (offs[j*4u+1u] << 4) |
+		                        (offs[j*4u+2u] << 2) |  offs[j*4u+3u]);
+}
+
+/* Decode cnt frames starting at frame li of sector sec into the
+ * stereo ring dst at write head dw. Walks sectors; NO divides in the
+ * sample loop. Stateless per sector (seek-safe). */
+static void s8q_dec_span(const uint8_t *sec, uint32_t li, uint32_t cnt,
+                         int16_t *dst, uint32_t mask, uint32_t dw)
+{
+	while (cnt) {
+		uint8_t baseL = (uint8_t)(sec[3] >> 4);
+		uint8_t baseR = (uint8_t)(sec[3] & 0x0Fu);
+		uint32_t f = 0u, b = 0u;
+		while (f + s8q_sub[b] <= li) { f += s8q_sub[b]; b++; }
+		uint32_t rem = f + s8q_sub[b] - li;
+		f = li;
+		while (f < 250u && cnt) {
+			uint32_t jr = 16u + b;
+			uint8_t shL = (uint8_t)(baseL +
+			    ((sec[4u + (b  >> 2)] >> (6u - 2u * (b  & 3u))) & 3u));
+			uint8_t shR = (uint8_t)(baseR +
+			    ((sec[4u + (jr >> 2)] >> (6u - 2u * (jr & 3u))) & 3u));
+			while (rem && cnt) {
+				int32_t yl = (int32_t)(int8_t)sec[12u + f * 2u]      << shL;
+				int32_t yr = (int32_t)(int8_t)sec[12u + f * 2u + 1u] << shR;
+				if (yl > 32767) yl = 32767; else if (yl < -32768) yl = -32768;
+				if (yr > 32767) yr = 32767; else if (yr < -32768) yr = -32768;
+				uint32_t _di = (dw & mask) * 2u;
+				dst[_di]      = (int16_t)yl;
+				dst[_di + 1u] = (int16_t)yr;
+				dw++; f++; cnt--; rem--;
+			}
+			b++;
+			if (b < 16u) rem = s8q_sub[b];
+		}
+		sec += 512u; li = 0u;
+	}
+}
+
+#define X3_CODEC_P14S 5u
+#define P14S_MARK     0x5Bu
+static uint8_t  g_p14s_mask;              /* bit i: track i is P14S (shadow OFF) */
+static int32_t  g_p14s_e1[2];             /* encode shaper, carried within a take */
+static int16_t  g_p14s_prev[NTRK][2];     /* decode continuity per track */
+static volatile uint32_t g_shw_wm[NTRK];
+/* #116: the shadow region is addressed by TRACK INDEX ONLY --
+ * SHW_TRK(i) has no slot in it -- so every song shares the same
+ * four regions and a slot change makes all four stale. */
+static volatile uint32_t g_shw_slot = 0xFFFFFFFFu;
+static volatile uint32_t g_shw_inv;    /* stale shadow actually discarded */
+static volatile uint32_t g_shw_stale;  /* serve passed on a stale slot -- MUST STAY 0 */
+static volatile uint32_t g_shw_blk, g_shw_skip, g_shw_hit;
+static uint8_t g_shw_armed;
+/* W4C: 1 ms statistical census — the timer ISR samples the
+ * INTERRUPTED thread. Cumulative per-tid counts (Protocol A:
+ * deltas belong to the analysis, not the firmware). */
+static struct k_timer g_w4c_tmr;
+static struct { void *tid; uint32_t n; } g_w4c_tab[8];
+static volatile uint32_t g_w4c_miss;
+/* CX: the corner census. g_w4c_tab is cumulative from boot and is
+ * diluted by every idle second; these tick ONLY while the transport
+ * is at high speed AND a take is recording -- the corner's defining
+ * condition. Indices match g_w4c_tab, so no second tid table. */
+#define CX_SPEED_MIN 90000u   /* ~1.373x (1.5x == 98304) */
+/* g_rec_track is DEFINED further down the file than the census
+ * tick that reads it -- the first CX build failed to compile on
+ * exactly this, the same ordering class as the batchbuf bug in
+ * 432. A tentative definition here is legal C at file scope and
+ * binds to the real one below. */
+static volatile int g_rec_track;
+static uint32_t g_cur_speed_q16;
+static volatile uint32_t g_cx_n[8];
+static volatile uint32_t g_cx_tot, g_cx_hs;
+static volatile uint32_t g_gap_max;   /* W4N: worst rec-ring gap this boot */
+static uint8_t g_w4n_once;
+static uint8_t g_w4c_on;
+static void w4c_tick(struct k_timer *t)
+{
+	ARG_UNUSED(t);
+	void *cur = (void *)k_current_get();
+	int _cxhs = (g_cur_speed_q16 >= CX_SPEED_MIN);
+	int _cx = _cxhs && (g_rec_track >= 0);
+	if (_cxhs) g_cx_hs++;
+	for (int i = 0; i < 8; i++) {
+		if (g_w4c_tab[i].tid == cur) { g_w4c_tab[i].n++;
+			if (_cx) { g_cx_n[i]++; g_cx_tot++; } return; }
+		if (!g_w4c_tab[i].tid) { g_w4c_tab[i].tid = cur; g_w4c_tab[i].n = 1;
+			if (_cx) { g_cx_n[i] = 1; g_cx_tot++; } return; }
+	}
+	g_w4c_miss++;
+}
+#define M81_LAP(K) do { uint32_t _n81 = DWT->CYCCNT, _d81 = _n81 - _lt81; \
+	g_ph[K] += _d81; uint32_t _u81 = _d81 / 64u; \
+	if (_u81 > g_phmax[K]) g_phmax[K] = _u81; \
+	if (_cx81) g_cph[K] += _d81; \
+	if (_dx81) g_dph[K] += _d81; \
+	_lt81 = _n81; } while (0)
+#define M73_T0() uint32_t _t73 = DWT->CYCCNT
+/* M95-A: same accumulate, plus a corner-gated twin. The gate reads
+ * g_play_speed_q16 (volatile, rocker-set) rather than g_cur_speed_q16
+ * -- the latter is documented audio-thread-only and M73_ADD runs on
+ * the STREAMER thread. */
+#define M73_CX_NOW() (g_play_speed_q16 >= CX_SPEED_MIN && g_rec_track >= 0)
+#define M73_ADD(acc) do { uint32_t _dcx73 = (uint32_t)(DWT->CYCCNT - _t73); \
+        (acc) += _dcx73; \
+        if (M73_CX_NOW()) { (acc##_cx) += _dcx73; (acc##_cxn)++; } } while (0)
 static volatile int      g_meta_loaded;       /* streamer -> main: g_meta read at boot */
 
 /* Persist the 2-block song index MAGIC-LAST: block 1 (songs 9-16 + tail)
@@ -1100,7 +1384,10 @@ enum trk_state { TS_EMPTY, TS_ARMED, TS_REC, TS_DONE, TS_PLAY };
 struct looptrk {
 	volatile uint8_t  state;
 	volatile uint16_t vol_q8;            /* fader volume, 256 = unity */
-	int16_t  pring[RING_SAMPLES];        /* play ring:  streamer writes, audio reads */
+	int16_t  pring[RING_SAMPLES * 2u] __attribute__((aligned(4)));
+	                                     /* M63a play ring: STEREO frames (L,R int16
+	                                      * pairs); RING_SAMPLES counts FRAMES.
+	                                      * streamer writes, audio reads */
 	volatile uint32_t p_w;               /*   streamer fill frontier (loop samples) */
 	volatile uint32_t r_w;               /*   rec ring: audio produce (into g_rring) */
 	volatile uint32_t r_r;               /*   rec ring: streamer consume */
@@ -1146,9 +1433,13 @@ static struct looptrk trk[NTRK];
  * rings were waste: one ring TWICE the size costs 32 KB less RAM and absorbs
  * twice the eMMC-write transient (~2.4 s at the loop rate) before overflowing.
  * Overflow = a permanently corrupted take, so headroom here is what matters. */
-#define RRING_SAMPLES    16384u   /* ~341 ms record backlog (reverted 32768->16384): the compressed codecs cut flush traffic, so the doubled rec ring is no longer needed; this reclaims RAM for the play-ring revert */
+#define RRING_SAMPLES    8192u   /* S2CAP: STEREO FRAMES. Byte-identical
+ * ring (8192 x 2ch x 2B = 32,768 B). Backlog tolerance HALVES to
+ * ~170 ms -- one 104 ms write-cache stall fits, two stacked may
+ * not. rhw= on the STV line is the meter; ovr counts losses. */  /* M91: MONO frames -- capture is a mono downmix; the stereo-frame ring stored every sample twice. 341 ms backlog, the PCM-era headroom back */   /* M63a: STEREO FRAMES (~170 ms backlog; was 16384 mono) */   /* ~341 ms record backlog (reverted 32768->16384): the compressed codecs cut flush traffic, so the doubled rec ring is no longer needed; this reclaims RAM for the play-ring revert */
 #define RRING_MASK       (RRING_SAMPLES - 1u)
-static int16_t g_rring[RRING_SAMPLES];
+static int16_t g_rring[RRING_SAMPLES * 2u]  /* S2CAP: stereo frames */ __attribute__((aligned(4)));
+/* M63a: stereo frames; g_pre_w / r_w / r_r count FRAMES as before */
 /* M20 PRE-ROLL: the record ring sits IDLE whenever nothing is being captured,
  * so the input is written into it continuously — the machine always remembers
  * the last stretch of what it heard. A punch that arrives LATE can then start
@@ -1156,7 +1447,8 @@ static int16_t g_rring[RRING_SAMPLES];
  * record the past, but you can remember it. Costs zero RAM (the buffer already
  * existed) and one store per sample while idle. Capped at half the ring so a
  * backfilled take never starts the flush against a full buffer. */
-#define PREROLL_MAX      (RRING_SAMPLES / 2u)
+#define PREROLL_MAX      (RRING_SAMPLES * 3u / 4u)  /* M63a: ring halved; 3/4 keeps
+                                                     * instant-record reach ~128 ms */
 /* M20b-r2: how far back a punch may REACH. Human lateness is measured in
  * milliseconds, not in beats, so the reach window is a quarter of a beat
  * CAPPED here — see the rescue site for why half a beat was too generous. */
@@ -1178,6 +1470,25 @@ static volatile uint8_t  g_done_pending;  /* a take is still flushing: ring is B
 static volatile uint8_t  g_instant_rec = 1;
 static volatile uint32_t g_rec_overruns;         /* diag: rec ring overflow events */
 static volatile uint32_t g_starve_cnt[NTRK];     /* diag: per-track play-ring underrun episodes */
+/* M98: g_starve_cnt is cumulative-since-boot, and Protocol A connects
+ * the capture AFTER the run -- so every stv we have ever read is a
+ * single end-of-session snapshot. Slicing the captures by tick shows
+ * flat lines: identical on all 269 ticks of one run. Four snapshots
+ * from four differently-shaped sessions cannot answer WHERE the
+ * dropouts happen. Same defect as artifact #6, same fix as W4X:
+ * gate by phase. Both bump sites are in PASS B on the audio thread,
+ * so the gate reads variables already in hand and only runs when a
+ * ring has ALREADY underrun -- it cannot perturb what it measures. */
+static volatile uint32_t g_stv_lo;   /* below high speed              */
+static volatile uint32_t g_stv_up;   /* high speed, NOT recording     */
+static volatile uint32_t g_stv_cx;   /* high speed AND recording      */
+static volatile uint32_t g_stv_pf;   /* a take still flushing         */
+#define STV_BUMP() do { \
+        if (g_cur_speed_q16 < CX_SPEED_MIN) g_stv_lo++; \
+        else if (g_rec_track >= 0)          g_stv_cx++; \
+        else if (g_done_pending)            g_stv_pf++; \
+        else                                g_stv_up++; \
+} while (0)
 /* ---- M46d: duty-cycled streamer priority boost (the TL-3 dropout fix).
  * USB interrupt load dilates the CPU-paced eMMC reads ~2x (measured:
  * cmd 455->857 us, data 474->847 us per 512 B block). When a playing
@@ -1341,7 +1652,9 @@ static volatile int      g_emmc_ready;
 static volatile int      g_dbg_beat;              /* current beat number (diag) */
 static volatile int      g_dbg_btn = -1;          /* committed track button (diag) */
 static uint64_t          g_sample_clock;          /* free-running I2S frames (idle metronome) */
-static int64_t           g_dec_acc;                /* live accumulator for record decimation (int64: cannot overflow when the transport is stopped / step rounds to 0) */
+static int64_t           g_dec_acc;
+static int64_t           g_dec_accR;               /* S2CAP: R-channel decimator */
+static volatile uint32_t g_rw_hw;                  /* S2CAP: rec-ring fill high-water (frames) */                /* live accumulator for record decimation (int64: cannot overflow when the transport is stopped / step rounds to 0) */
 static uint32_t          g_frames_since;           /* I2S frames since the last loop-sample tick */
 static uint32_t          g_pphase;                 /* Q16 playback phase */
 static volatile uint32_t g_play_speed_q16 = 65536; /* tape speed when playing (Q16, 65536=1.0x); rocker sets */
@@ -1369,6 +1682,15 @@ static volatile int g_play_bpm = 80;
  * ~= 55 ms — backdated out of every take so the captured end lands where the
  * finger did, not where the pipeline noticed. */
 #define STOP_COMP_SAMPLES 2600u             /* ~55 ms at 48 kHz */
+/* M96: the stop gesture's latency is NOT constant. The debounce below
+ * was PASS-COUNTED, and the control pass stretches when main is starved
+ * (4.60%% CPU at the corner), so the real latency scales with load. We
+ * now MEASURE it: g_stop_lat_ms is the wall time from first sighting of
+ * a new ladder value to its commit. Used for the backdate and printed
+ * as BTN, so the stretch is visible instead of merely felt. */
+#define BTN_DEBOUNCE_MS   24
+static volatile uint32_t g_stop_lat_ms;
+static volatile uint32_t g_stop_lat_max;
 /* M44 PRESS side of the same budget: ladder debounce (~24 ms) + control
  * pass (~8 ms) ~= 32 ms between skin-on-button and the committed press.
  * Added to the A-r2 press stamp so head recovery (M41) and the gridded
@@ -1686,7 +2008,19 @@ static inline int16_t soft_limit(int32_t x)
 	int32_t a = x * s;               /* |x| */
 	if (a > TH) {
 		int32_t over = a - TH;       /* compress: y = TH + HEAD*over/(over+HEAD) */
-		a = TH + (int32_t)(((int64_t)HEAD * over) / (over + HEAD));
+		/* M95-C: the int64 form compiles to bl __aeabi_uldivmod, called
+		 * 2x per output frame -- up to 512 library divisions per block on
+		 * loud material. HEAD is 6767, so HEAD*over stays under 2^31 for
+		 * over < 317346; below that the whole expression fits in uint32
+		 * and becomes ONE hardware udiv. The 64-bit arm is kept so this
+		 * is bit-exact for every input, not merely for reachable ones:
+		 * clamping instead of branching diverges from |x| = 344002 up.
+		 * Verified 0 differing samples over +/-2,000,000. Reachable max
+		 * over = 137835 (4 tracks + monitor, full scale) -- 2.3x inside. */
+		if (over < 317000)
+			a = TH + (int32_t)(((uint32_t)HEAD * (uint32_t)over) / (uint32_t)(over + HEAD));
+		else
+			a = TH + (int32_t)(((int64_t)HEAD * over) / (over + HEAD));
 	}
 	return (int16_t)(s * a);         /* a <= 32767 by construction */
 }
@@ -1694,11 +2028,96 @@ static inline int16_t soft_limit(int32_t x)
  * overflow UB sites are fixed with int64 casts, -fno-strict-aliasing is global, and
  * this function contains NO flash-write code -- same per-function -O2 already proven
  * werr-safe on the eMMC read path. Speeds the per-frame interp/volume/limit work. */
+/* M85-r2: the rec-write chain, machine-extracted from the tree
+ * (M84) with a MECHANICAL field-pointer transform. Do not edit
+ * by hand; r1 hand-transcription broke the stereo ring store. */
+__attribute__((optimize("O2"), noinline))
+static void rec_write_sample(int16_t lsamp, int16_t rsamp)
+{
+					struct looptrk *rt = &trk[g_rec_track];
+					/* M85-r2: one address computation per field per CALL --
+					 * struct looptrk is 32,840 B with control fields past
+					 * +0x8000 (beyond Thumb-2 imm12); naive access pays
+					 * movw+mla per field per sample (M84 disasm). Volatile
+					 * semantics, store order, per-sample publish: UNCHANGED. */
+					volatile uint32_t * const prw = &rt->r_w;
+					volatile uint32_t * const prr = &rt->r_r;
+					volatile uint32_t * const prc = &rt->rec_count;
+					volatile uint32_t * const ptg = &rt->rec_target;
+					if (((*prw) - (*prr)) >= RRING_SAMPLES)
+						g_rec_overruns++;   /* take corrupting: flush too slow */
+					int16_t wsamp = lsamp;
+					int16_t wsampR = rsamp;
+					if (rt->rec_silence) {
+						uint8_t fg = rt->rec_fade;
+						if (fg) {
+							wsamp  = (int16_t)(((int32_t)lsamp * fg) >> 7);
+							wsampR = (int16_t)(((int32_t)rsamp * fg) >> 7);
+							uint8_t st = rt->rec_fstep ? rt->rec_fstep : 1u;
+							rt->rec_fade = (fg > st) ? (uint8_t)(fg - st) : 0u;
+						} else {
+							wsamp = 0; wsampR = 0;
+						}
+					} else if ((*ptg)) {
+						/* fixed-mode run-to-the-bar: fade the final ~2.7 ms
+						 * into the bar line so the loop seam can't click */
+						uint32_t rem = (*ptg) - (*prc);
+						if (rem <= 128u) {
+							wsamp  = (int16_t)(((int32_t)lsamp *
+									   (int32_t)rem) >> 7);
+							wsampR = (int16_t)(((int32_t)rsamp *
+									   (int32_t)rem) >> 7); }
+					}
+					{ uint32_t _fi = ((*prw) & RRING_MASK);      /* S2CAP frame */
+					  g_rring[_fi * 2u]      = wsamp;
+					  g_rring[_fi * 2u + 1u] = wsampR; }
+					(*prw)++;
+					(*prc)++;
+					{ uint32_t _bl = (*prw) - (*prr);   /* S2CAP meter */
+					  if (_bl > g_rw_hw) g_rw_hw = _bl; }
+					g_pre_w = (*prw);   /* pre-roll follows the take */
+					if (g_tempo.active) tempo_feed(lsamp, (*prc));
+					if ((*ptg) == 0u) {
+						/* OPEN take (first take AND independent overdubs):
+						 * force-stop at the maximum length. Only a FIRST
+						 * take defines the song grid/BPM. */
+						if ((*prc) >= MAX_LOOP_SAMPLES) {
+							if (g_loop_len == 0u) {
+								g_loop_len = MAX_LOOP_SAMPLES;
+								g_loop_blocks = (g_loop_len + SAMP_PER_BLK / 2u) / SAMP_PER_BLK;
+								tempo_finish();
+								if (g_slot < NUM_SLOTS) {
+									g_meta.slot[g_slot].loop_len = g_loop_len;
+									g_meta_save_req = 1;
+								}
+							}
+							(*ptg) = MAX_LOOP_SAMPLES;
+							rt->len_blocks = MAX_LOOP_BLOCKS;
+							rt->len_samps = MAX_LOOP_SAMPLES;
+							rt->content_blocks = MAX_LOOP_BLOCKS;  /* all content */
+							rt->state = TS_DONE; g_rec_track = -1;
+							g_done_pending = 1;   /* M20: ring busy */
+						}
+					} else if ((*prc) >= (*ptg)) {
+						/* Take FINALIZE: rec_target is set by the stop tap
+						 * (free-length, block-rounded) — the recorder pads
+						 * the sub-block remainder with silence and lands
+						 * here. The take now loops at its own length. */
+						rt->state = TS_DONE; g_rec_track = -1;
+							g_done_pending = 1;   /* M20: ring busy */
+					}
+}
 __attribute__((optimize("O2")))
 static void looper_audio_block(int16_t *s)
 {
 	static int16_t tmp[BLK_FRAMES * 2];
 	if (g_xfer_mode) { memset(s, 0, BLK_BYTES); return; }   /* USB transfer: silence out */
+	uint32_t _lt81 = DWT->CYCCNT;   /* M81 phase clock */
+	/* M8X: one predicate per BLOCK, not per frame. Same gate as W4X. */
+	const int _cx81 = (g_cur_speed_q16 >= CX_SPEED_MIN) && (g_rec_track >= 0);
+	const int _dx81 = (g_cur_speed_q16 >= CX_SPEED_MIN) && (g_rec_track < 0);
+	if (_cx81) g_cph_blk++;
+	if (_dx81) g_dph_blk++;
 	{ /* M46d: sprint flag with hysteresis — ON under 4096 smp (~85 ms),
 	   * OFF at 4800 smp (~100 ms); steady-state fill is ~110 ms. */
 	  uint32_t _sp_c = g_consume_pos; int _sp_low = 0;
@@ -1708,6 +2127,19 @@ static void looper_audio_block(int16_t *s)
 	            (g_emmc_sprint ? (int32_t)4800 : (int32_t)4096)) {
 	      _sp_low = 1; break;
 	    }
+	  { /* M87: the rec-ring flush needs the SAME storm immunity the
+	     * play rings got in 2.7.2. Measured (M86-r2, raw indices):
+	     * flush sustains ~160 blk/s under USB vs 171.4 demand; the
+	     * 8,192-frame ring is lapped ~1 s into a take and capture
+	     * corrupts. M55-r3 proved 376 blk/s at sprint priority under
+	     * the same storm. Pressure = >2 pages (2x16 blocks) queued;
+	     * the existing 150/15 duty cycle bounds the boost. */
+	    int _rt87 = g_rec_track;
+	    if (_rt87 >= 0 && trk[_rt87].state == TS_REC &&
+	        (trk[_rt87].r_w - trk[_rt87].r_r) > 2u * 16u * SAMP_PER_BLK)
+		_sp_low = 1;
+	  }
+	  g_w4_tq++; if (_sp_low) g_w4_sq++;   /* W4P */
 	  g_emmc_sprint = (uint8_t)_sp_low;
 	}
 	/* PREBUFFER: do not start draining a freshly-(re)enabled stream until the
@@ -1876,9 +2308,18 @@ static void looper_audio_block(int16_t *s)
 				/* R2 (perfect-loop): backdate the stop by the constant
 				 * gesture latency so the end lands on the finger, not
 				 * on the pipeline. */
+				/* M96: the gesture latency is not constant -- it stretches
+				 * with main's CPU share, so a fixed 55 ms backdate leaves the
+				 * take ending LATE under load. Use the measured value.
+				 * FLOORED at the old constant so the healthy case cannot
+				 * regress, CEILINGed at 8x so a pathological reading can
+				 * never eat the take. 48 samples per ms at 48 kHz. */
+				uint32_t _comp96 = g_stop_lat_ms * 48u;
+				if (_comp96 < STOP_COMP_SAMPLES)      _comp96 = STOP_COMP_SAMPLES;
+				if (_comp96 > STOP_COMP_SAMPLES * 8u) _comp96 = STOP_COMP_SAMPLES * 8u;
 				uint32_t rc = trk[i].rec_count;
-				if (rc > STOP_COMP_SAMPLES + SAMP_PER_BLK)
-					rc -= STOP_COMP_SAMPLES;
+				if (rc > _comp96 + SAMP_PER_BLK)
+					rc -= _comp96;
 				uint32_t content = (rc + SAMP_PER_BLK - 1u)
 						   / SAMP_PER_BLK;
 				if (content < 1u) content = 1u;
@@ -2260,7 +2701,7 @@ static void looper_audio_block(int16_t *s)
 			 * loop position 0. Snap the tape speed so no spin-up ramp is baked in. */
 			g_cur_speed_q16 = g_play_speed_q16;   /* snap to the set tape speed */
 			g_loop_active = 1; g_consume_pos = 0;
-			g_pphase = 0; g_frames_since = 0; g_dec_acc = 0;
+			g_pphase = 0; g_frames_since = 0; g_dec_acc = 0; g_dec_accR = 0;
 		}
 		/* ARM (first take AND overdub): wait for the first sound, then the tick
 		 * handler begins the capture so the loop starts exactly on the audio. */
@@ -2322,7 +2763,7 @@ static void looper_audio_block(int16_t *s)
 	if (g_restart_req) {
 		g_restart_req = 0;
 		if (g_rec_track < 0 && g_loop_active) {
-			g_consume_pos = 0; g_pphase = 0; g_frames_since = 0; g_dec_acc = 0; g_midi_cnt = 0;
+			g_consume_pos = 0; g_pphase = 0; g_frames_since = 0; g_dec_acc = 0; g_dec_accR = 0; g_midi_cnt = 0;
 			for (int i = 0; i < NTRK; i++) trk[i].p_w = 0;
 			g_playing = 1;
 			g_midi_start_pending = 1;
@@ -2344,7 +2785,7 @@ static void looper_audio_block(int16_t *s)
 	 * region from block 0); empty tracks -> ready to record. Restart the loop. */
 	if (g_slot_switch_req) {
 		g_slot_switch_req = 0;
-		g_consume_pos = 0; g_pphase = 0; g_frames_since = 0; g_dec_acc = 0; g_midi_cnt = 0;
+		g_consume_pos = 0; g_pphase = 0; g_frames_since = 0; g_dec_acc = 0; g_dec_accR = 0; g_midi_cnt = 0;
 		g_rec_track = -1;
 		/* this song's remembered loop length (0 = empty, ready for a fresh take) */
 		g_loop_len    = (g_slot < NUM_SLOTS) ? g_meta.slot[g_slot].loop_len : 0;
@@ -2393,6 +2834,22 @@ static void looper_audio_block(int16_t *s)
 				 * M22-B, found while planning M25. */
 				trk[i].start_samps = trk[i].start_blk * SAMP_PER_BLK;
 				trk[i].content_blocks = g_meta.trk_content[g_slot][i]; /* 0 = whole track */
+				/* M72: adopt the EXACT persisted values when the v3
+				 * entry is consistent with the index (torn/stale ->
+				 * keep the block-derived fallback above). */
+				if (g_x3_ok && g_slot < NUM_SLOTS) {
+					const struct x3_trk *xe = &g_x3.t[g_slot][i];
+					uint32_t Lb2 = trk[i].len_blocks;
+					if (xe->len_samps && Lb2 &&
+					    /* r2: the INDEX rounds half-up, not ceil */
+					    ((xe->len_samps + SAMP_PER_BLK / 2u) /
+					     SAMP_PER_BLK) == Lb2 &&
+					    (xe->start_samps / SAMP_PER_BLK) ==
+					     trk[i].start_blk) {
+						trk[i].len_samps   = xe->len_samps;
+						trk[i].start_samps = xe->start_samps;
+					}
+				}
 			} else {
 				trk[i].len_blocks = 0; trk[i].start_blk = 0;
 				trk[i].len_samps = 0; trk[i].start_samps = 0;
@@ -2429,6 +2886,34 @@ static void looper_audio_block(int16_t *s)
 	uint16_t vol_s[NTRK];
 	for (int i = 0; i < NTRK; i++) vol_s[i] = trk[i].vol_q8;
 
+	M81_LAP(0);
+	/* ==== M90: PASS A ran on VOLATILES. Every reference was a forced
+	 * reload; ~60 of them per inner-loop iteration, which is why the
+	 * loop cost 338 cycles (634 recording) for a decimate and one ring
+	 * store. Hoist the audio-thread-private ones into locals for the
+	 * duration of the block and publish once at the end.
+	 *
+	 * SAFE because the STREAMER CANNOT RUN INSIDE PASS A: audio is
+	 * PREEMPT(0), streamer PREEMPT(5), and PASS A has no blocking call.
+	 * The streamer already only ever saw whole-block snapshots.
+	 *
+	 * NOT hoisted, deliberately: trk[].r_w (g_rring[] is non-volatile,
+	 * so hoisting r_w lets the compiler sink array stores past the
+	 * publish -- needs a barrier), g_rec_track (needs a finalize
+	 * publication point), and trk[].state / trk[].r_r / g_done_pending
+	 * (the STREAMER writes those -- read-only, never written back).
+	 *
+	 * g_dec_acc stays 64-bit: paused with a loop present, step rounds
+	 * to 0, the inner while never fires, and it accumulates unbounded
+	 * at 48 kHz -- int32 would overflow in ~1.37 s. */
+	uint32_t _pphase   = g_pphase;
+	int64_t  _dec_acc  = g_dec_acc;
+	int64_t  _dec_accR = g_dec_accR;
+	uint32_t _fsince   = g_frames_since;
+	uint32_t _pre_w    = g_pre_w;
+	uint32_t _pre_val  = g_pre_valid;
+	uint32_t _cpos     = g_consume_pos;
+	const uint8_t _lactive = g_loop_active;
 	/* ==== PASS A: transport + record, stashing per-frame positions ====
 	 * The old single loop interleaved all four tracks' mixing into every
 	 * frame, paying loop + volatile-read overhead 4 x 48000 times a second
@@ -2443,46 +2928,66 @@ static void looper_audio_block(int16_t *s)
 	 * invariants hoist out of the 48 kHz hot path. */
 	static uint32_t posb[BLK_FRAMES];
 	static uint16_t fracb[BLK_FRAMES];
-	static int32_t  mix32[BLK_FRAMES];
+	static int32_t  mix32[BLK_FRAMES];   /* LEFT bus */
+	static int32_t  mix32R[BLK_FRAMES];  /* M63a RIGHT bus */
 	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
-		int32_t live = (f < got)
-			? (((int32_t)tmp[2 * f] + (int32_t)tmp[2 * f + 1]) >> 1) : 0;
+		/* The UAC2 input is a stereo pair and always has been; the
+		 * engine simply summed it away. liveL/liveR feed the monitor;
+		 * `live` keeps the EXACT former value so every record-path
+		 * consumer stays bit-exact (asserted in this stage's gate). */
+		int32_t liveL = (f < got) ? (int32_t)tmp[2 * f]      : 0;
+		int32_t liveR = (f < got) ? (int32_t)tmp[2 * f + 1]  : 0;
+		int32_t live  = (liveL + liveR) >> 1;
 
 		/* (the first take is started immediately by the press handler above, and
 		 * overdubs are started on the next beat by the wrap logic below) */
-		mix32[f] = live;                        /* live monitor under the mix */
-		posb[f]  = g_consume_pos;
-		fracb[f] = (uint16_t)(g_pphase & 0xFFFFu);
+		mix32[f] = liveL; mix32R[f] = liveR;    /* the live monitor is STEREO.
+		                                         * PASS B and PASS C were already
+		                                         * two-channel (M63a stages 2, 3);
+		                                         * only this fetch was still mono. */
+		posb[f]  = _cpos;
+		fracb[f] = (uint16_t)(_pphase & 0xFFFFu);
 
 		/* advance the playback phase; each integer step is one loop-sample tick */
-		g_dec_acc += live; g_frames_since++;
-		if (g_loop_active) {
-			g_pphase += step;
-			while (g_pphase >= 65536u) {
-				g_pphase -= 65536u;
+		/* S2CAP: accumulate TRUE channels. `live` (the downmix) still
+		 * feeds threshold/tempo consumers; the RECORDED signal is now
+		 * the real L and the real R. */
+		_dec_acc += liveL; _dec_accR += liveR; _fsince++;
+		if (_lactive) {
+			_pphase += step;
+			while (_pphase >= 65536u) {
+				_pphase -= 65536u;
 				/* Decimate the live input to the current tape rate.
 				 * >1x (frames_since==0, a 2nd+ emit in one input frame):
 				 * HOLD the current sample instead of emitting a zero — the
 				 * old zero-stuffing was the metallic aliasing/bitcrush. 1x:
 				 * the one accumulated sample. <1x: average the frames. */
-				int16_t lsamp;
-				if (g_frames_since == 0u)      lsamp = (int16_t)live;
-				else if (g_frames_since == 1u) lsamp = (int16_t)g_dec_acc;
-				else if (g_frames_since < 65536u)
-					lsamp = (int16_t)((int32_t)g_dec_acc /
-							  (int32_t)g_frames_since); /* hw SDIV, bit-identical */
-				else lsamp = (int16_t)(g_dec_acc / (int64_t)g_frames_since);
-				g_dec_acc = 0; g_frames_since = 0;
+				int16_t lsamp, rsamp;
+				if (_fsince == 0u)    { lsamp = (int16_t)liveL; rsamp = (int16_t)liveR; }
+				else if (_fsince == 1u) { lsamp = (int16_t)_dec_acc; rsamp = (int16_t)_dec_accR; }
+				else if (_fsince < 65536u)
+				{ lsamp = (int16_t)((int32_t)_dec_acc /
+							  (int32_t)_fsince); /* hw SDIV, bit-identical */
+				  rsamp = (int16_t)((int32_t)_dec_accR /
+							  (int32_t)_fsince); }
+				else { lsamp = (int16_t)(_dec_acc / (int64_t)_fsince);
+				       rsamp = (int16_t)(_dec_accR / (int64_t)_fsince); }
+				_dec_acc = 0; _dec_accR = 0; _fsince = 0;
 
+#if M82_PROBES
+				uint32_t _r82 = DWT->CYCCNT;   /* M82 */
+#endif
 				int rt_i = g_rec_track;
 				/* M20 PRE-ROLL: nothing capturing and nothing still
 				 * flushing -> the ring is free, so keep the last
 				 * PREROLL_MAX samples of input in it. */
 				if (!g_done_pending &&
 				    (rt_i < 0 || trk[rt_i].state != TS_REC)) {
-					g_rring[g_pre_w & RRING_MASK] = lsamp;
-					g_pre_w++;
-					if (g_pre_valid < PREROLL_MAX) g_pre_valid++;
+					{ uint32_t _fi = (_pre_w & RRING_MASK);      /* S2CAP frame */
+					  g_rring[_fi * 2u]      = lsamp;
+					  g_rring[_fi * 2u + 1u] = rsamp; }
+					_pre_w++;
+					if (_pre_val < PREROLL_MAX) _pre_val++;
 				}
 				if (rt_i >= 0 && trk[rt_i].state == TS_ARMED) {
 					/* AUTO-START: hold armed until the input first crosses
@@ -2515,7 +3020,7 @@ static void looper_audio_block(int16_t *s)
 						 * lands on the NEAREST line either way, so a
 						 * press just after the beat is as good as a
 						 * press just before it. */
-						if (!trigger && g_pre_valid &&
+						if (!trigger && _pre_val &&
 						    now_f > g_grid_anchor) {
 							uint64_t unit = g_grid_beat_frames;
 							uint64_t off = now_f - g_grid_anchor;
@@ -2547,7 +3052,7 @@ static void looper_audio_block(int16_t *s)
 								PREROLL_REACH_MS;
 							if (reach > rcap) reach = rcap;
 							if (back <= reach && need &&
-							    need <= g_pre_valid) {
+							    need <= _pre_val) {
 								pre_backfill = need;
 								g_dbg_anc_bkf = need;   /* r6: ANY take */
 								g_grid_punch_at = prev;
@@ -2570,24 +3075,24 @@ static void looper_audio_block(int16_t *s)
 						 * (g_arm_press_sclk, engine frames -> ring
 						 * samples via tape speed — recording never
 						 * reaches back before the finger) and
-						 * g_pre_valid. Silence at arm = shipped exact.
+						 * _pre_val. Silence at arm = shipped exact.
 						 * Same ring adoption as the gridded rescue
 						 * below; no provisional phase, no catch-up
 						 * burst. g_instant_rec clear = classic: skip
 						 * the scan, shipped behavior bit-for-bit. */
-						if (trigger && g_instant_rec && g_pre_valid) {
+						if (trigger && g_instant_rec && _pre_val) {
 							uint64_t now_f = g_sample_clock + f;
 							uint64_t backf = (g_arm_press_sclk &&
 							                  now_f > g_arm_press_sclk)
 							               ? (now_f - g_arm_press_sclk) : 0u;
 							uint32_t cap = (uint32_t)
 								((backf * g_cur_speed_q16) >> 16);
-							if (cap > g_pre_valid) cap = g_pre_valid;
+							if (cap > _pre_val) cap = _pre_val;
 							uint32_t n = 0u;
 							while (n + 64u <= cap) {
 								int32_t pk = 0;
 								for (uint32_t k = 1u; k <= 64u; k++) {
-									int32_t sv = g_rring[(g_pre_w - n - k) & RRING_MASK];
+									int32_t sv = g_rring[((_pre_w - n - k) & RRING_MASK) * 2u]; /* S2CAP: L of frame */
 									if (sv < 0) sv = -sv;
 									if (sv > pk) pk = sv;
 								}
@@ -2603,7 +3108,7 @@ static void looper_audio_block(int16_t *s)
 							 * (M20: with pre-roll, position 0 is the
 							 * grid line we reached back to, so the
 							 * playhead is already that far in) */
-							g_consume_pos = pre_backfill;
+							_cpos = pre_backfill;
 							g_midi_start_pending = 1; g_midi_cnt = 0;
 							tempo_reset();
 							rt->flush_blk = 0; rt->flush_mod = MAX_LOOP_BLOCKS;
@@ -2640,7 +3145,7 @@ static void looper_audio_block(int16_t *s)
 							{	/* M20: an overdub anchors where
 								 * recording BEGAN — the reached-back
 								 * line, not the moment of the punch */
-								uint32_t sp = g_consume_pos;
+								uint32_t sp = _cpos;
 								sp = (sp >= pre_backfill)
 								   ? (sp - pre_backfill) : 0u;
 								/* M22-A: NEAREST, not truncate — the
@@ -2650,7 +3155,7 @@ static void looper_audio_block(int16_t *s)
 								rt->start_blk = (sp + SAMP_PER_BLK / 2u)
 								              / SAMP_PER_BLK;
 								rt->start_samps = sp;   /* M22-B: exact */
-								g_dbg_anc_cp  = g_consume_pos;
+								g_dbg_anc_cp  = _cpos;
 								g_dbg_anc_bkf = pre_backfill;
 								g_dbg_anc_mod = g_grid_beat_frames
 									      ? (sp % g_grid_beat_frames) : 0u;
@@ -2663,13 +3168,13 @@ static void looper_audio_block(int16_t *s)
 							/* the pre-rolled tail IS the take's head:
 							 * the ring already holds it, so simply
 							 * adopt those indices (no copy). */
-							rt->r_r = g_pre_w - pre_backfill;
-							rt->r_w = g_pre_w;
+							rt->r_r = _pre_w - pre_backfill;
+							rt->r_w = _pre_w;
 							rt->rec_count = pre_backfill;
 						} else {
 							rt->r_w = 0; rt->r_r = 0; rt->rec_count = 0;
 						}
-						g_pre_valid = 0;   /* the ring belongs to the take now */
+						_pre_val = 0;   /* the ring belongs to the take now */
 						{	/* r2 diag: where did this punch land on
 							 * the grid? (frames past the nearest
 							 * line; ~0 = exact) */
@@ -2712,68 +3217,38 @@ static void looper_audio_block(int16_t *s)
 							g_gridrec = 0;
 						}
 						g_grid_punch_at = 0;
+						/* M90: publish the hoisted playhead BEFORE any state
+						 * transition -- the streamer may observe the new state
+						 * and must not then read a stale g_consume_pos. */
+						{ g_pphase = _pphase; g_dec_acc = _dec_acc; g_dec_accR = _dec_accR;
+						  g_frames_since = _fsince; g_pre_w = _pre_w;
+						  g_pre_valid = _pre_val; g_consume_pos = _cpos; }
+						/* P14S: every new take is raw. Shaper restarts at
+						 * the punch; shadow machinery off for this track. */
+						g_p14s_e1[0] = 0; g_p14s_e1[1] = 0;
+						g_p14s_prev[rt_i][0] = 0; g_p14s_prev[rt_i][1] = 0;
+						g_p14s_mask |= (uint8_t)(1u << rt_i);
 						rt->state = TS_REC;
 					}
 				}
+#if M82_PROBES
+				g_pa82[0] += DWT->CYCCNT - _r82; _r82 = DWT->CYCCNT;
+#endif
 				if (g_rec_track >= 0 && trk[g_rec_track].state == TS_REC) {
-					struct looptrk *rt = &trk[g_rec_track];
-					if ((rt->r_w - rt->r_r) >= RRING_SAMPLES)
-						g_rec_overruns++;   /* take corrupting: flush too slow */
-					int16_t wsamp = lsamp;
-					if (rt->rec_silence) {
-						uint8_t fg = rt->rec_fade;
-						if (fg) {
-							wsamp = (int16_t)(((int32_t)lsamp * fg) >> 7);
-							uint8_t st = rt->rec_fstep ? rt->rec_fstep : 1u;
-							rt->rec_fade = (fg > st) ? (uint8_t)(fg - st) : 0u;
-						} else {
-							wsamp = 0;
-						}
-					} else if (rt->rec_target) {
-						/* fixed-mode run-to-the-bar: fade the final ~2.7 ms
-						 * into the bar line so the loop seam can't click */
-						uint32_t rem = rt->rec_target - rt->rec_count;
-						if (rem <= 128u)
-							wsamp = (int16_t)(((int32_t)lsamp *
-									   (int32_t)rem) >> 7);
-					}
-					g_rring[rt->r_w & RRING_MASK] = wsamp;
-					rt->r_w++;
-					rt->rec_count++;
-					g_pre_w = rt->r_w;   /* pre-roll follows the take */
-					if (g_tempo.active) tempo_feed(lsamp, rt->rec_count);
-					if (rt->rec_target == 0u) {
-						/* OPEN take (first take AND independent overdubs):
-						 * force-stop at the maximum length. Only a FIRST
-						 * take defines the song grid/BPM. */
-						if (rt->rec_count >= MAX_LOOP_SAMPLES) {
-							if (g_loop_len == 0u) {
-								g_loop_len = MAX_LOOP_SAMPLES;
-								g_loop_blocks = (g_loop_len + SAMP_PER_BLK / 2u) / SAMP_PER_BLK;
-								tempo_finish();
-								if (g_slot < NUM_SLOTS) {
-									g_meta.slot[g_slot].loop_len = g_loop_len;
-									g_meta_save_req = 1;
-								}
-							}
-							rt->rec_target = MAX_LOOP_SAMPLES;
-							rt->len_blocks = MAX_LOOP_BLOCKS;
-							rt->len_samps = MAX_LOOP_SAMPLES;
-							rt->content_blocks = MAX_LOOP_BLOCKS;  /* all content */
-							rt->state = TS_DONE; g_rec_track = -1;
-							g_done_pending = 1;   /* M20: ring busy */
-						}
-					} else if (rt->rec_count >= rt->rec_target) {
-						/* Take FINALIZE: rec_target is set by the stop tap
-						 * (free-length, block-rounded) — the recorder pads
-						 * the sub-block remainder with silence and lands
-						 * here. The take now loops at its own length. */
-						rt->state = TS_DONE; g_rec_track = -1;
-							g_done_pending = 1;   /* M20: ring busy */
-					}
+#if M82_PROBES
+					{ uint32_t _c86 = DWT->CYCCNT;
+					  rec_write_sample(lsamp, rsamp);
+					  uint32_t _d86 = DWT->CYCCNT - _c86;
+					  if (_d86 < g_t1min) g_t1min = _d86; }
+#else
+					rec_write_sample(lsamp, rsamp);
+#endif
 				}
 
-				g_consume_pos++;
+#if M82_PROBES
+				g_pa82[1] += DWT->CYCCNT - _r82;
+#endif
+				_cpos++;
 				/* MIDI 24-PPQN clock: a cheap per-sample COUNTER (the divisor
 				 * g_midi_div is precomputed when the tempo is detected) -- no
 				 * runtime divide here. The beat-phase display moved to once-per-
@@ -2797,27 +3272,39 @@ static void looper_audio_block(int16_t *s)
 				/* rate changed: what is stored was sampled at a
 				 * different tape speed, so its LENGTH would lie */
 				g_pre_speed = g_play_speed_q16;
-				g_pre_valid = 0;
-				g_dec_acc = 0; g_frames_since = 0;
+				_pre_val = 0;
+				_dec_acc = 0; _fsince = 0;
 			}
 			g_pre_phase += g_play_speed_q16 / DECIM;
 			while (g_pre_phase >= 65536u) {
 				g_pre_phase -= 65536u;
 				/* MUST MATCH the decimator above, sample for sample */
-				int16_t psamp;
-				if (g_frames_since == 0u)      psamp = (int16_t)live;
-				else if (g_frames_since == 1u) psamp = (int16_t)g_dec_acc;
-				else if (g_frames_since < 65536u)
-					psamp = (int16_t)((int32_t)g_dec_acc /
-							  (int32_t)g_frames_since);
-				else psamp = (int16_t)(g_dec_acc / (int64_t)g_frames_since);
-				g_dec_acc = 0; g_frames_since = 0;
-				g_rring[g_pre_w & RRING_MASK] = psamp;
-				g_pre_w++;
-				if (g_pre_valid < PREROLL_MAX) g_pre_valid++;
+				int16_t psamp, psampR;
+				if (_fsince == 0u)    { psamp = (int16_t)liveL; psampR = (int16_t)liveR; }
+				else if (_fsince == 1u) { psamp = (int16_t)_dec_acc; psampR = (int16_t)_dec_accR; }
+				else if (_fsince < 65536u)
+				{ psamp = (int16_t)((int32_t)_dec_acc /
+							  (int32_t)_fsince);
+				  psampR = (int16_t)((int32_t)_dec_accR /
+							  (int32_t)_fsince); }
+				else { psamp = (int16_t)(_dec_acc / (int64_t)_fsince);
+				       psampR = (int16_t)(_dec_accR / (int64_t)_fsince); }
+				_dec_acc = 0; _dec_accR = 0; _fsince = 0;
+				{ uint32_t _fi = (_pre_w & RRING_MASK);          /* S2CAP frame */
+				  g_rring[_fi * 2u]      = psamp;
+				  g_rring[_fi * 2u + 1u] = psampR; }
+				_pre_w++;
+				if (_pre_val < PREROLL_MAX) _pre_val++;
 			}
 		}
 	}
+
+	M81_LAP(1);
+	/* M90: publish the block's work. One store per variable per block
+	 * instead of one per sample. */
+	g_pphase = _pphase; g_dec_acc = _dec_acc;
+	g_frames_since = _fsince; g_pre_w = _pre_w;
+	g_pre_valid = _pre_val; g_consume_pos = _cpos;
 
 	/* ==== PASS B: accumulate each playing track over the whole block ==== */
 	for (int i = 0; i < NTRK; i++) {
@@ -2858,21 +3345,32 @@ static void looper_audio_block(int16_t *s)
 		if (step == 0u && !trk[i].starved && trk[i].fade >= 256u && vd == 0) {
 			int32_t avail = (int32_t)(trk[i].p_w - posb[0]);
 			if (avail < 2) {
-				trk[i].starved = 1; g_starve_cnt[i]++;
+				trk[i].starved = 1; g_starve_cnt[i]++; STV_BUMP();
 				continue;
 			}
-			int16_t a = pr[posb[0] & RING_MASK];
-			int16_t sv;
+			/* M63a: one constant FRAME (L,R) instead of one sample */
+			uint32_t _b0 = (posb[0] & RING_MASK) * 2u;
+			int16_t aL = pr[_b0], aR = pr[_b0 + 1u];
+			int16_t svL, svR;
 			if (fracb[0] == 0u) {
-				sv = a;
+				svL = aL; svR = aR;
 			} else {
-				int16_t bb = pr[(posb[0] + 1) & RING_MASK];
-				sv = (int16_t)((int32_t)a +
-					(int32_t)(((int64_t)(bb - a) * (int32_t)fracb[0]) >> 16));
+				uint32_t _b1 = ((posb[0] + 1) & RING_MASK) * 2u;
+				int16_t bL = pr[_b1], bR = pr[_b1 + 1u];
+				svL = (int16_t)((int32_t)aL +
+					(int32_t)(((int64_t)(bL - aL) * (int32_t)fracb[0]) >> 16));
+				svR = (int16_t)((int32_t)aR +
+					(int32_t)(((int64_t)(bR - aR) * (int32_t)fracb[0]) >> 16));
 			}
-			if (avail < 256) sv = (int16_t)(((int32_t)sv * avail) >> 8);
-			int32_t add = ((int32_t)sv * vol) >> 8;
-			for (uint32_t f = 0; f < BLK_FRAMES; f++) mix32[f] += add;
+			if (avail < 256) {
+				svL = (int16_t)(((int32_t)svL * avail) >> 8);
+				svR = (int16_t)(((int32_t)svR * avail) >> 8);
+			}
+			int32_t addL = ((int32_t)svL * vol) >> 8;
+			int32_t addR = ((int32_t)svR * vol) >> 8;
+			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+				mix32[f] += addL; mix32R[f] += addR;
+			}
 			continue;
 		}
 		/* HEALTHY fast path: when no starve or fade boundary can possibly
@@ -2892,16 +3390,21 @@ static void looper_audio_block(int16_t *s)
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				uint32_t cpos = posb[f];
 				uint32_t frac = fracb[f];
-				int16_t a = pr[cpos & RING_MASK];
-				int16_t sv;
+				uint32_t _b0 = (cpos & RING_MASK) * 2u;
+				int16_t aL = pr[_b0], aR = pr[_b0 + 1u];
+				int16_t svL, svR;
 				if (frac == 0u) {
-					sv = a;
+					svL = aL; svR = aR;
 				} else {
-					int16_t bb = pr[(cpos + 1) & RING_MASK];
-					sv = (int16_t)((int32_t)a +
-						(int32_t)(((int64_t)(bb - a) * (int32_t)frac) >> 16));
+					uint32_t _b1 = ((cpos + 1) & RING_MASK) * 2u;
+					int16_t bL = pr[_b1], bR = pr[_b1 + 1u];
+					svL = (int16_t)((int32_t)aL +
+						(int32_t)(((int64_t)(bL - aL) * (int32_t)frac) >> 16));
+					svR = (int16_t)((int32_t)aR +
+						(int32_t)(((int64_t)(bR - aR) * (int32_t)frac) >> 16));
 				}
-				mix32[f] += ((int32_t)sv * vol) >> 8;
+				mix32[f]  += ((int32_t)svL * vol) >> 8;
+				mix32R[f] += ((int32_t)svR * vol) >> 8;
 			}
 			continue;
 		}
@@ -2919,20 +3422,24 @@ static void looper_audio_block(int16_t *s)
 					continue;
 				}
 			} else if (avail < 2) {
-				trk[i].starved = 1; g_starve_cnt[i]++;
+				trk[i].starved = 1; g_starve_cnt[i]++; STV_BUMP();
 				continue;
 			}
 			uint32_t frac = fracb[f];
-			int16_t a = pr[cpos & RING_MASK];
-			int16_t sv;
+			uint32_t _b0 = (cpos & RING_MASK) * 2u;               /* M63a frame */
+			int16_t aL = pr[_b0], aR = pr[_b0 + 1u];
+			int16_t sv, svR2;
 			if (frac == 0u) {
-				sv = a;                /* unity speed: no interpolation */
+				sv = aL; svR2 = aR;    /* unity speed: no interpolation */
 			} else {
-				int16_t bb = pr[(cpos + 1) & RING_MASK];
-				/* int64 product: (bb-a)*frac can exceed INT32_MAX = signed-
+				uint32_t _b1 = ((cpos + 1) & RING_MASK) * 2u;
+				int16_t bL = pr[_b1], bR = pr[_b1 + 1u];
+				/* int64 product: (b-a)*frac can exceed INT32_MAX = signed-
 				 * overflow UB; the cast keeps it defined (SMULL on M4). */
-				sv = (int16_t)((int32_t)a +
-					(int32_t)(((int64_t)(bb - a) * (int32_t)frac) >> 16));
+				sv = (int16_t)((int32_t)aL +
+					(int32_t)(((int64_t)(bL - aL) * (int32_t)frac) >> 16));
+				svR2 = (int16_t)((int32_t)aR +
+					(int32_t)(((int64_t)(bR - aR) * (int32_t)frac) >> 16));
 			}
 			/* BOUNDARY FADE (unchanged): fade out over the last ~5 ms as
 			 * the ring drains, fade in after recovery — dropouts duck
@@ -2944,13 +3451,18 @@ static void looper_audio_block(int16_t *s)
 					if ((int32_t)trk[i].fade < g) g = (int32_t)trk[i].fade;
 					trk[i].fade++;
 				}
-				if (g < 256) sv = (int16_t)(((int32_t)sv * g) >> 8);
+				if (g < 256) {
+					sv   = (int16_t)(((int32_t)sv * g) >> 8);
+					svR2 = (int16_t)(((int32_t)svR2 * g) >> 8);
+				}
 			}
 			int32_t vf = vd ? (vprev + ((vd * (int32_t)(f + 1)) >> 8)) : vol;
-			mix32[f] += ((int32_t)sv * vf) >> 8;
+			mix32[f]  += ((int32_t)sv * vf) >> 8;
+			mix32R[f] += ((int32_t)svR2 * vf) >> 8;
 		}
 	}
 
+	M81_LAP(2);
 	/* ==== PASS C: master volume + soft limiter -> stereo out ==== */
 	{
 		/* the VOL buttons step ~3 dB at a time — ramp each step across the
@@ -2978,7 +3490,7 @@ static void looper_audio_block(int16_t *s)
 		 * (LP <-> bypass <-> HP) the state is reprimed against the live
 		 * signal — the M11b pop lesson: never swap filter topology on
 		 * stale integrator state. */
-		static int32_t flt_low, flt_band, flt_f;
+		static int32_t flt_lowL, flt_bandL, flt_lowR, flt_bandR, flt_f;  /* M63a: L/R SVFs */
 		static uint8_t flt_mode;   /* 0 = bypass, 1 = LP, 2 = HP */
 		{
 			uint8_t fp = g_flt_pos;
@@ -2998,8 +3510,9 @@ static void looper_audio_block(int16_t *s)
 				 * more bass than it should while the integrator
 				 * catches up, which is what any analog high-pass
 				 * does when you patch it in. */
-				flt_low  = (nm == 2u) ? 0 : mix32[0];
-				flt_band = 0;
+				flt_lowL = (nm == 2u) ? 0 : mix32[0];
+				flt_lowR = (nm == 2u) ? 0 : mix32R[0];
+				flt_bandL = 0; flt_bandR = 0;
 			} else if (tf != flt_f) {
 				int32_t fd = (tf - flt_f) >> 3;
 				if (fd == 0) fd = (tf > flt_f) ? 1 : -1;
@@ -3013,27 +3526,23 @@ static void looper_audio_block(int16_t *s)
 		const int32_t g0 = ge_prev;
 		ge_prev = ge;
 		for (uint32_t f = 0; f < BLK_FRAMES; f++) {
-			int32_t x = mix32[f];
+			int32_t xL = mix32[f];
+			int32_t xR = mix32R[f];
 			if (flt_mode) {
-				/* Chamberlin SVF, Q14, damping 1.0 (a touch of DJ
-				 * resonance); coefficients capped ~6.5 kHz for
-				 * stability at this damping. */
-				/* M25: these were int32 x int32. flt_lp_tab peaks at
-				 * 13524 and a four-track mix reaches 131068, so the
-				 * product is 1.77e9 against a 2.147e9 ceiling —
-				 * 1.21x of margin, and the "touch of DJ resonance"
-				 * above is exactly what pushes flt_band past the
-				 * input and eats it. Overflow here wraps hard: a
-				 * loud click. smull is single-cycle on the M4, so
-				 * the widening costs ~25 us of a 5333 us block. */
-				flt_low += (int32_t)(((int64_t)flt_f * flt_band) >> 14);
-				int32_t hi = x - flt_low - flt_band;
-				flt_band += (int32_t)(((int64_t)flt_f * hi) >> 14);
-				x = (flt_mode == 1u) ? flt_low : hi;
+				/* Chamberlin SVF x2 (M63a): per-channel state, shared
+				 * coefficient. int64 products per the M25 overflow fix. */
+				flt_lowL += (int32_t)(((int64_t)flt_f * flt_bandL) >> 14);
+				int32_t hiL = xL - flt_lowL - flt_bandL;
+				flt_bandL += (int32_t)(((int64_t)flt_f * hiL) >> 14);
+				xL = (flt_mode == 1u) ? flt_lowL : hiL;
+				flt_lowR += (int32_t)(((int64_t)flt_f * flt_bandR) >> 14);
+				int32_t hiR = xR - flt_lowR - flt_bandR;
+				flt_bandR += (int32_t)(((int64_t)flt_f * hiR) >> 14);
+				xR = (flt_mode == 1u) ? flt_lowR : hiR;
 			}
 			int32_t m = gd ? (g0 + ((gd * (int32_t)(f + 1)) >> 8)) : ge;
-			int16_t out = soft_limit((x * m) >> 8);
-			s[2 * f] = out; s[2 * f + 1] = out;
+			s[2 * f]      = soft_limit((xL * m) >> 8);
+			s[2 * f + 1u] = soft_limit((xR * m) >> 8);
 		}
 	}
 	g_sample_clock += BLK_FRAMES;
@@ -3111,6 +3620,7 @@ static void looper_audio_block(int16_t *s)
 			if (_fill > g_rec_hiwat) g_rec_hiwat = _fill;
 		}
 	}
+	M81_LAP(3);
 }
 
 /* eMMC busy-abort callback: polled ~1 kHz inside the driver's ABORTABLE R1b
@@ -3391,46 +3901,366 @@ static void xfer_service(void)
  * ===================================================================== */
 
 #if SP1_CODEC == SP1_CODEC_PCM
-/* ---- PCM: memcpy-equivalent (handles the single ring wrap) ---------------- */
+/* ---- M63a PCM: STEREO ring <-> MONO blocks. The on-flash format is
+ * byte-identical to v2.7.2 (256 int16 samples per block): pack stores
+ * the LEFT channel of each frame; unpack writes the sample to BOTH
+ * channels. Index math replaces the old memcpy pair; SAMP_PER_BLK
+ * counts FRAMES (== stored samples, mono blocks). ---- */
 static void codec_pack(const int16_t *ring, uint32_t ring_mask, uint32_t start,
                        uint8_t *flash, uint32_t nblk)
 {
 	int16_t *out = (int16_t *)flash;
 	uint32_t ntot = nblk * SAMP_PER_BLK;
-	uint32_t ring_samps = ring_mask + 1u;
-	uint32_t run1 = ring_samps - start;
-	if (run1 > ntot) run1 = ntot;
-	memcpy(out, &ring[start], run1 * 2u);
-	if (ntot > run1)
-		memcpy(out + run1, &ring[0], (ntot - run1) * 2u);
+	for (uint32_t i = 0; i < ntot; i++)
+		out[i] = ring[((start + i) & ring_mask) * 2u];
 }
 static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
                          const uint8_t *flash, uint32_t nblk)
 {
 	const int16_t *in = (const int16_t *)flash;
 	uint32_t ntot = nblk * SAMP_PER_BLK;
-	uint32_t ring_samps = ring_mask + 1u;
-	uint32_t run1 = ring_samps - start;
-	if (run1 > ntot) run1 = ntot;
-	memcpy(&ring[start], in, run1 * 2u);
-	if (ntot > run1)
-		memcpy(&ring[0], in + run1, (ntot - run1) * 2u);
+	for (uint32_t i = 0; i < ntot; i++) {
+		uint32_t fi = ((start + i) & ring_mask) * 2u;
+		ring[fi] = in[i]; ring[fi + 1u] = in[i];
+	}
 }
-/* M22-B: decode an arbitrary SAMPLE run out of a whole-block read. The eMMC
- * can only read 512-byte blocks (CMD16), but the play ring is sample-granular
- * — so a sample-exact loop seam reads the whole final block and adopts only
- * the samples that belong to the lap. PCM only: it is a memcpy with offsets.
- * (The compressed codecs keep block-exact loops; see the plain-path gate.) */
+/* M22-B: adopt an arbitrary FRAME run out of a whole-block read (the
+ * sample-exact loop seam). Semantics identical to v2.7.2. */
 static void codec_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
                               const uint8_t *flash, uint32_t skip, uint32_t nsamp)
 {
 	const int16_t *in = (const int16_t *)flash + skip;
-	uint32_t ring_samps = ring_mask + 1u;
-	uint32_t run1 = ring_samps - start;
-	if (run1 > nsamp) run1 = nsamp;
-	memcpy(&ring[start], in, run1 * 2u);
-	if (nsamp > run1)
-		memcpy(&ring[0], in + run1, (nsamp - run1) * 2u);
+	for (uint32_t i = 0; i < nsamp; i++) {
+		uint32_t fi = ((start + i) & ring_mask) * 2u;
+		ring[fi] = in[i]; ring[fi + 1u] = in[i];
+	}
+}
+#elif SP1_CODEC == SP1_CODEC_A7
+/* ==== M63b: SP1-ADPCM7 — the FROZEN 3.0 codec. Core verified
+ * bit-exact against SP1-ADPCM7-CODEC-REFERENCE.py by M70 on hardware.
+ * 7-bit, damped 2nd-order predictor, full quantiser-error noise
+ * shaping clamped at 4*step. 280 STEREO FRAMES per 512-byte block:
+ *   [0:2] Lp1 [2:4] Lp2 [4] Lidx [5] flags(b0=stereo)
+ *   [6:8] Rp1 [8:10] Rp2 [10] Ridx [11] rsv
+ *   [12:14] frames u16  [14:16] sum16(payload)  [16:506] payload
+ * Headers reseed the decoder, so every block decodes independently —
+ * that is what keeps loop wrap, windows, chop and reverse free. ==== */
+static const int16_t a7_step[89] = {
+	7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,
+	73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,
+	408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,
+	1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,
+	7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,
+	22385,24623,27086,29794,32767 };
+static const int8_t a7_idx7[64] = {
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	1,1,1,1,2,2,2,2,3,3,3,4,4,4,5,5,
+	6,6,7,7,8,8,9,10,10,11,12,13,14,15,16,16 };
+struct a7_enc { int32_t p1, p2; uint8_t idx; int32_t e; };
+struct a7_dec { int32_t p1, p2; uint8_t idx; };
+static inline int32_t a7_clip16(int32_t v)
+{ return v > 32767 ? 32767 : (v < -32768 ? -32768 : v); }
+static inline int32_t a7_pred(int32_t p1, int32_t p2)
+{ return a7_clip16(p1 + ((p1 - p2) >> 1)); }
+__attribute__((optimize("O2")))
+static inline __attribute__((always_inline)) uint8_t a7_encode(struct a7_enc *st, int16_t s)
+{
+	int32_t pr = a7_pred(st->p1, st->p2);
+	int32_t step = a7_step[st->idx];
+	int32_t d = (int32_t)s - pr + st->e;      /* NS_NUM 8/8 => e as-is */
+	uint8_t sign = 0; int32_t ad, q, ne, lim, ni; uint32_t mag;
+	if (d < 0) { sign = 64u; ad = -d; } else ad = d;
+	mag = (uint32_t)((ad * 32) / step);
+	if (mag > 63u) mag = 63u;
+	q = (int32_t)((mag * (uint32_t)step) / 32u) + step / 64;
+	if (sign) q = -q;
+	st->p2 = st->p1; st->p1 = a7_clip16(pr + q);
+	ne = d - q; lim = 4 * step;
+	st->e = ne > lim ? lim : (ne < -lim ? -lim : ne);
+	ni = (int32_t)st->idx + a7_idx7[mag];
+	st->idx = (uint8_t)(ni < 0 ? 0 : (ni > 88 ? 88 : ni));
+	return (uint8_t)(sign | (uint8_t)mag);
+}
+__attribute__((optimize("O2")))
+/* M74 bitstream helpers: 32-bit, LSB-first -- exactly the order the
+ * format already uses (spec 4.1b: "V = c0 | c1<<7 | ... little-endian").
+ * These replace uint64_t shifts, which the Cortex-M4 has no barrel
+ * shifter for. */
+#define A7_FILL(acc, nb, bi, p) do { \
+	while ((nb) <= 24u && (bi) < 7u) { \
+		(acc) |= (uint32_t)(p)[(bi)++] << (nb); (nb) += 8u; } \
+	} while (0)
+#define A7_TAKE(c, acc, nb) do { \
+	(c) = (uint8_t)((acc) & 0x7Fu); (acc) >>= 7; (nb) -= 7u; \
+	} while (0)
+static inline __attribute__((always_inline)) int16_t a7_decode(struct a7_dec *st, uint8_t c)
+{
+	int32_t pr = a7_pred(st->p1, st->p2);
+	int32_t step = a7_step[st->idx];
+	uint32_t mag = c & 63u;
+	int32_t q = (int32_t)((mag * (uint32_t)step) / 32u) + step / 64;
+	int32_t rec = a7_clip16((c & 64u) ? (pr - q) : (pr + q));
+	int32_t ni = (int32_t)st->idx + a7_idx7[mag];
+	st->idx = (uint8_t)(ni < 0 ? 0 : (ni > 88 ? 88 : ni));
+	st->p2 = st->p1; st->p1 = rec;
+	return (int16_t)rec;
+}
+static int16_t a7_scrL[280], a7_scrR[280];   /* streamer-only scratch */
+static uint8_t a7_codes[560];
+static void a7_emit_block_i(const int16_t *ring, uint32_t ring_mask,
+			  uint32_t start, struct a7_enc *eL,
+			  struct a7_enc *eR, uint8_t *blk);
+static void a7_emit_block(const int16_t *ring, uint32_t ring_mask,
+			  uint32_t start, struct a7_enc *eL,
+			  struct a7_enc *eR, uint8_t *blk)
+{
+	M73_T0();
+	a7_emit_block_i(ring, ring_mask, start, eL, eR, blk);
+	{ uint32_t _d88 = DWT->CYCCNT - _t73;
+	  if (_d88 < g_enmin) g_enmin = _d88; }
+	M73_ADD(g_t_en);
+}
+__attribute__((optimize("O2")))
+static void a7_emit_block_i(const int16_t *ring, uint32_t ring_mask,
+			  uint32_t start, struct a7_enc *eL,
+			  struct a7_enc *eR, uint8_t *blk)
+{
+	uint32_t g, k, i2; uint16_t s16 = 0;
+	blk[0] = (uint8_t)(eL->p1 & 0xFF); blk[1] = (uint8_t)((eL->p1 >> 8) & 0xFF);
+	blk[2] = (uint8_t)(eL->p2 & 0xFF); blk[3] = (uint8_t)((eL->p2 >> 8) & 0xFF);
+	blk[4] = eL->idx;
+	blk[5] = g_cap_stereo ? 1u : 0u;  /* M78: mono takes -> mono blocks */
+	blk[6] = (uint8_t)(eR->p1 & 0xFF); blk[7] = (uint8_t)((eR->p1 >> 8) & 0xFF);
+	blk[8] = (uint8_t)(eR->p2 & 0xFF); blk[9] = (uint8_t)((eR->p2 >> 8) & 0xFF);
+	blk[10] = eR->idx; blk[11] = 0;
+	blk[12] = (uint8_t)(SAMP_PER_BLK & 0xFF); blk[13] = (uint8_t)(SAMP_PER_BLK >> 8);
+	if (blk[5] & 1u) {
+		for (i2 = 0; i2 < SAMP_PER_BLK; i2++) {
+			/* M91: the rec ring is MONO; this encoder serves ONLY the
+			 * rec ring. Stereo blocks (impossible until M63b-2) would
+			 * encode L for both channels. */
+			uint32_t fi = (start + i2) & ring_mask;
+			a7_codes[i2 * 2u]      = a7_encode(eL, ring[fi * 2u]);
+			a7_codes[i2 * 2u + 1u] = a7_encode(eR, ring[fi * 2u + 1u]);
+		}
+	} else {
+		/* M78 MONO: one code per frame from L (capture writes the
+		 * downmix to both channels, so L is the take). R seeds are
+		 * zeroed; the mono decoder never reads them. */
+		for (i2 = 0; i2 < SAMP_PER_BLK; i2++) {
+			uint32_t fi = (start + i2) & ring_mask;   /* M91 mono ring */
+			a7_codes[i2] = a7_encode(eL, ring[fi * 2u]);  /* S2CAP: L of frame */
+		}
+		blk[6] = 0; blk[7] = 0; blk[8] = 0; blk[9] = 0; blk[10] = 0;
+	}
+	{
+	uint32_t _ng78 = (blk[5] & 1u) ? 70u : 35u;
+	for (g = 0; g < _ng78; g++) {
+		/* M74: 32-bit LSB-first pack (was a uint64_t V with a
+		 * variable-distance shift per code). Identical order, so
+		 * byte-for-byte identical output -- stage EQ proves it. */
+		uint32_t acc74 = 0, nb74 = 0, bo74 = 0;
+		for (k = 0; k < 8u; k++) {
+			acc74 |= (uint32_t)(a7_codes[g * 8u + k] & 0x7Fu) << nb74;
+			nb74 += 7u;
+			while (nb74 >= 8u) {
+				blk[16u + g * 7u + bo74++] = (uint8_t)acc74;
+				acc74 >>= 8; nb74 -= 8u;
+			}
+		}
+	}
+	}
+	if (!(blk[5] & 1u))
+		for (g = 16u + 245u; g < 506u; g++) blk[g] = 0;
+	for (g = 0; g < 490u; g++) s16 = (uint16_t)(s16 + blk[16u + g]);
+	blk[14] = (uint8_t)(s16 & 0xFF); blk[15] = (uint8_t)(s16 >> 8);
+	for (g = 506u; g < 512u; g++) blk[g] = 0;
+}
+static void a7_decode_block_i(const uint8_t *blk, int16_t *dstL, int16_t *dstR);
+static void a7_decode_block(const uint8_t *blk, int16_t *dstL, int16_t *dstR)
+{
+	M73_T0();
+	a7_decode_block_i(blk, dstL, dstR);
+	M73_ADD(g_t_dc);
+	g_dcc++;
+}
+
+/* M79: decode STRAIGHT INTO THE RING -- deletes the a7_scr scratch
+ * store + reload + masked copy (~6-8 ops/frame). Plain fill path
+ * only (100% of steady traffic, M76: dcu==dcc); the seam and reverse
+ * paths keep the scratch route. The running pointer handles the wrap
+ * with one compare per frame: RING_SAMPLES is NOT a multiple of
+ * SAMP_PER_BLK (8192 % 280 != 0), so a block CAN wrap mid-decode.
+ * Bit-exact: same sample codec, same code order, only the
+ * destination changes. Carries its own M73 timing + g_dcc. */
+__attribute__((optimize("O2"), noinline))
+static void a7_decode_block_ring(const uint8_t *blk, int16_t *ring,
+				 uint32_t ring_mask, uint32_t base)
+{
+	M73_T0();
+	struct a7_dec dL, dR;
+	uint32_t g, k, i2 = 0;
+	int stereo = blk[5] & 1;
+	int16_t *p = ring + (base & ring_mask) * 2u;
+	int16_t * const rend = ring + (ring_mask + 1u) * 2u;
+	dL.p1 = (int16_t)((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+	dL.p2 = (int16_t)((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));
+	dL.idx = blk[4] > 88u ? 88u : blk[4];
+	if (!stereo) {
+		for (g = 0; g < 35u && i2 < SAMP_PER_BLK; g++) {
+			const uint8_t *p79 = blk + 16u + g * 7u;
+			uint32_t acc = 0, nb = 0, bi = 0;
+			A7_FILL(acc, nb, bi, p79);
+			for (k = 0; k < 8u && i2 < SAMP_PER_BLK; k++, i2++) {
+				uint8_t c79;
+				A7_TAKE(c79, acc, nb); A7_FILL(acc, nb, bi, p79);
+				int16_t s = a7_decode(&dL, c79);
+				p[0] = s; p[1] = s; p += 2;
+				if (p == rend) p = ring;
+			}
+		}
+		M73_ADD(g_t_dc);
+		g_dcc++;
+		return;
+	}
+	dR.p1 = (int16_t)((uint16_t)blk[6] | ((uint16_t)blk[7] << 8));
+	dR.p2 = (int16_t)((uint16_t)blk[8] | ((uint16_t)blk[9] << 8));
+	dR.idx = blk[10] > 88u ? 88u : blk[10];
+	for (g = 0; g < 70u && i2 < SAMP_PER_BLK; g++) {
+		const uint8_t *p79 = blk + 16u + g * 7u;
+		uint32_t acc = 0, nb = 0, bi = 0;
+		A7_FILL(acc, nb, bi, p79);
+		for (k = 0; k < 8u && i2 < SAMP_PER_BLK; k += 2u, i2++) {
+			uint8_t cl79, cr79;
+			A7_TAKE(cl79, acc, nb); A7_FILL(acc, nb, bi, p79);
+			A7_TAKE(cr79, acc, nb); A7_FILL(acc, nb, bi, p79);
+			int16_t sl = a7_decode(&dL, cl79);
+			int16_t sr = a7_decode(&dR, cr79);
+			p[0] = sl; p[1] = sr; p += 2;
+			if (p == rend) p = ring;
+		}
+	}
+	M73_ADD(g_t_dc);
+	g_dcc++;
+}
+__attribute__((optimize("O2")))
+static void a7_decode_block_i(const uint8_t *blk, int16_t *dstL, int16_t *dstR)
+{
+	struct a7_dec dL, dR;
+	uint32_t g, k, i2 = 0;
+	int stereo = blk[5] & 1;
+	dL.p1 = (int16_t)((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+	dL.p2 = (int16_t)((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));
+	dL.idx = blk[4] > 88u ? 88u : blk[4];
+	dR.p1 = (int16_t)((uint16_t)blk[6] | ((uint16_t)blk[7] << 8));
+	dR.p2 = (int16_t)((uint16_t)blk[8] | ((uint16_t)blk[9] << 8));
+	dR.idx = blk[10] > 88u ? 88u : blk[10];
+	if (!stereo) {
+		/* M78 MONO: 280 codes, 35 groups, one code per frame; the
+		 * sample lands on BOTH ring channels. dR is never used. */
+		for (g = 0; g < 35u && i2 < SAMP_PER_BLK; g++) {
+			const uint8_t *p78 = blk + 16u + g * 7u;
+			uint32_t acc = 0, nb = 0, bi = 0;
+			A7_FILL(acc, nb, bi, p78);
+			for (k = 0; k < 8u && i2 < SAMP_PER_BLK; k++, i2++) {
+				uint8_t c78;
+				A7_TAKE(c78, acc, nb); A7_FILL(acc, nb, bi, p78);
+				int16_t s = a7_decode(&dL, c78);
+				dstL[i2] = s; dstR[i2] = s;
+			}
+		}
+		return;
+	}
+	for (g = 0; g < 70u && i2 < SAMP_PER_BLK; g++) {
+		/* M74: 32-bit LSB-first bitstream. Was a uint64_t V with a
+		 * variable-distance >> per code -- the M4 has no 64-bit
+		 * barrel shifter, so each cost ~10-20 cycles. Same LSB-first
+		 * order, so codes are BIT-IDENTICAL (stage EQ proves it on
+		 * the host; M70 conformance proves it again on hardware).
+		 * Refill keeps nb <= 24 before an OR, so every shift is
+		 * in-range for a uint32_t. */
+		const uint8_t *p74 = blk + 16u + g * 7u;
+		uint32_t acc = 0, nb = 0, bi = 0;
+		A7_FILL(acc, nb, bi, p74);
+		for (k = 0; k < 8u && i2 < SAMP_PER_BLK; k += 2u, i2++) {
+			uint8_t cl74, cr74;
+			A7_TAKE(cl74, acc, nb); A7_FILL(acc, nb, bi, p74);
+			A7_TAKE(cr74, acc, nb); A7_FILL(acc, nb, bi, p74);
+			int16_t sl = a7_decode(&dL, cl74);
+			int16_t sr = a7_decode(&dR, cr74);
+			if (!stereo) sr = sl;
+			dstL[i2] = sl; dstR[i2] = sr;
+		}
+	}
+}
+/* PACK: encoder state chains across SEQUENTIAL calls (a flush burst);
+ * a non-sequential start resets it. Headers carry the pre-block state,
+ * so decode never depends on that continuity. */
+static void codec_pack(const int16_t *ring, uint32_t ring_mask, uint32_t start,
+                       uint8_t *flash, uint32_t nblk)
+{
+	static struct a7_enc peL, peR;
+	static uint32_t p_expect = 0xFFFFFFFFu;
+	if (start != p_expect) {
+		peL.p1 = 0; peL.p2 = 0; peL.idx = 0; peL.e = 0;
+		peR = peL;
+	}
+	for (uint32_t b = 0; b < nblk; b++)
+		a7_emit_block(ring, ring_mask,
+			      (start + b * SAMP_PER_BLK) & ring_mask,
+			      &peL, &peR, flash + b * EMMC_BLOCK_SIZE);
+	p_expect = (start + nblk * SAMP_PER_BLK) & ring_mask;
+}
+static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
+                         const uint8_t *flash, uint32_t nblk)
+{
+	/* M79: straight to the ring; scratch route retired from this
+	 * path (seam + reverse keep it). */
+	for (uint32_t b = 0; b < nblk; b++) {
+		a7_decode_block_ring(flash + b * EMMC_BLOCK_SIZE, ring,
+				     ring_mask, start + b * SAMP_PER_BLK);
+		g_dcu++;
+	}
+}
+/* M22-B seam, with the M62-r2 MULTI-BLOCK walk: the caller's run can
+ * span blocks (_ds = n*SAMP_PER_BLK - off). The r1 single-block version
+ * of this is what caused the stutter; do not simplify it back. */
+static void codec_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
+                              const uint8_t *flash, uint32_t skip, uint32_t nsamp)
+{
+	uint32_t pos = start, done = 0;
+	uint32_t b = skip / SAMP_PER_BLK, off = skip % SAMP_PER_BLK;
+	while (done < nsamp) {
+		uint32_t take = SAMP_PER_BLK - off;
+		if (take > nsamp - done) take = nsamp - done;
+		a7_decode_block(flash + b * EMMC_BLOCK_SIZE, a7_scrL, a7_scrR);
+		g_dcp++;
+		for (uint32_t i2 = 0; i2 < take; i2++) {
+			uint32_t fi = (pos & ring_mask) * 2u;
+			ring[fi] = a7_scrL[off + i2];
+			ring[fi + 1u] = a7_scrR[off + i2];
+			pos++;
+		}
+		done += take; off = 0; b++;
+	}
+}
+/* Reversed heads: coded blocks cannot be byte-flipped, so decode in
+ * reverse block order and write each block's frames time-reversed.
+ * Same audible result the M15-r2 batch flip had on PCM. */
+static void codec_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
+                             const uint8_t *flash, uint32_t nblk)
+{
+	uint32_t pos = start;
+	for (uint32_t b = nblk; b-- > 0u; ) {
+		a7_decode_block(flash + b * EMMC_BLOCK_SIZE, a7_scrL, a7_scrR);
+		g_dcr++;
+		for (uint32_t i2 = SAMP_PER_BLK; i2-- > 0u; ) {
+			uint32_t fi = (pos & ring_mask) * 2u;
+			ring[fi] = a7_scrL[i2]; ring[fi + 1u] = a7_scrR[i2];
+			pos++;
+		}
+	}
 }
 
 #elif SP1_CODEC == SP1_CODEC_ULAW
@@ -3610,6 +4440,234 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 }
 #endif /* SP1_CODEC */
 
+/* ==== M71: verified async reads for the streamer. The port (M50) +
+ * CRC tails (M54) + PSEL re-orient (M55r6) are the six-bench-proven
+ * triple. <=16-block chunks (the tail stash caps at 16), 3 attempts,
+ * then the SYNC path as courier fallback — never worse than before.
+ * ONLY the streamer thread may call this (single storage owner). ==== */
+extern void emmc_m50_setup(void);
+extern int emmc_m50_read_async(uint32_t blk, uint8_t *buf, uint32_t n);
+extern int emmc_m50_wait(int ms);
+extern uint8_t m54_tails[32][2];
+extern void emmc_m54_crc_init(void);
+extern uint16_t emmc_m54_crc16(const uint8_t *d, uint32_t n);
+static volatile uint32_t g_m71_as, g_m71_rt, g_m71_fb;
+static volatile uint32_t g_m71_ca, g_m71_rq, g_m71_rd, g_m71_wu;
+/* ==== PCM14S: the two-tier TAKE codec (design doc + script 459) ====
+ * 24 kHz stereo 14-bit shaped. 512 B = 16 B hdr + 140 stored frames
+ * x 3.5 B. ONE BLOCK = 280 ENGINE frames: the decoder upsamples 2:1
+ * (linear), so the transport/region/bus math is identical to A7.
+ * Marker blk[11] = 0x5B -> per-block dispatch; mixed tracks decode.
+ * Shaper e1 is CARRIED across blocks (encode-side; decode stateless);
+ * reset at punch-in. Continuity: the sequential fill heals the odd
+ * frame before each block against the previous block's last stored
+ * frame (per-track state); seam/reverse paths duplicate one frame.
+ * 64-bit pack shifts (4 x 14 = 56 bits) -- see 459's C-port note. */
+
+static void p14s_pack_blocks(const int16_t *ring, uint32_t ring_mask,
+			     uint32_t start, uint8_t *out, uint32_t nblk)
+{
+	for (uint32_t b = 0; b < nblk; b++) {
+		uint8_t *blk = out + b * EMMC_BLOCK_SIZE;
+		uint32_t f0 = start + b * SAMP_PER_BLK;
+		blk[0] = 0x50u; blk[1] = 0x31u; blk[2] = 0x34u; blk[3] = 0x53u;
+		blk[4] = 0; blk[5] = 1u; blk[6] = 0; blk[7] = 0;
+		blk[8] = 0; blk[9] = 0; blk[10] = 0; blk[11] = P14S_MARK;
+		blk[12] = (uint8_t)(SAMP_PER_BLK & 0xFFu);
+		blk[13] = (uint8_t)(SAMP_PER_BLK >> 8);
+		blk[14] = 0; blk[15] = 0;
+		uint32_t o = 16u;
+		for (uint32_t i = 0; i < 140u; i += 2u) {
+			int32_t q4[4];
+			for (uint32_t k = 0; k < 2u; k++) {
+				uint32_t fe = f0 + (i + k) * 2u;
+				uint32_t fa = (fe & ring_mask) * 2u;
+				uint32_t fb = ((fe + 1u) & ring_mask) * 2u;
+				for (uint32_t c = 0; c < 2u; c++) {
+					int32_t s24 = ((int32_t)ring[fa + c] +
+					               (int32_t)ring[fb + c] + 1) >> 1;
+					int32_t v = s24 - g_p14s_e1[c];
+					if (v > 32767) v = 32767;
+					else if (v < -32768) v = -32768;
+					int32_t q = (v + 2) >> 2;
+					if (q > 8191) q = 8191;
+					else if (q < -8192) q = -8192;
+					g_p14s_e1[c] = (q << 2) - v;
+					if (g_p14s_e1[c] > 16) g_p14s_e1[c] = 16;
+					else if (g_p14s_e1[c] < -16) g_p14s_e1[c] = -16;
+					q4[k * 2u + c] = q;
+				}
+			}
+			uint64_t v64 = ((uint64_t)((uint32_t)q4[0] & 0x3FFFu) << 42) |
+			               ((uint64_t)((uint32_t)q4[1] & 0x3FFFu) << 28) |
+			               ((uint64_t)((uint32_t)q4[2] & 0x3FFFu) << 14) |
+			                (uint64_t)((uint32_t)q4[3] & 0x3FFFu);
+			for (uint32_t k2 = 0; k2 < 7u; k2++)
+				blk[o + k2] = (uint8_t)(v64 >> (48u - 8u * k2));
+			o += 7u;
+		}
+	}
+}
+
+/* decode ONE P14S block into a7_scrL/R (280 engine frames). The last
+ * odd frame duplicates (healed by the sequential path via prev). */
+static void p14s_dec_scr(const uint8_t *blk)
+{
+	const uint8_t *o = blk + 16u;
+	for (uint32_t i = 0; i < 140u; i += 2u) {
+		uint64_t v64 = 0;
+		for (uint32_t k = 0; k < 7u; k++) v64 = (v64 << 8) | o[k];
+		o += 7u;
+		int32_t s0 = (int32_t)((v64 >> 42) & 0x3FFFu);
+		int32_t s1 = (int32_t)((v64 >> 28) & 0x3FFFu);
+		int32_t s2 = (int32_t)((v64 >> 14) & 0x3FFFu);
+		int32_t s3 = (int32_t)( v64        & 0x3FFFu);
+		if (s0 > 8191) s0 -= 16384; if (s1 > 8191) s1 -= 16384;
+		if (s2 > 8191) s2 -= 16384; if (s3 > 8191) s3 -= 16384;
+		a7_scrL[i * 2u]        = (int16_t)(s0 << 2);
+		a7_scrR[i * 2u]        = (int16_t)(s1 << 2);
+		a7_scrL[(i + 1u) * 2u] = (int16_t)(s2 << 2);
+		a7_scrR[(i + 1u) * 2u] = (int16_t)(s3 << 2);
+	}
+	for (uint32_t j = 0; j < 279u; j += 2u) {
+		a7_scrL[j + 1u] = (int16_t)(((int32_t)a7_scrL[j] + a7_scrL[j + 2u]) >> 1);
+		a7_scrR[j + 1u] = (int16_t)(((int32_t)a7_scrR[j] + a7_scrR[j + 2u]) >> 1);
+	}
+	a7_scrL[279] = a7_scrL[278]; a7_scrR[279] = a7_scrR[278];
+}
+
+/* sequential fill dispatch: per-block marker branch; P14S blocks copy
+ * scr -> stereo pring and HEAL the previous odd frame via per-track
+ * continuity. A7 blocks fall through to codec_unpack one at a time. */
+static void p14s_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
+			const uint8_t *flash, uint32_t nblk, int trk)
+{
+	for (uint32_t b = 0; b < nblk; b++) {
+		const uint8_t *blk = flash + b * EMMC_BLOCK_SIZE;
+		uint32_t s0 = start + b * SAMP_PER_BLK;
+		if (blk[11] == P14S_MARK) {
+			p14s_dec_scr(blk);
+			for (uint32_t f = 0; f < SAMP_PER_BLK; f++) {
+				uint32_t fi = ((s0 + f) & ring_mask) * 2u;
+				ring[fi]      = a7_scrL[f];
+				ring[fi + 1u] = a7_scrR[f];
+			}
+			{ uint32_t hp = ((s0 - 1u) & ring_mask) * 2u;
+			  ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + a7_scrL[0]) >> 1);
+			  ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + a7_scrR[0]) >> 1); }
+			g_p14s_prev[trk][0] = a7_scrL[278];
+			g_p14s_prev[trk][1] = a7_scrR[278];
+		} else {
+			codec_unpack(ring, ring_mask, s0, blk, 1u);
+		}
+	}
+}
+
+static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
+			     const uint8_t *flash, uint32_t skip, uint32_t nsamp)
+{
+	/* seam-rate only: decode block-by-block into scr, copy the run.
+	 * A7 blocks in the span fall through to codec_unpack_part. */
+	uint32_t f = skip;
+	uint32_t done = 0;
+	while (done < nsamp) {
+		uint32_t blkno = f / SAMP_PER_BLK;
+		uint32_t off   = f - blkno * SAMP_PER_BLK;
+		uint32_t run   = SAMP_PER_BLK - off;
+		if (run > nsamp - done) run = nsamp - done;
+		const uint8_t *blk = flash + blkno * EMMC_BLOCK_SIZE;
+		if (blk[11] == P14S_MARK) {
+			p14s_dec_scr(blk);
+			for (uint32_t k = 0; k < run; k++) {
+				uint32_t fi = ((start + done + k) & ring_mask) * 2u;
+				ring[fi]      = a7_scrL[off + k];
+				ring[fi + 1u] = a7_scrR[off + k];
+			}
+		} else {
+			codec_unpack_part(ring, ring_mask, start + done, flash, f, run);
+		}
+		f += run; done += run;
+	}
+}
+
+static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
+			    const uint8_t *flash, uint32_t nblk)
+{
+	for (uint32_t b = 0; b < nblk; b++) {
+		const uint8_t *blk = flash + b * EMMC_BLOCK_SIZE;
+		if (blk[11] == P14S_MARK) {
+			p14s_dec_scr(blk);
+			for (uint32_t f = 0; f < SAMP_PER_BLK; f++) {
+				uint32_t fi = ((start + b * SAMP_PER_BLK + f) & ring_mask) * 2u;
+				ring[fi]      = a7_scrL[SAMP_PER_BLK - 1u - f];
+				ring[fi + 1u] = a7_scrR[SAMP_PER_BLK - 1u - f];
+			}
+		} else {
+			codec_unpack_rev(ring, ring_mask, start + b * SAMP_PER_BLK, blk, 1u);
+		}
+	}
+}
+
+static void p14s_mask_from_x3(uint32_t slot)
+{
+	g_p14s_mask = 0;
+	if (g_x3_ok && slot < NUM_SLOTS)
+		for (int xi = 0; xi < NTRK; xi++)
+			if (g_x3.t[slot][xi].codec_id == X3_CODEC_P14S)
+				g_p14s_mask |= (uint8_t)(1u << xi);
+}
+
+static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
+{
+	M73_T0();
+	int64_t _t0 = k_uptime_get();
+	g_m71_ca++; g_m71_rq += n;
+	static uint8_t m71_init;   /* 0 = not yet, 1 = ok */
+	if (!m71_init) {
+		emmc_m50_setup();
+		emmc_m54_crc_init();
+		m71_init = 1;
+	}
+	uint32_t done = 0;
+	while (done < n) {
+		uint32_t c = n - done;
+		if (c > 32u) c = 32u;   /* M71r5: whole turn in one arm */
+		uint8_t *dst = buf + done * EMMC_BLOCK_SIZE;
+		int good = 0;
+		for (int attempt = 0; attempt < 3 && !good; attempt++) {
+			int bad, r;
+			if (attempt) g_m71_rt++;
+			if (!emmc_m50_read_async(blk + done, dst, c)) {
+				k_msleep(1);
+				continue;
+			}
+			r = emmc_m50_wait(300);
+			if (r != 1) continue;
+			bad = -1;
+			for (uint32_t bi = 0; bi < c; bi++) {
+				uint16_t cc = emmc_m54_crc16(dst + bi * 512u, 512u);
+				uint16_t tb = (uint16_t)((m54_tails[bi][0] << 8) |
+							  m54_tails[bi][1]);
+				if (cc != tb) { bad = (int)bi; break; }
+			}
+			if (bad < 0) good = 1;
+		}
+		if (!good) {
+			/* courier: the proven sync path takes this chunk */
+			g_m71_fb++;
+			if (!emmc_read_blocks(blk + done, dst, c))
+				return false;
+		} else {
+			g_m71_as += c;
+		}
+		done += c;
+	}
+	g_m71_wu += (uint32_t)(k_uptime_get() - _t0);
+	M73_ADD(g_t_rd);
+	return true;
+}
+
+
 static void streamer_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -3619,7 +4677,7 @@ static void streamer_thread(void *a, void *b, void *c)
 	 * programming across the burst instead of fully programming each block (~30 ms
 	 * single-block), so the sustained write keeps up with live recording. */
 #define FLUSH_BATCH 32u   /* 16KB bursts = 2 whole 8KB pages per CMD25 (reverted from 16: the interleave+16 experiment caused catastrophic rec-ring overflow + flash write errors) */
-	static uint8_t batchbuf[FLUSH_BATCH * EMMC_BLOCK_SIZE];
+	static uint8_t batchbuf[FLUSH_BATCH * EMMC_BLOCK_SIZE] __aligned(4); /* M71: DMA dest */
 
 	(void)emmc_init();
 	/* AFTER init: emmc_init() resets the clock to the slow safe value — the
@@ -3628,6 +4686,15 @@ static void streamer_thread(void *a, void *b, void *c)
 	 * intended this whole time. Zero it here so it actually sticks. */
 	g_emmc_clk_half_us = 0u;
 	g_emmc_ready = emmc_is_ready() ? 1 : 0;
+	{ /* CX: start the 1 ms census HERE, at boot, not at the first
+	   * DTR tick. The old placement meant the census only ever ran
+	   * while 328 was attached, so under Protocol A it started
+	   * AFTER the corner was over and every number it produced
+	   * described a monitored machine. */
+	  g_w4c_on = 1;
+	  k_timer_init(&g_w4c_tmr, w4c_tick, NULL);
+	  k_timer_start(&g_w4c_tmr, K_MSEC(1), K_MSEC(1));
+	}
 
 	/* Enable the card's internal write cache if it has one. Read EXT_CSD (CMD8) to
 	 * check CACHE_SIZE and the spec revision; if present, turn the cache on. It
@@ -3654,6 +4721,11 @@ static void streamer_thread(void *a, void *b, void *c)
 		g_extcsd_dump[4] = blk[503]; g_extcsd_dump[5] = blk[198];
 		g_extcsd_dump[6] = blk[246]; g_extcsd_dump[7] = blk[192];
 		g_extcsd_dump[8] = blk[175];
+		{ /* S1: arm the shadow only if the card holds it + 64k margin */
+		  uint32_t _sec = (uint32_t)blk[212] | ((uint32_t)blk[213] << 8) |
+		                  ((uint32_t)blk[214] << 16) | ((uint32_t)blk[215] << 24);
+		  if (_sec >= SHW_BASE + (uint32_t)NTRK * SHW_TRK_BLOCKS + 65536u)
+			g_shw_armed = 1u; }
 		if (cache_kb > 0u && blk[192] >= 6u)   /* CACHE_SIZE>0, EXT_CSD_REV>=6 (v4.5+) */
 			g_cache_on = emmc_cache_enable() ? 1u : 0u;
 		if (blk[503] & 0x01) {                 /* HPI: abort lever for the idle flush */
@@ -3696,6 +4768,14 @@ static void streamer_thread(void *a, void *b, void *c)
 	g_mode_pref = g_meta.fixed_len ? 1u : 0u;   /* M7c: global mode preference */
 	g_fixed_len = g_mode_pref;                  /* effective refined when the
 	                                             * current song loads (main) */
+	/* M72: pull the v3 extended table (blocks 3-5). Invalid/stale ->
+	 * g_x3_ok stays 0 and reloads use the block-derived values. */
+	if (g_emmc_ready && emmc_read_blocks(X3_BLK, batchbuf, X3_NBLK)) {
+		memcpy(&g_x3, batchbuf, sizeof(g_x3));
+		g_x3_ok = x3_valid(&g_x3) ? 1u : 0u;
+		p14s_mask_from_x3(g_slot);   /* P14S: shadow gates follow the table */
+	}
+	if (!g_x3_ok) memset(&g_x3, 0, sizeof(g_x3));
 	g_meta_loaded = 1;
 
 	while (1) {
@@ -3733,6 +4813,117 @@ static void streamer_thread(void *a, void *b, void *c)
 		bool work = false;
 		uint32_t cpos = g_consume_pos;
 		uint32_t slot = g_slot;
+		{ /* #116 FIX: invalidate the shadow on a slot change HERE,
+		   * unconditionally, before PASS 1 and PASS 2. The old check
+		   * lived inside the S1 builder gate (TS_PLAY && !recording),
+		   * while the S2 serve gate requires neither -- and serve runs
+		   * first. Switch-then-record never reset at all. */
+		  if (g_shw_slot != slot) {
+			uint32_t _had = 0u;
+			for (int _j = 0; _j < NTRK; _j++) {
+				if (g_shw_wm[_j]) _had = 1u;
+				g_shw_wm[_j] = 0u;
+			}
+			if (_had) g_shw_inv++;
+			g_shw_slot = slot;
+		  }
+		}
+		{ /* ==== S3: IDLE-TIME SEQUENTIAL SHADOW BUILD (one bite/round).
+		   * Completes coverage without lap alignment (campaign #56).
+		   * Gated: armed, nothing recording, every playing cushion
+		   * comfortable. batchbuf layout: [0,4K) A7 in, [4K,6K) decode
+		   * ring (512 fr), [8K,16K) staging. Stateless (from wm). */
+		  if (g_shw_armed && g_meta_loaded && k_uptime_get_32() > 5000u) {
+			static uint8_t s3_rr;
+			bool _ok3 = true;
+			/* M99: ovr (rec-ring lapping) is what CORRUPTS TAKES, and it is
+			 * still ~2M. So shadow work during a take is allowed only while
+			 * the record ring is comfortably drained -- under a quarter
+			 * full. The flush always wins; the builder only uses slack. */
+			if (g_rec_track >= 0) {
+				uint32_t _fill99 = trk[g_rec_track].r_w - trk[g_rec_track].r_r;
+				if (_fill99 >= (RRING_SAMPLES / 4u)) _ok3 = false;
+			}
+			for (int _j = 0; _j < NTRK; _j++) {
+				uint8_t _sj = trk[_j].state;
+				/* M99: the record target is EXPECTED to be TS_REC now; it
+				 * must not veto building the OTHER tracks' shadows. Any
+				 * other non-idle state (TS_ARMED, TS_DONE) still does. */
+				if (_j != g_rec_track && _sj != TS_EMPTY && _sj != TS_PLAY)
+					_ok3 = false;
+				if ((_sj == TS_PLAY || head_active(_j)) &&
+				    (int32_t)(trk[_j].p_w - cpos) <
+				    (int32_t)PLAY_CRIT_SAMPLES)  /* r2: 1x -- 2x sat above the steady cushion and starved the builder (wm 38% at 12 min, campaign #57) */
+					_ok3 = false;
+			}
+			if (_ok3) {
+				for (int _t3 = 0; _t3 < NTRK; _t3++) {
+					int _i3 = (s3_rr + _t3) & 3;
+					/* M99: never build the track being recorded -- its shadow is
+					 * invalidated on TS_REC and the take is still growing. */
+					if (_i3 == g_rec_track) continue;
+					/* P14S: raw tracks need no shadow -- and building one
+					 * would A7-decode raw blocks into garbage. */
+					if (g_p14s_mask & (1u << _i3)) continue;
+					struct looptrk *_tr = &trk[_i3];
+					uint32_t _len = _tr->len_samps;
+					uint32_t _wmf = g_shw_wm[_i3];
+					if (!_len || _wmf + 250u > _len) continue;
+					uint32_t _ab = _wmf / SAMP_PER_BLK;
+					uint32_t _off = _wmf - _ab * SAMP_PER_BLK;
+					uint32_t _gb3 = _tr->content_blocks;
+					uint32_t _k = 8u;
+					if (_ab >= _gb3) continue;
+					if (_ab + _k > _gb3) _k = _gb3 - _ab;
+					if (!emmc_read_blocks_fast(trk_blk(slot, (uint32_t)_i3) + _ab,
+					                           batchbuf, _k)) break;
+					int16_t *_dr = (int16_t *)(batchbuf + 4096u);
+					uint8_t *_sb3 = (uint8_t *)(batchbuf + 8192u);
+					/* S8Q gather: 250 stereo frames = 1000 B in the free
+					 * [6K,8K) scratch (_dr's 511-mask ring tops out at 6K).
+					 * Needed because a 15-16 frame sub-block can straddle
+					 * an A7 block boundary and the exponent search needs
+					 * the whole sub-block before it can quantise. */
+					int16_t *_g16 = (int16_t *)(batchbuf + 6144u);
+					uint32_t _have = 0, _m3 = 0, _src = _off, _bi3 = 0;
+					a7_decode_block_ring(batchbuf, _dr, 511u, 0u);
+					while (_m3 < 16u) {
+						while (_have < 250u) {
+							if (_src >= SAMP_PER_BLK) {
+								_bi3++; _src = 0;
+								if (_bi3 >= _k) break;
+								a7_decode_block_ring(batchbuf + _bi3 * EMMC_BLOCK_SIZE,
+								                     _dr, 511u, 0u);
+							}
+							/* S8Q: BOTH channels. The mono discard guard is
+							 * DELETED -- it protected a MONO buffer from
+							 * stereo data, and the buffer is stereo now. */
+							_g16[_have * 2u]      = _dr[_src * 2u];
+							_g16[_have * 2u + 1u] = _dr[_src * 2u + 1u];
+							_have++; _src++;
+						}
+						if (_have < 250u) break;
+						s8q_enc_sector(_g16, 0xFFFFFFFFu, 0u,
+						               (uint16_t)(_wmf / 250u + _m3),
+						               _sb3 + _m3 * 512u);
+						_m3++; _have = 0;
+					}
+					if (_m3) {
+						bool aw3_burst_start(uint32_t, const uint8_t *, uint32_t);
+						bool aw3_burst_wait(void);
+						if (aw3_burst_start(SHW_TRK((uint32_t)_i3) + _wmf / 250u,
+						                    (const uint8_t *)_sb3, _m3) &&
+						    aw3_burst_wait()) {
+							g_shw_wm[_i3] = _wmf + _m3 * 250u;
+							g_shw_blk += _m3;
+						}
+					}
+					s3_rr = (uint8_t)(_i3 + 1);
+					break;
+				}
+			}
+		  }
+		}
 
 		if (g_meta_save_req) {                       /* persist songs + BPMs */
 			g_meta_save_req = 0;
@@ -3741,6 +4932,27 @@ static void streamer_thread(void *a, void *b, void *c)
 				memcpy(metabuf, &g_meta, sizeof(g_meta));
 				(void)meta_write_blocks(metabuf);
 				work = true;
+				/* M72: refresh this slot's v3 rows from LIVE state
+				 * and persist blocks 3-5 alongside the index. The
+				 * reload cross-check makes write order irrelevant. */
+				if (slot < NUM_SLOTS) {
+					for (int xi = 0; xi < NTRK; xi++) {
+						struct x3_trk *xe = &g_x3.t[slot][xi];
+						xe->start_samps    = trk[xi].start_samps;
+						xe->len_samps      = trk[xi].len_samps;
+						xe->content_blocks = trk[xi].content_blocks;
+						xe->codec_id       = (g_p14s_mask & (1u << xi))
+						                     ? X3_CODEC_P14S : X3_CODEC_A7;  /* two-tier */
+						xe->flags          = (uint8_t)(g_cap_stereo ? 1u : 0u);  /* bit0 = stereo content; derived, so M63b-2 makes it correct for free */
+						xe->pan            = 128u;
+					}
+					g_x3.magic = X3_MAGIC; g_x3.ver = X3_VER;
+					g_x3.sum = x3_sum(&g_x3);
+					memset(batchbuf, 0, X3_NBLK * EMMC_BLOCK_SIZE);
+					memcpy(batchbuf, &g_x3, sizeof(g_x3));
+					if (emmc_write_blocks(X3_BLK, batchbuf, X3_NBLK))
+						g_x3_ok = 1u;
+				}
 			}
 		}
 		if (g_grid_save_req) {                       /* persist grids (block 2) */
@@ -3767,7 +4979,15 @@ static void streamer_thread(void *a, void *b, void *c)
 			struct looptrk *t = &trk[i];
 			uint8_t st = t->state;
 
-			if (st == TS_REC || st == TS_DONE) {
+			if (st == TS_REC) g_shw_wm[i] = 0u;   /* S1: take invalidates shadow */
+			if (st == TS_REC || st == TS_DONE ||
+			    (t->r_w - t->r_r) >= SAMP_PER_BLK) {
+				/* M89: the wrap can flip a finished take to TS_PLAY
+				 * before its tail is flushed (measured: 8,781-29,118
+				 * frames stranded, frozen between takes -- every take
+				 * stored missing its last stretch). Serve ANY backlog:
+				 * the frames are real audio with fixed destinations;
+				 * a late flush self-heals on the next loop pass. */
 				while ((t->r_w - t->r_r) >= SAMP_PER_BLK) {
 					uint32_t fm = t->flush_mod ? t->flush_mod : MAX_LOOP_BLOCKS;
 					/* batch as many contiguous blocks as are ready, up to the
@@ -3815,13 +5035,64 @@ static void streamer_thread(void *a, void *b, void *c)
 					 * block-aligned) -> packed flash bytes for n blocks. PCM is
 					 * memcpy-equivalent; ULAW/ADPCM compress 2x/4x so this CMD25
 					 * moves half/quarter the bytes the card must program. */
-					codec_pack(g_rring, RRING_MASK, t->r_r & RRING_MASK,
+					if (n == 16u && t->state == TS_REC &&
+					    (blkno % 16u) == 0u && navail >= 32u &&
+					    to_wrap >= 32u) {
+						/* W3-r4 PIPELINE: pack the NEXT page while this one
+						 * is in the card. Encode wall hides inside program
+						 * time (the async port's overlap). Pair-granular
+						 * play-crit break below; failures leave data in the
+						 * ring for the single-burst path's streak logic. */
+						bool aw3_burst_start(uint32_t, const uint8_t *, uint32_t);
+						bool aw3_burst_wait(void);
+						uint32_t _tw4 = DWT->CYCCNT;
+						g_w4_pk++; g_w4_pb += 16u;
+						p14s_pack_blocks(g_rring, RRING_MASK, t->r_r & RRING_MASK,
+						           batchbuf, 16u);
+						bool _ok1 = aw3_burst_start(blkno, batchbuf, 16u);
+						g_w4_pk++; g_w4_pb += 16u;
+						p14s_pack_blocks(g_rring, RRING_MASK,
+						           (t->r_r + 16u * SAMP_PER_BLK) & RRING_MASK,
+						           batchbuf + 16u * EMMC_BLOCK_SIZE, 16u);
+						if (_ok1) _ok1 = aw3_burst_wait();
+						if (_ok1) {
+							t->r_r += 16u * SAMP_PER_BLK;
+							t->flush_blk += 16u;
+							bool _ok2 = aw3_burst_start(blkno + 16u,
+							            batchbuf + 16u * EMMC_BLOCK_SIZE, 16u);
+							if (_ok2) _ok2 = aw3_burst_wait();
+							if (_ok2) {
+								t->r_r += 16u * SAMP_PER_BLK;
+								t->flush_blk += 16u;
+							}
+						}
+						{ uint32_t _dcx73 = (uint32_t)(DWT->CYCCNT - _tw4); g_t_wr += _dcx73; if (M73_CX_NOW()) { g_t_wr_cx += _dcx73; g_t_wr_cxn++; } }
+						work = true;
+						if ((t->r_w - t->r_r) <
+						    (RRING_SAMPLES / 2u)) {
+							bool _pc4 = false;
+							for (int j = 0; j < NTRK; j++)
+								if ((trk[j].state == TS_PLAY ||
+								     head_active(j)) &&
+								    (int32_t)(trk[j].p_w - g_consume_pos) <
+								    (int32_t)PLAY_CRIT_SAMPLES)
+									_pc4 = true;
+							if (_pc4)
+								break;
+						}
+						continue;
+					}
+					g_w4_pk++; g_w4_pb += n;   /* W4P */
+					p14s_pack_blocks(g_rring, RRING_MASK, t->r_r & RRING_MASK,
 					           batchbuf, n);
 					static uint32_t wfail_start;   /* 0 = no failure streak */
 					static uint32_t wfail_key;     /* streak identity (track|flush pos) */
 					static uint8_t  wfail_ready1;  /* card seen READY once this streak */
 					uint32_t _wkey = ((uint32_t)i << 28) ^ t->flush_blk;
-					if (!emmc_write_blocks(blkno, batchbuf, n)) {
+					uint32_t _tw = DWT->CYCCNT;
+					bool _wok = emmc_write_blocks(blkno, batchbuf, n);
+					{ uint32_t _dcx73 = (uint32_t)(DWT->CYCCNT - _tw); g_t_wr += _dcx73; if (M73_CX_NOW()) { g_t_wr_cx += _dcx73; g_t_wr_cxn++; } }
+					if (!_wok) {
 						/* write failed (bus CRC or busy timeout): data is
 						 * still in the ring — retry next pass. Give up and
 						 * advance anyway (storing a glitch) ONLY after the
@@ -3882,8 +5153,14 @@ static void streamer_thread(void *a, void *b, void *c)
 					 * Burst-granular alternation only (one fully-terminated
 					 * CMD25, then reads) — NOT the sub-page interleave that
 					 * broke writes in an earlier experiment. */
+					/* W3-r2: the polite play-first break now yields only
+					 * below HALF a ring of backlog. The old 7/8 line left
+					 * 43 ms of emergency headroom -- thinner than one
+					 * write-cache stall -- and takes lapped inside it
+					 * (W3-r1, campaign S43). Above half a ring the flush
+					 * outranks play, as this pass's own preamble says. */
 					if ((t->r_w - t->r_r) <
-					    (RRING_SAMPLES - RRING_SAMPLES / 8u)) {
+					    (RRING_SAMPLES / 2u)) {
 						bool _pcrit = false;
 						for (int j = 0; j < NTRK; j++)
 							if ((trk[j].state == TS_PLAY ||
@@ -4049,6 +5326,18 @@ static void streamer_thread(void *a, void *b, void *c)
 							uint32_t _off = _lp % SAMP_PER_BLK;
 							uint32_t _lb2 = _lp / SAMP_PER_BLK;
 							uint32_t _n2  = 32u;
+							{  /* M63b-r2: the prime loop may run MORE THAN ONCE
+							    * when blocks/iteration < _want (true at 280
+							    * frames/block, false at 256) — without a
+							    * CUMULATIVE room clip the second pass wraps the
+							    * ring and overwrites the first. Same clip PASS2
+							    * has always had. */
+							   int32_t _rm = (int32_t)(RING_SAMPLES - SAMP_PER_BLK)
+							               - (int32_t)_got;
+							   uint32_t _rb = _rm > 0 ? (uint32_t)_rm / SAMP_PER_BLK : 0u;
+							   if (_n2 > _rb) { _n2 = _rb; g_prime_ovf++; }
+							   if (!_n2) break;
+							}
 							{	/* clip to the lap end (whole blocks;
 								 * the decode below trims the tail) */
 								uint32_t _lapb = ((_Ls - 1u) / SAMP_PER_BLK) + 1u;
@@ -4061,12 +5350,12 @@ static void streamer_thread(void *a, void *b, void *c)
 							if (!_n2) _n2 = 1u, _ps = true;
 							if (_ps) {
 								memset(batchbuf, 0, (size_t)_n2 * EMMC_BLOCK_SIZE);
-							} else if (!emmc_read_blocks(trk_blk(slot, (uint32_t)i) + _lb2, batchbuf, _n2)) {
+							} else if (!emmc_read_blocks_fast(trk_blk(slot, (uint32_t)i) + _lb2, batchbuf, _n2)) { /* M71 */
 								break;
 							}
 							uint32_t _ds = _n2 * SAMP_PER_BLK - _off;
 							if (_ds > _Ls - _lp) _ds = _Ls - _lp;
-							codec_unpack_part(t->pring, RING_MASK,
+							p14s_unpack_part(t->pring, RING_MASK,
 									  _pw & RING_MASK,
 									  batchbuf, _off, _ds);
 							_pw  += _ds;
@@ -4080,6 +5369,13 @@ static void streamer_thread(void *a, void *b, void *c)
 						uint32_t _lb  = (_c / _win) * _wper + _wb + (_c % _win);
 						uint32_t _n   = 32u;
 						if (_n > (RING_SAMPLES / SAMP_PER_BLK) - 1u) _n = (RING_SAMPLES / SAMP_PER_BLK) - 1u;
+						{  /* M63b-r2: cumulative room clip (see the plain path) */
+						   int32_t _rm = (int32_t)(RING_SAMPLES - SAMP_PER_BLK)
+						               - (int32_t)_got;
+						   uint32_t _rb = _rm > 0 ? (uint32_t)_rm / SAMP_PER_BLK : 0u;
+						   if (_n > _rb) { _n = _rb; g_prime_ovf++; }
+						   if (!_n) break;
+						}
 						{
 							uint32_t _we = (_c / _win) * _wper + _wb + _win;
 							if (_lb + _n > _we) _n = _we - _lb;
@@ -4091,13 +5387,13 @@ static void streamer_thread(void *a, void *b, void *c)
 						if (!_psil && _lb + _n > _content) _n = _content - _lb;
 						if (_psil) {
 							memset(batchbuf, 0, (size_t)_n * EMMC_BLOCK_SIZE);
-						} else if (!emmc_read_blocks(trk_blk(slot, (uint32_t)i) + _lb, batchbuf, _n)) {
+						} else if (!emmc_read_blocks_fast(trk_blk(slot, (uint32_t)i) + _lb, batchbuf, _n)) { /* M71 */
 							break;
 						}
 						/* DECODE the prime burst (_n blocks) into the play ring. */
 						uint32_t _ntot = _n * SAMP_PER_BLK;
-						codec_unpack(t->pring, RING_MASK, _pw & RING_MASK,
-						             batchbuf, _n);
+						p14s_unpack(t->pring, RING_MASK, _pw & RING_MASK,
+						             batchbuf, _n, i);
 						_pw  += _ntot;
 						_got += _ntot;
 					}
@@ -4138,11 +5434,43 @@ static void streamer_thread(void *a, void *b, void *c)
 			 * surplus to rebuild margins). Fairness is per ROUND, so no
 			 * track can be locked out; writes stay bounded because a round
 			 * breaks out the moment a whole write page is waiting. */
+			/* M71r4 SPRINT: the async benches earned 1,689-3,024 blk/s at
+			 * prio 1; at PREEMPT(5) the storm load (~71% above us) parks
+			 * this loop between arms (r2/r3 measured). Boost the WHOLE
+			 * rounds loop while the audio thread says a ring is low; the
+			 * 64-pass 0.5 ms breather below still protects main/WDT. */
+			/* M63b-r4 DUTY CYCLE (M46d semantics restored): main runs at
+			 * PREEMPT(1) too and there is no timeslicing, so an
+			 * unbounded boost starves buttons/LEDs/the WDT feed. Sprint
+			 * at most SPRINT_ON_MS, then hand the level back for
+			 * SPRINT_OFF_MS. */
+			static int64_t _spr_t0;
+			int _m71spr = 0;
+			if (g_emmc_sprint) {
+				_m71spr = 1; _spr_t0 = k_uptime_get();
+				k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(1));
+			}
 			static uint32_t rr;
 			bool more = true;
 			while (more && g_slot == slot) {
 				more = false;
-			rr = (rr + 1u) & 3u;
+			rr = (rr + 1u) & 3u; g_m71_rd++;   /* M71r2 rounds/s */
+			if (!_m71spr && g_emmc_sprint) {   /* went low mid-loop */
+				_m71spr = 1; _spr_t0 = k_uptime_get();
+				k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(1));
+			} else if (_m71spr &&
+			           k_uptime_get() - _spr_t0 >= 150) {
+				/* M63b-r4: 150 ms sprinted -> give main the level back
+				 * for 15 ms, then resume if still low (M46d shape). */
+				k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(5));
+				_m71spr = 0;
+				k_msleep(15);
+				if (g_emmc_sprint) {
+					_m71spr = 1; _spr_t0 = k_uptime_get();
+					k_thread_priority_set(k_current_get(),
+					                      K_PRIO_PREEMPT(1));
+				}
+			}
 			cpos = g_consume_pos;    /* fresh playhead for this round */
 			for (int k = 0; k < NTRK; k++) {
 				int i = (int)((rr + (uint32_t)k) & 3u);
@@ -4294,7 +5622,7 @@ static void streamer_thread(void *a, void *b, void *c)
 						if (!n) { n = 1u; sil = true; }
 						bool rok;
 						if (sil) { memset(batchbuf, 0, (size_t)n * EMMC_BLOCK_SIZE); rok = true; }
-						else     { rok = emmc_read_blocks(trk_blk(slot, (uint32_t)i) + lb, batchbuf, n); }
+						else     { rok = emmc_read_blocks_fast(trk_blk(slot, (uint32_t)i) + lb, batchbuf, n); } /* M71 */
 						if (!rok) {
 							work = true;
 							g_p2rfail++;
@@ -4312,7 +5640,7 @@ static void streamer_thread(void *a, void *b, void *c)
 						if (t->p_w != pw) { work = true; break; } /* reset raced us */
 						uint32_t ds = n * SAMP_PER_BLK - off;
 						if (ds > Ls - lp) ds = Ls - lp;
-						codec_unpack_part(t->pring, RING_MASK, pw & RING_MASK,
+						p14s_unpack_part(t->pring, RING_MASK, pw & RING_MASK,
 								  batchbuf, off, ds);
 						t->p_w = pw + ds;
 						g_p2blk[i] += n;
@@ -4383,9 +5711,40 @@ static void streamer_thread(void *a, void *b, void *c)
 					                              ? (uint32_t)g_head_src
 					                              : (uint32_t)i)
 						       + (hrev ? (loop_blk - n + 1u) : loop_blk);
+					/* ==== S2: SHADOW HIT? Steady forward spans fully below
+					 * this track's watermark stream PCM from the shadow --
+					 * no decode. Same CRC-verified read wrapper. Any miss
+					 * or failure falls through to the A7 path unchanged. */
+					bool _shit = false;
+					if (g_shw_armed && !hrev && !_sil && !head_active(i) &&
+					    (loop_blk + (n <= 27u ? n : 27u)) * SAMP_PER_BLK <= g_shw_wm[i]) {
+						if (n > 27u)
+							n = 27u;   /* S8Q DERIVED, not hardcoded: batchbuf is 32
+							            * sectors; worst start offset 249 =>
+							            * ceil((249+n*280)/250): n=27 -> 32 fits,
+							            * n=28 -> 33 OVERFLOWS. */
+						uint32_t _sf0 = loop_blk * SAMP_PER_BLK;
+						uint32_t _sb0 = _sf0 / 250u;
+						uint32_t _sbe = (_sf0 + n * SAMP_PER_BLK + 249u) / 250u;
+						uint32_t _sm  = _sbe - _sb0;
+						if (_sm <= 32u &&
+						    emmc_read_blocks_fast(SHW_TRK((uint32_t)i) + _sb0,
+						                          batchbuf, _sm)) {
+							/* S8Q: decode BOTH channels -- the mono
+							 * duplication is gone with the mono format. */
+							s8q_dec_span((const uint8_t *)batchbuf,
+							             _sf0 - _sb0 * 250u,
+							             n * SAMP_PER_BLK,
+							             t->pring, RING_MASK, pw);
+							if (g_shw_slot != slot) g_shw_stale++;  /* #116 guard: must stay 0 */
+							_shit = true;
+							g_shw_hit += n;
+						}
+					}
 					bool _rok;
-					if (_sil) { memset(batchbuf, 0, (size_t)n * EMMC_BLOCK_SIZE); _rok = true; }
-					else      { _rok = emmc_read_blocks(blkno, batchbuf, n); }
+					if (_shit) { _rok = true; }
+					else if (_sil) { memset(batchbuf, 0, (size_t)n * EMMC_BLOCK_SIZE); _rok = true; }
+					else      { _rok = emmc_read_blocks_fast(blkno, batchbuf, n); } /* M71 */
 					if (!_rok) {
 						work = true;       /* read failed: retry in a few ms */
 						g_p2rfail++;
@@ -4410,26 +5769,64 @@ static void streamer_thread(void *a, void *b, void *c)
 					/* DECODE: packed flash bytes (n blocks just read) -> play
 					 * ring (int16, wraps at RING_MASK, pw is block-aligned).
 					 * PCM is memcpy-equivalent. */
-					if (hrev) {
-						/* M15-r2: the run was read FORWARD in one CMD18;
-						 * reversing the whole batch in place flips both
-						 * block order and sample order — a time-reversed
-						 * stream in normal layout. (The first cut read
-						 * reversed heads one block per command; 3-4 of
-						 * them near top speed starved on command
-						 * overhead — marc's dropout report.) */
-						int16_t *bp = (int16_t *)batchbuf;
-						uint32_t tot = n * SAMP_PER_BLK;
-						for (uint32_t f = 0; f < tot / 2u; f++) {
-							int16_t tv = bp[f];
-							bp[f] = bp[tot - 1u - f];
-							bp[tot - 1u - f] = tv;
-						}
-					}
-					codec_unpack(t->pring, RING_MASK, pw & RING_MASK,
-					             batchbuf, n);
+					/* M63b: coded blocks cannot be byte-flipped — decode
+					 * in reverse block order instead. */
+					if (_shit) {
+						/* S2: ring already holds the shadow PCM */
+					} else if (hrev)
+						p14s_unpack_rev(t->pring, RING_MASK, pw & RING_MASK,
+						                 batchbuf, n);
+					else
+						p14s_unpack(t->pring, RING_MASK, pw & RING_MASK,
+						             batchbuf, n, i);
 					t->p_w = pw + n * SAMP_PER_BLK;
 					g_p2blk[i] += n;
+					/* ==== S1 SHADOW BUILDER. The decoded span sits in
+					 * pring[pw..pw+n*280) as unconsumed PREFETCH (stable,
+					 * SPSC). batchbuf is DEAD here (unpack above consumed
+					 * its A7 bytes; next use overwrites) -- borrowed as
+					 * staging per the M69 liveness rule. Bus is ours
+					 * (sole-owner thread); writes ride the async port. */
+					if (g_shw_armed && !hrev && !_sil &&
+					    !head_active(i) && t->state == TS_PLAY &&
+					    g_rec_track < 0 &&
+					    !(g_p14s_mask & (1u << i))) {   /* P14S: no shadow */
+						static uint32_t _shw_slot = 0xFFFFFFFFu;
+						if (_shw_slot != slot) {   /* song switch: all stale */
+							_shw_slot = slot;
+							for (int _j = 0; _j < NTRK; _j++)
+								g_shw_wm[_j] = 0u;
+						}
+						uint32_t _f0 = loop_blk * SAMP_PER_BLK;
+						uint32_t _fe = _f0 + n * SAMP_PER_BLK;
+						uint32_t _w  = g_shw_wm[i];
+						if (_w >= _f0 && _w < _fe) {
+							uint8_t *_sb = (uint8_t *)batchbuf;
+							uint32_t _m = 0;
+							while (_m < 32u && _w + 250u <= _fe) {
+								uint32_t _rb = pw + (_w - _f0);
+								/* S8Q: stereo encode straight from pring.
+								 * The mono bail is deleted WITH the format. */
+								s8q_enc_sector(t->pring, RING_MASK, _rb,
+								               (uint16_t)(_w / 250u),
+								               _sb + _m * 512u);
+								_w += 250u; _m++;
+							}
+							if (_m) {
+								bool aw3_burst_start(uint32_t, const uint8_t *, uint32_t);
+								bool aw3_burst_wait(void);
+								uint32_t _sblk = SHW_TRK((uint32_t)i) +
+								                 g_shw_wm[i] / 250u;
+								if (aw3_burst_start(_sblk, batchbuf, _m) &&
+								    aw3_burst_wait()) {
+									g_shw_wm[i] = _w;
+									g_shw_blk += _m;
+								} else {
+									g_shw_skip++;
+								}
+							}
+						}
+					}
 					work = true;
 					more = true;             /* served: worth another round */
 					budget -= n;
@@ -4454,12 +5851,20 @@ static void streamer_thread(void *a, void *b, void *c)
 				}
 			}
 			}
+			if (_m71spr)
+				k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(5));
 		}
 		/* ==== M19b BOUNCE RENDER: one 4-block chunk per round, between
 		 * the passes — the same citizenship as the PASS-1 flush. Bounded
 		 * IO (<=16 single reads + one 4-block write), so the play rings
 		 * keep their cushions while the heads keep sounding. ==== */
-		if (g_bnc_req >= 0 && !g_bnc_active && !g_bnc_abort)
+		/* M63b-1: the bounce mixer sums RAW FLASH BYTES as PCM, which is
+		 * wrong for coded blocks. Refuse the request (LED shrug) rather
+		 * than render noise; M63b-2 ports it to a7_decode_block. */
+		if (g_bnc_req >= 0 && !g_bnc_active) {
+			g_bnc_req = -1; g_bnc_abort = 0; g_led_shrug = 1;
+		}
+		if (0)
 			g_bnc_active = 1;
 		if (g_bnc_active) {
 			if (g_bnc_abort) {
@@ -4468,7 +5873,9 @@ static void streamer_thread(void *a, void *b, void *c)
 				uint32_t bdst = trk_blk(g_slot, (uint32_t)bnc_dst);
 				uint32_t bsrc = trk_blk(g_slot, (uint32_t)bnc_src);
 				uint32_t nblk = bnc_cyc - bnc_done_blocks;
-				if (nblk > 4u) nblk = 4u;
+				if (nblk > 1u) nblk = 1u;   /* M63b: bnc_acc holds ONE
+				                             * stereo A7 block (2,240 B of
+				                             * 4 KB); b-2 ports the mixer */
 				memset(bnc_acc, 0,
 				       sizeof(bnc_acc[0]) * nblk * SAMP_PER_BLK);
 				bool rok = true;
@@ -4980,6 +6387,7 @@ static void uac2_data_recv_cb(const struct device *dev, uint8_t terminal,
 			      void *buf, uint16_t size, void *user_data)
 {
 	ARG_UNUSED(dev); ARG_UNUSED(terminal); ARG_UNUSED(user_data);
+	uint32_t _t80 = DWT->CYCCNT;
 
 	if (g_usb_streaming && size) {
 		g_usb_pkts++;                /* diag: ~1000/s expected while streaming */
@@ -4996,6 +6404,16 @@ static void uac2_data_recv_cb(const struct device *dev, uint8_t terminal,
 	}
 
 	k_mem_slab_free(&uac2_rx_slab, buf);
+	/* U1: the feedback regulator, relocated off the SOF path. Same
+	 * 1 ms cadence (one ISO OUT completion per frame while streaming)
+	 * on a wake-cascade that is already paid for. Runs AFTER the
+	 * ring_buf_put above, so it sees the fill this frame produced --
+	 * a fixed one-frame phase shift versus the old SOF timing, which
+	 * the FILL_EMA_SHIFT=6 (~64 ms) filter renders irrelevant. */
+	if (g_fb_running) {
+		feedback_update();
+	}
+	g_t_cb += (uint32_t)(DWT->CYCCNT - _t80);
 }
 
 static void uac2_buf_release_cb(const struct device *dev, uint8_t terminal,
@@ -5015,9 +6433,14 @@ static uint32_t uac2_feedback_cb(const struct device *dev, uint8_t terminal,
 static void uac2_sof_cb(const struct device *dev, void *user_data)
 {
 	ARG_UNUSED(dev); ARG_UNUSED(user_data);
-	if (g_fb_running) {
-		feedback_update();
-	}
+	uint32_t _t80 = DWT->CYCCNT;
+	/* U1: feedback_update() moved to uac2_data_recv_cb(). With
+	 * CONFIG_UDC_ENABLE_SOF=n this callback no longer fires at all;
+	 * it is kept so the ops struct and the g_t_sof meter stay valid
+	 * (g_t_sof going to zero is itself the confirmation that SOF is
+	 * off). Set SP1_U1_SOF_OFF=0 and CONFIG_UDC_ENABLE_SOF=y to
+	 * restore the old path. */
+	g_t_sof += (uint32_t)(DWT->CYCCNT - _t80);
 }
 
 static struct uac2_ops sp1_uac2_ops = {
@@ -5106,6 +6529,172 @@ static uint32_t semitone_next(uint32_t sp, int dir)
 
 static void controls_diag(void)
 {
+	{ /* BF: bug #116 + #117 evidence, one line.
+	   *   inv=   stale shadow discarded on a slot change (bug window was live)
+	   *   stale= serve passed on a stale slot -- MUST BE 0
+	   *   cid=   codec id stamped into the v3 table (4 = SP1-ADPCM7)
+	   *   flg=   v3 flags byte, bit0 = stereo content */
+	  uint32_t _dbf = 0;
+	  (void)uart_line_ctrl_get(cdc, UART_LINE_CTRL_DTR, &_dbf);
+	  if (_dbf) {
+		printk("BF,inv=%u,stale=%u,cid=%u,flg=%u\n",
+		       (unsigned)g_shw_inv, (unsigned)g_shw_stale,
+		       (unsigned)g_x3.t[g_slot][0].codec_id,
+		       (unsigned)g_x3.t[g_slot][0].flags);
+	  }
+	}
+	{ /* M80: USB path meters, CUMULATIVE ms (Protocol A applies).
+	   * res = all-thread runtime minus our four threads = USB
+	   * cluster + idle; only meaningful under load (M35: idle=0
+	   * at the max corner). */
+	  uint32_t _d80 = 0;
+	  (void)uart_line_ctrl_get(cdc, UART_LINE_CTRL_DTR, &_d80);
+	  if (_d80) {
+		k_thread_runtime_stats_t _rs;
+		uint64_t _all = 0, _kn = 0;
+		if (!k_thread_runtime_stats_all_get(&_rs)) _all = _rs.execution_cycles;
+		if (!k_thread_runtime_stats_get(&audio_tcb, &_rs))    _kn += _rs.execution_cycles;
+		if (!k_thread_runtime_stats_get(&streamer_tcb, &_rs)) _kn += _rs.execution_cycles;
+		if (!k_thread_runtime_stats_get(&midi_tcb, &_rs))     _kn += _rs.execution_cycles;
+		if (!k_thread_runtime_stats_get(k_current_get(), &_rs)) _kn += _rs.execution_cycles;
+		/* M80-r2: cb/sof are DWT (64 MHz -> /64000 = ms). res/all are
+		 * RUNTIME-STATS cycles -- the 32768 Hz RTC on this config, NOT
+		 * DWT. r1 divided them by 64000 and printed 0 forever (time-base
+		 * artifact #6). Print them RAW; the host divides by 32.768/ms. */
+		{ /* M90: live snapshot, any state (artifact #9 fix) */
+		  uint32_t _bg90 = 0;
+		  for (int _i90 = 0; _i90 < NTRK; _i90++) {
+			uint32_t _g90 = trk[_i90].r_w - trk[_i90].r_r;
+			if (_g90 >= _bg90) { _bg90 = _g90;
+			  { uint32_t _g4 = 0;
+		  for (int _i4 = 0; _i4 < NTRK; _i4++) {
+			uint32_t _d4 = trk[_i4].r_w - trk[_i4].r_r;
+			if (_d4 > _g4) _g4 = _d4;
+		  }
+		  if (_g4 > g_gap_max) g_gap_max = _g4; }
+		g_dbg_rw = trk[_i90].r_w; g_dbg_rr = trk[_i90].r_r;
+			  g_dbg_rc = trk[_i90].rec_count; }
+		  }
+		}
+		printk("M81,d=%u,a=%u,b=%u,c=%u,dm=%u,am=%u,bm=%u,cm=%u,r=%u,t=%u,tm=%u,rw=%u,rr=%u,rc=%u,em=%u\n",
+		       (unsigned)(g_ph[0] / 64000u), (unsigned)(g_ph[1] / 64000u),
+		       (unsigned)(g_ph[2] / 64000u), (unsigned)(g_ph[3] / 64000u),
+		       (unsigned)g_phmax[0], (unsigned)g_phmax[1],
+		       (unsigned)g_phmax[2], (unsigned)g_phmax[3],
+		       (unsigned)(g_pa82[0] / 64000u), (unsigned)(g_pa82[1] / 64000u),
+		       (unsigned)g_t1min, (unsigned)g_dbg_rw,
+		       (unsigned)g_dbg_rr, (unsigned)g_dbg_rc,
+		       (unsigned)g_enmin);
+		printk("M8X,d=%u,a=%u,b=%u,c=%u,blk=%u\n",
+		       (unsigned)(g_cph[0] / 64u), (unsigned)(g_cph[1] / 64u),
+		       (unsigned)(g_cph[2] / 64u), (unsigned)(g_cph[3] / 64u),
+		       (unsigned)g_cph_blk);
+		printk("M8Y,d=%u,a=%u,b=%u,c=%u,blk=%u\n",
+		       (unsigned)(g_dph[0] / 64u), (unsigned)(g_dph[1] / 64u),
+		       (unsigned)(g_dph[2] / 64u), (unsigned)(g_dph[3] / 64u),
+		       (unsigned)g_dph_blk);
+		printk("M80,up=%u,cb=%u,sof=%u,res=%u,all=%u,pk=%u,sf=%u\n",
+		       (unsigned)k_uptime_get_32(),
+		       (unsigned)(g_t_cb / 64000u), (unsigned)(g_t_sof / 64000u),
+		       (unsigned)(_all > _kn ? _all - _kn : 0u),
+		       (unsigned)_all,
+		       (unsigned)g_usb_pkts, (unsigned)g_sof_cnt);
+	  }
+	}
+	{ /* M73: CUMULATIVE ms per streamer phase since boot.
+	   * CUMULATIVE, not per-second deltas, so PROTOCOL A applies:
+	   * run the corner with NO monitor, connect AFTERWARDS, and this
+	   * one line carries the whole run. M71-r5 proved the diag
+	   * printing is itself part of the storm load, so a per-second
+	   * phase readout would have measured its own weight. */
+	  uint32_t _d73 = 0;
+	  (void)uart_line_ctrl_get(cdc, UART_LINE_CTRL_DTR, &_d73);
+	  if (_d73) {
+		/* DWT->CYCCNT is the 64 MHz core counter, so 64000 cycles = 1 ms
+		 * exactly -- no rounding constant to get wrong. */
+		printk("M73,up=%u,rd=%u,dc=%u,en=%u,wr=%u,dcc=%u,"
+		       "dcu=%u,dcp=%u,dcr=%u\n",
+		       (unsigned)k_uptime_get_32(),
+		       (unsigned)(g_t_rd / 64000u), (unsigned)(g_t_dc / 64000u),
+		       (unsigned)(g_t_en / 64000u), (unsigned)(g_t_wr / 64000u),
+		       (unsigned)g_dcc, (unsigned)g_dcu,
+		       (unsigned)g_dcp, (unsigned)g_dcr);
+		printk("M73CX,rd=%llu/%u,dc=%llu/%u,en=%llu/%u,wr=%llu/%u\n",
+		       (unsigned long long)g_t_rd_cx, g_t_rd_cxn,
+		       (unsigned long long)g_t_dc_cx, g_t_dc_cxn,
+		       (unsigned long long)g_t_en_cx, g_t_en_cxn,
+		       (unsigned long long)g_t_wr_cx, g_t_wr_cxn);
+		printk("STV,lo=%u,up=%u,cx=%u,pf=%u,rhw=%u\n",
+		       (unsigned)g_stv_lo, (unsigned)g_stv_up,
+		       (unsigned)g_stv_cx, (unsigned)g_stv_pf, (unsigned)g_rw_hw);
+
+		printk("BTN,lat=%u,max=%u\n",
+		       (unsigned)g_stop_lat_ms, (unsigned)g_stop_lat_max);
+
+
+		printk("W4P,pk=%u,pb=%u,sq=%u,tq=%u\n",
+		       (unsigned)g_w4_pk, (unsigned)g_w4_pb,
+		       (unsigned)g_w4_sq, (unsigned)g_w4_tq);
+		{   /* CX-r2: EVERY tick. The once-per-boot guard cost the
+		     * 435 run its thread map. */
+			g_w4n_once = 1;
+			extern struct k_thread z_main_thread;
+			extern struct k_work_q k_sys_work_q;
+			printk("W4N,aud=%p,str=%p,midi=%p,main=%p,sysq=%p\n",
+			       (void *)&audio_tcb, (void *)&streamer_tcb,
+			       (void *)&midi_tcb, (void *)&z_main_thread,
+			       (void *)&k_sys_work_q.thread);
+		}
+		printk("W4G,gmax=%u\n", (unsigned)g_gap_max);
+		printk("SHW,wm=%u,%u,%u,%u,blk=%u,sk=%u,arm=%u\n",
+		       (unsigned)g_shw_wm[0], (unsigned)g_shw_wm[1],
+		       (unsigned)g_shw_wm[2], (unsigned)g_shw_wm[3],
+		       (unsigned)g_shw_blk, (unsigned)g_shw_skip,
+		       (unsigned)g_shw_armed);
+		printk("SHR,hit=%u\n", (unsigned)g_shw_hit);
+		printk("W4C,%p:%u,%p:%u,%p:%u,%p:%u,%p:%u,%p:%u,%p:%u,%p:%u,m=%u,str=%p\n",
+		       g_w4c_tab[0].tid, (unsigned)g_w4c_tab[0].n,
+		       g_w4c_tab[1].tid, (unsigned)g_w4c_tab[1].n,
+		       g_w4c_tab[2].tid, (unsigned)g_w4c_tab[2].n,
+		       g_w4c_tab[3].tid, (unsigned)g_w4c_tab[3].n,
+		       g_w4c_tab[4].tid, (unsigned)g_w4c_tab[4].n,
+		       g_w4c_tab[5].tid, (unsigned)g_w4c_tab[5].n,
+		       g_w4c_tab[6].tid, (unsigned)g_w4c_tab[6].n,
+		       g_w4c_tab[7].tid, (unsigned)g_w4c_tab[7].n,
+		       (unsigned)g_w4c_miss, (void *)g_str_tid);
+		printk("W4X,%u,%u,%u,%u,%u,%u,%u,%u,tot=%u,hs=%u\n",
+		       (unsigned)g_cx_n[0], (unsigned)g_cx_n[1],
+		       (unsigned)g_cx_n[2], (unsigned)g_cx_n[3],
+		       (unsigned)g_cx_n[4], (unsigned)g_cx_n[5],
+		       (unsigned)g_cx_n[6], (unsigned)g_cx_n[7],
+		       (unsigned)g_cx_tot, (unsigned)g_cx_hs);
+	  }
+	}
+	{ /* M72: table health + track-1 exact length (a non-multiple of
+	   * 256 surviving a power cycle is the PASS) */
+	  uint32_t _d72 = 0;
+	  (void)uart_line_ctrl_get(cdc, UART_LINE_CTRL_DTR, &_d72);
+	  if (_d72)
+		printk("M72,x3ok=%u,l0=%u,s0=%u\n", (unsigned)g_x3_ok,
+		       (unsigned)trk[0].len_samps, (unsigned)trk[0].start_samps);
+	}
+	{ /* M71: async-read health, once per diag cycle (deltas) */
+	  static uint32_t _p_as, _p_rt, _p_fb; uint32_t _d = 0;
+	  (void)uart_line_ctrl_get(cdc, UART_LINE_CTRL_DTR, &_d);
+	  if (_d) {
+		static uint32_t _p_ca, _p_rq, _p_rd, _p_wu;
+		printk("M71,as=%u,rt=%u,fb=%u,ca=%u,rq=%u,rd=%u,wu=%u,ovf=%u\n",
+		       (unsigned)(g_m71_as - _p_as),
+		       (unsigned)(g_m71_rt - _p_rt),
+		       (unsigned)(g_m71_fb - _p_fb),
+		       (unsigned)(g_m71_ca - _p_ca),
+		       (unsigned)(g_m71_rq - _p_rq),
+		       (unsigned)(g_m71_rd - _p_rd),
+		       (unsigned)(g_m71_wu - _p_wu), (unsigned)g_prime_ovf);
+		_p_as = g_m71_as; _p_rt = g_m71_rt; _p_fb = g_m71_fb;
+		_p_ca = g_m71_ca; _p_rq = g_m71_rq; _p_rd = g_m71_rd; _p_wu = g_m71_wu;
+	  }
+	}
 	/* Stream one status line over USB-serial, but ONLY when a host has opened
 	 * the port (DTR asserted) — otherwise printk could stall the control loop.
 	 * Throttled by the caller. Healthy: tracks PLAY, ovr=0 (no record-buffer
@@ -6056,7 +7645,12 @@ int main(void)
 	 * Preempting the streamer is harmless NOW: the rings ride 341 ms and
 	 * every bus wait is fail-safe/time-bounded — a few ms of ladder reads or
 	 * CDC prints cannot overflow anything. Responsiveness is structural. */
-	k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(1));
+	/* W3-r5: PREEMPT(2), not (1) -- the streamer's pressure sprint
+	 * boosts to PREEMPT(1) and Zephyr does not preempt on ties, so
+	 * at (1) main kept every cycle it held (census §48). At (2) the
+	 * sprint takes the CPU during rec pressure; the 150/15 duty
+	 * still hands main the level back every 165 ms (WDT, buttons). */
+	k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(2));
 
 	const struct device *wdt = DEVICE_DT_GET(WDT_NODE);
 
@@ -7300,6 +8894,7 @@ int main(void)
 			 * value resets the counter, so a steady hold can never false-trigger. */
 			static enum trk_btn committed = TRK_NONE, cand = TRK_NONE;
 			static int cand_cnt;
+			static int64_t cand_t0;              /* M96: first sighting of `cand` */
 			static int64_t press_t[NTRK];        /* when committed first named this track */
 			static int64_t tap_deadline[NTRK];   /* >0: a single tap awaiting a possible 2nd */
 			static uint8_t armed_press[NTRK];    /* this press already armed a take */
@@ -7326,7 +8921,7 @@ int main(void)
 			 * ladder until it reads idle. */
 			if (ctl_flush) {
 				ctl_flush = 0;
-				committed = TRK_NONE; cand = TRK_NONE; cand_cnt = 0;
+				committed = TRK_NONE; cand = TRK_NONE; cand_cnt = 0; cand_t0 = 0;
 				for (int k = TRK_1; k <= TRK_PLAY; k++) ep_time[k] = 0;
 				ep_open = 0; ep_play_held = 0;
 				play_t = -1; play_held = 0;
@@ -7336,12 +8931,26 @@ int main(void)
 				raw = TRK_NONE;
 			}
 			enum trk_btn before = committed;
+			/* M96: TIME-BASED commit. Was `++cand_cnt >= 3`, i.e. three
+			 * control passes -- which reads as 24 ms only while the pass
+			 * runs every 8 ms. k_msleep(8) is a FLOOR; under corner load
+			 * the pass stretches and the gesture stretched with it.
+			 * Healthy behaviour is IDENTICAL: at an 8 ms pass the 2nd
+			 * confirming read is at 16 ms (< 24), so commit still lands
+			 * on the 3rd at ~24 ms. Glitch rejection unchanged -- a lone
+			 * bad read still falls to the else and restarts the window. */
 			if (raw == committed) {
 				cand_cnt = 0;
 			} else if (raw == cand) {
-				if (++cand_cnt >= 3) { committed = raw; cand_cnt = 0; }
+				int64_t _el96 = k_uptime_get() - cand_t0;
+				if (++cand_cnt >= 2 && _el96 >= BTN_DEBOUNCE_MS) {
+					committed = raw; cand_cnt = 0;
+					g_stop_lat_ms = (uint32_t)_el96;
+					if ((uint32_t)_el96 > g_stop_lat_max)
+						g_stop_lat_max = (uint32_t)_el96;
+				}
 			} else {
-				cand = raw; cand_cnt = 1;
+				cand = raw; cand_cnt = 1; cand_t0 = k_uptime_get();
 			}
 
 			/* TRACK buttons:
