@@ -4106,7 +4106,12 @@ static inline __attribute__((always_inline)) int16_t a7_decode(struct a7_dec *st
 	st->p2 = st->p1; st->p1 = rec;
 	return (int16_t)rec;
 }
-static int16_t a7_scrL[280], a7_scrR[280];   /* streamer-only scratch */
+static int16_t a7_scrL[280], a7_scrR[280];   /* streamer-only scratch (A7 SONGS) */
+/* IL-489: PCM14S decodes into ONE INTERLEAVED buffer so the
+ * scratch->ring copy becomes two straight 32-bit memcpy spans
+ * instead of a 16-bit-at-a-time interleave. Frame f is at
+ * [f*2] = L, [f*2+1] = R. 562 not 560: see the upsample note. */
+static int16_t p14s_scr[562] __attribute__((aligned(4)));
 static uint8_t a7_codes[560];
 static void a7_emit_block_i(const int16_t *ring, uint32_t ring_mask,
 			  uint32_t start, struct a7_enc *eL,
@@ -4677,16 +4682,18 @@ static void p14s_dec_scr(const uint8_t *blk)
 		int32_t s3 = (int32_t)( _b32        & 0x3FFFu);
 		if (s0 > 8191) s0 -= 16384; if (s1 > 8191) s1 -= 16384;
 		if (s2 > 8191) s2 -= 16384; if (s3 > 8191) s3 -= 16384;
-		a7_scrL[i * 2u]        = (int16_t)((s0 << 2) >> _sh);   /* BG-470 */
-		a7_scrR[i * 2u]        = (int16_t)((s1 << 2) >> _sh);
-		a7_scrL[(i + 1u) * 2u] = (int16_t)((s2 << 2) >> _sh);
-		a7_scrR[(i + 1u) * 2u] = (int16_t)((s3 << 2) >> _sh);
+		p14s_scr[i * 4u]        = (int16_t)((s0 << 2) >> _sh);  /* BG-470 */
+		p14s_scr[i * 4u + 1u]   = (int16_t)((s1 << 2) >> _sh);
+		p14s_scr[i * 4u + 4u]   = (int16_t)((s2 << 2) >> _sh);
+		p14s_scr[i * 4u + 5u]   = (int16_t)((s3 << 2) >> _sh);
 	}
-	for (uint32_t j = 0; j < 279u; j += 2u) {
-		a7_scrL[j + 1u] = (int16_t)(((int32_t)a7_scrL[j] + a7_scrL[j + 2u]) >> 1);
-		a7_scrR[j + 1u] = (int16_t)(((int32_t)a7_scrR[j] + a7_scrR[j + 2u]) >> 1);
+	for (uint32_t j = 0; j < 277u; j += 2u) {   /* IL-489: was 279u, OOB */
+		p14s_scr[j * 2u + 2u] = (int16_t)(((int32_t)p14s_scr[j * 2u]
+						  + p14s_scr[j * 2u + 4u]) >> 1);
+		p14s_scr[j * 2u + 3u] = (int16_t)(((int32_t)p14s_scr[j * 2u + 1u]
+						  + p14s_scr[j * 2u + 5u]) >> 1);
 	}
-	a7_scrL[279] = a7_scrL[278]; a7_scrR[279] = a7_scrR[278];
+	p14s_scr[558] = p14s_scr[556]; p14s_scr[559] = p14s_scr[557];
 	M73_ADD(g_t_ps);   /* UP-476 */
 }
 
@@ -4713,23 +4720,27 @@ static void p14s_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 				uint32_t _base = s0 & ring_mask;
 				uint32_t _run  = _cap - _base;
 				if (_run > SAMP_PER_BLK) _run = SAMP_PER_BLK;
-				int16_t *_d = ring + (size_t)_base * 2u;
-				const int16_t *_pL = a7_scrL, *_pR = a7_scrR;
-				for (uint32_t f = 0; f < _run; f++) {
-					*_d++ = *_pL++; *_d++ = *_pR++;
-				}
+				/* W2X-490: ONE 32-bit word per FRAME, INLINE.
+				 * 489 used memcpy() with a RUNTIME size -- GCC cannot
+				 * inline that, so it emitted `bl memcpy` into libc and
+				 * the copy got 3x SLOWER than the -O2 hand loop (W44).
+				 * Both sides are aligned(4), so a word move is legal and
+				 * halves the memory ops: 560 halfwords -> 280 words. */
+				uint32_t *_d32 = (uint32_t *)(void *)
+						(ring + (size_t)_base * 2u);
+				const uint32_t *_s32 = (const uint32_t *)(const void *)p14s_scr;
+				for (uint32_t f = 0; f < _run; f++) *_d32++ = *_s32++;
 				if (_run < SAMP_PER_BLK) {
-					_d = ring;
-					for (uint32_t f = _run; f < SAMP_PER_BLK; f++) {
-						*_d++ = *_pL++; *_d++ = *_pR++;
-					}
+					_d32 = (uint32_t *)(void *)ring;
+					for (uint32_t f = _run; f < SAMP_PER_BLK; f++)
+						*_d32++ = *_s32++;
 				}
 			}
 			{ uint32_t hp = ((s0 - 1u) & ring_mask) * 2u;
-			  ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + a7_scrL[0]) >> 1);
-			  ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + a7_scrR[0]) >> 1); }
-			g_p14s_prev[trk][0] = a7_scrL[278];
-			g_p14s_prev[trk][1] = a7_scrR[278];
+			  ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + p14s_scr[0]) >> 1);
+			  ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + p14s_scr[1]) >> 1); }
+			g_p14s_prev[trk][0] = p14s_scr[556];
+			g_p14s_prev[trk][1] = p14s_scr[557];
 		} else {
 			codec_unpack(ring, ring_mask, s0, blk, 1u);
 		}
@@ -4761,22 +4772,22 @@ static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 			p14s_dec_scr(blk);
 			for (uint32_t k = 0; k < run; k++) {
 				uint32_t fi = ((start + done + k) & ring_mask) * 2u;
-				ring[fi]      = a7_scrL[off + k];
-				ring[fi + 1u] = a7_scrR[off + k];
+				ring[fi]      = p14s_scr[(off + k) * 2u];
+				ring[fi + 1u] = p14s_scr[(off + k) * 2u + 1u];
 			}
 			if (off == 0u) {
 				/* block ENTRY: heal the previous engine frame
 				 * (written by an earlier pass or the loop seam)
 				 * exactly like the full path. */
 				uint32_t hp = ((start + done - 1u) & ring_mask) * 2u;
-				ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + a7_scrL[0]) >> 1);
-				ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + a7_scrR[0]) >> 1);
+				ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + p14s_scr[0]) >> 1);
+				ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + p14s_scr[1]) >> 1);
 			}
 			if (off + run >= 279u) {
 				/* this pass decoded through the block's last stored
 				 * frame -> it becomes the prev for the next entry. */
-				g_p14s_prev[trk][0] = a7_scrL[278];
-				g_p14s_prev[trk][1] = a7_scrR[278];
+				g_p14s_prev[trk][0] = p14s_scr[556];
+				g_p14s_prev[trk][1] = p14s_scr[557];
 			}
 		} else {
 			codec_unpack_part(ring, ring_mask, start + done, flash, f, run);
@@ -4794,8 +4805,8 @@ static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
 			p14s_dec_scr(blk);
 			for (uint32_t f = 0; f < SAMP_PER_BLK; f++) {
 				uint32_t fi = ((start + b * SAMP_PER_BLK + f) & ring_mask) * 2u;
-				ring[fi]      = a7_scrL[SAMP_PER_BLK - 1u - f];
-				ring[fi + 1u] = a7_scrR[SAMP_PER_BLK - 1u - f];
+				ring[fi]      = p14s_scr[(SAMP_PER_BLK - 1u - f) * 2u];
+				ring[fi + 1u] = p14s_scr[(SAMP_PER_BLK - 1u - f) * 2u + 1u];
 			}
 		} else {
 			codec_unpack_rev(ring, ring_mask, start + b * SAMP_PER_BLK, blk, 1u);
