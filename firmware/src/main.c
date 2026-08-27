@@ -803,6 +803,16 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 #define TRACK_BLOCKS     ((((MAX_LOOP_BLOCKS + 8u) + 4095u) / 4096u) * 4096u)
 #define RING_SAMPLES     8192u   /* M63a: STEREO FRAMES (~170 ms @48k; was 16384 mono) */                            /* ~341 ms read-ahead @48k (reverted 8192->16384 to give the compressed codecs comfortable play-ring margin) */
 #define RING_MASK        (RING_SAMPLES - 1u)
+/* RA-491: how full a STARVED track's ring must get before it is
+ * audible again. Was RING_SAMPLES/2 = 4096 frames = 14.6 blocks =
+ * ~85 ms of SILENCE on that track for a ring that ran dry by TWO
+ * frames. The starve COUNT was never the audible thing -- the HOLE
+ * each starve opens is. /8 = 1024 frames = ~21 ms, still 4x the
+ * 5 ms fade-in ramp, so there is real hysteresis left.
+ * TE's own engine holds the last good frame on a late read
+ * (KB references/12-audio-engine-internals.md: held_frame_), i.e.
+ * it never opens a hole at all. This is the cheap half of that. */
+#define PLAY_REARM_FRAMES (RING_SAMPLES / 8u)
 /* Play-ring critical margin for scheduling decisions: 128 ms expressed in
  * samples at the loop rate — EXPLICIT and codec-independent (the old
  * 24u*SAMP_PER_BLK silently varied 2.5x across codec block sizes). */
@@ -1375,6 +1385,13 @@ static volatile uint32_t g_cx_tot, g_cx_hs;
 static volatile bool g_usb_streaming;
 static volatile uint32_t g_cy_n[8];
 static volatile uint32_t g_cy_tot;
+/* RC-484: the RECORD corner at ANY speed -- marc's real workflow.
+ * Same 8 indices; the only gate is that a take is recording. */
+static volatile uint32_t g_cz_n[8];
+static volatile uint32_t g_cz_tot;
+/* EP-484: the PCM14S packer, gated on the record corner. */
+static volatile uint64_t g_t_ep;
+static volatile uint32_t g_t_epn, g_ep_blk;
 static volatile uint32_t g_gap_max;   /* W4N: worst rec-ring gap this boot */
 static uint8_t g_w4n_once;
 static uint8_t g_w4c_on;
@@ -1385,14 +1402,17 @@ static void w4c_tick(struct k_timer *t)
 	int _cxhs = (g_cur_speed_q16 >= CX_SPEED_MIN);
 	int _cx = _cxhs && (g_rec_track >= 0);
 	int _cy = _cxhs && g_usb_streaming;   /* CXW-473: input corner */
+	int _cz = (g_rec_track >= 0);         /* RC-484: record, ANY speed */
 	if (_cxhs) g_cx_hs++;
 	for (int i = 0; i < 8; i++) {
 		if (g_w4c_tab[i].tid == cur) { g_w4c_tab[i].n++;
 			if (_cx) { g_cx_n[i]++; g_cx_tot++; }
-			if (_cy) { g_cy_n[i]++; g_cy_tot++; } return; }
+			if (_cy) { g_cy_n[i]++; g_cy_tot++; }
+			if (_cz) { g_cz_n[i]++; g_cz_tot++; } return; }
 		if (!g_w4c_tab[i].tid) { g_w4c_tab[i].tid = cur; g_w4c_tab[i].n = 1;
 			if (_cx) { g_cx_n[i] = 1; g_cx_tot++; }
-			if (_cy) { g_cy_n[i] = 1; g_cy_tot++; } return; }
+			if (_cy) { g_cy_n[i] = 1; g_cy_tot++; }
+			if (_cz) { g_cz_n[i] = 1; g_cz_tot++; } return; }
 	}
 	g_w4c_miss++;
 }
@@ -1545,7 +1565,9 @@ static volatile uint32_t g_stv_lo;   /* below high speed              */
 static volatile uint32_t g_stv_up;   /* high speed, NOT recording     */
 static volatile uint32_t g_stv_cx;   /* high speed AND recording      */
 static volatile uint32_t g_stv_pf;   /* a take still flushing         */
+static volatile uint32_t g_stv_re;   /* RA-491: starve DURING fade-in */
 #define STV_BUMP() do { \
+        if (trk[i].fade < 256u) g_stv_re++;   /* RA-491 thrash */ \
         if (g_cur_speed_q16 < CX_SPEED_MIN) g_stv_lo++; \
         else if (g_rec_track >= 0)          g_stv_cx++; \
         else if (g_done_pending)            g_stv_pf++; \
@@ -3493,7 +3515,7 @@ static void looper_audio_block(int16_t *s)
 			 * (recovering earlier re-dips and chatters — hardware-tested). */
 			int32_t avail = (int32_t)(trk[i].p_w - cpos);
 			if (trk[i].starved) {
-				if (avail >= (int32_t)(RING_SAMPLES / 2u)) {
+				if (avail >= (int32_t)PLAY_REARM_FRAMES) {
 					trk[i].starved = 0;
 					trk[i].fade = 0;   /* ramp back in (~5 ms), no click */
 				} else {
@@ -4542,9 +4564,14 @@ static volatile uint32_t g_m71_ca, g_m71_rq, g_m71_rd, g_m71_wu;
  * frame (per-track state); seam/reverse paths duplicate one frame.
  * 64-bit pack shifts (4 x 14 = 56 bits) -- see 459's C-port note. */
 
+/* PK32-484: the last PCM14S hot function still at -Os. Stage K gave
+ * the A7 encoder -O2 and 479 gave the decoder -O2; this is the
+ * encode side of marc's record corner. */
+__attribute__((optimize("O2")))
 static void p14s_pack_blocks(const int16_t *ring, uint32_t ring_mask,
 			     uint32_t start, uint8_t *out, uint32_t nblk)
 {
+	uint32_t _tep = DWT->CYCCNT;   /* EP-484 */
 	for (uint32_t b = 0; b < nblk; b++) {
 		uint8_t *blk = out + b * EMMC_BLOCK_SIZE;
 		uint32_t f0 = start + b * 140u;   /* CD-463: STORED (24k) frames */
@@ -4595,14 +4622,29 @@ static void p14s_pack_blocks(const int16_t *ring, uint32_t ring_mask,
 					q4[k * 2u + c] = q;
 				}
 			}
-			uint64_t v64 = ((uint64_t)((uint32_t)q4[0] & 0x3FFFu) << 42) |
-			               ((uint64_t)((uint32_t)q4[1] & 0x3FFFu) << 28) |
-			               ((uint64_t)((uint32_t)q4[2] & 0x3FFFu) << 14) |
-			                (uint64_t)((uint32_t)q4[3] & 0x3FFFu);
-			for (uint32_t k2 = 0; k2 < 7u; k2++)
-				blk[o + k2] = (uint8_t)(v64 >> (48u - 8u * k2));
+			{	/* PK32-484: two 32-bit words, no 64-bit arithmetic.
+				 * Exact inverse of the 477 decode. */
+				uint32_t _p0 = (uint32_t)q4[0] & 0x3FFFu;
+				uint32_t _p1 = (uint32_t)q4[1] & 0x3FFFu;
+				uint32_t _p2 = (uint32_t)q4[2] & 0x3FFFu;
+				uint32_t _p3 = (uint32_t)q4[3] & 0x3FFFu;
+				uint32_t _pa = (_p0 << 18) | (_p1 << 4) | (_p2 >> 10);
+				uint32_t _pb = (_p2 << 14) | _p3;
+				blk[o     ] = (uint8_t)(_pa >> 24);
+				blk[o + 1u] = (uint8_t)(_pa >> 16);
+				blk[o + 2u] = (uint8_t)(_pa >>  8);
+				blk[o + 3u] = (uint8_t)(_pa);
+				blk[o + 4u] = (uint8_t)(_pb >> 16);
+				blk[o + 5u] = (uint8_t)(_pb >>  8);
+				blk[o + 6u] = (uint8_t)(_pb);
+			}
 			o += 7u;
 		}
+	}
+	if (g_rec_track >= 0) {   /* EP-484: record corner, any speed */
+		g_t_ep += (uint32_t)(DWT->CYCCNT - _tep);
+		g_t_epn++;
+		g_ep_blk += nblk;
 	}
 }
 
@@ -6867,10 +6909,15 @@ static void controls_diag(void)
 		       (unsigned long long)g_t_pk_cy, g_t_pk_cyn,
 		       (unsigned long long)g_t_ps_cy, g_t_ps_cyn,
 		       (unsigned)g_pk_blk);
+		printk("EP,cyc=%llu,n=%u,blk=%u\n",
+		       (unsigned long long)g_t_ep,
+		       (unsigned)g_t_epn, (unsigned)g_ep_blk);
 
 
-		printk("STV,lo=%u,up=%u,cx=%u,pf=%u,rhw=%u\n",
+
+		printk("STV,lo=%u,up=%u,cx=%u,pf=%u,re=%u,rhw=%u\n",
 		       (unsigned)g_stv_lo, (unsigned)g_stv_up,
+		       (unsigned)g_stv_re,
 		       (unsigned)g_stv_cx, (unsigned)g_stv_pf, (unsigned)g_rw_hw);
 
 		printk("BTN,lat=%u,max=%u\n",
@@ -6958,6 +7005,12 @@ static void controls_diag(void)
 		       (unsigned)g_cy_n[4], (unsigned)g_cy_n[5],
 		       (unsigned)g_cy_n[6], (unsigned)g_cy_n[7],
 		       (unsigned)g_cy_tot, (unsigned)g_cx_hs);
+		printk("W4Z,%u,%u,%u,%u,%u,%u,%u,%u,tot=%u\n",
+		       (unsigned)g_cz_n[0], (unsigned)g_cz_n[1],
+		       (unsigned)g_cz_n[2], (unsigned)g_cz_n[3],
+		       (unsigned)g_cz_n[4], (unsigned)g_cz_n[5],
+		       (unsigned)g_cz_n[6], (unsigned)g_cz_n[7],
+		       (unsigned)g_cz_tot);
 	  }
 	}
 	{ /* M72: table health + track-1 exact length (a non-multiple of
