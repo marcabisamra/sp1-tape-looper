@@ -3458,9 +3458,9 @@ static void looper_audio_block(int16_t *s)
 				uint32_t _b1 = ((posb[0] + 1) & RING_MASK) * 2u;
 				int16_t bL = pr[_b1], bR = pr[_b1 + 1u];
 				svL = (int16_t)((int32_t)aL +
-					(int32_t)(((int64_t)(bL - aL) * (int32_t)fracb[0]) >> 16));
+					(int32_t)(((bL - aL) * (int32_t)((fracb[0]) >> 1)) >> 15));
 				svR = (int16_t)((int32_t)aR +
-					(int32_t)(((int64_t)(bR - aR) * (int32_t)fracb[0]) >> 16));
+					(int32_t)(((bR - aR) * (int32_t)((fracb[0]) >> 1)) >> 15));
 			}
 			if (avail < 256) {
 				svL = (int16_t)(((int32_t)svL * avail) >> 8);
@@ -3499,9 +3499,9 @@ static void looper_audio_block(int16_t *s)
 					uint32_t _b1 = ((cpos + 1) & RING_MASK) * 2u;
 					int16_t bL = pr[_b1], bR = pr[_b1 + 1u];
 					svL = (int16_t)((int32_t)aL +
-						(int32_t)(((int64_t)(bL - aL) * (int32_t)frac) >> 16));
+						(int32_t)(((bL - aL) * (int32_t)((frac) >> 1)) >> 15));
 					svR = (int16_t)((int32_t)aR +
-						(int32_t)(((int64_t)(bR - aR) * (int32_t)frac) >> 16));
+						(int32_t)(((bR - aR) * (int32_t)((frac) >> 1)) >> 15));
 				}
 				mix32[f]  += ((int32_t)svL * vol) >> 8;
 				mix32R[f] += ((int32_t)svR * vol) >> 8;
@@ -3537,9 +3537,9 @@ static void looper_audio_block(int16_t *s)
 				/* int64 product: (b-a)*frac can exceed INT32_MAX = signed-
 				 * overflow UB; the cast keeps it defined (SMULL on M4). */
 				sv = (int16_t)((int32_t)aL +
-					(int32_t)(((int64_t)(bL - aL) * (int32_t)frac) >> 16));
+					(int32_t)(((bL - aL) * (int32_t)((frac) >> 1)) >> 15));
 				svR2 = (int16_t)((int32_t)aR +
-					(int32_t)(((int64_t)(bR - aR) * (int32_t)frac) >> 16));
+					(int32_t)(((bR - aR) * (int32_t)((frac) >> 1)) >> 15));
 			}
 			/* BOUNDARY FADE (unchanged): fade out over the last ~5 ms as
 			 * the ring drains, fade in after recovery — dropouts duck
