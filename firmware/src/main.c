@@ -2161,7 +2161,12 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
 					(*prc)++;
 					{ uint32_t _bl = (*prw) - (*prr);   /* S2CAP meter */
 					  if (_bl > g_rw_hw) g_rw_hw = _bl; }
-					g_pre_w = (*prw);   /* pre-roll follows the take */
+					/* RP: the per-sample pre-roll frontier store is DELETED
+					 * 72,000/s. Its only reader is at block START and the
+					 * block TAIL republishes that global regardless,
+					 * so nothing could ever observe it. (It also means
+					 * "pre-roll follows the take" has not worked since
+					 * M90 -- a real bug, logged, NOT fixed here.) */
 					if (g_tempo.active) tempo_feed(lsamp, (*prc));
 					if ((*ptg) == 0u) {
 						/* OPEN take (first take AND independent overdubs):
@@ -3067,11 +3072,20 @@ static void looper_audio_block(int16_t *s)
 				uint32_t _r82 = DWT->CYCCNT;   /* M82 */
 #endif
 				int rt_i = g_rec_track;
+				/* RP: ONE address computation for the whole iteration.
+				 * rt_i is a local and fixed here, so &trk[rt_i] is
+				 * invariant -- this replaces three movw #32840 + mul
+				 * sequences. Every state READ below stays exactly where
+				 * it was: the arm block changes state mid-iteration and
+				 * the third read is what starts recording on the SAME
+				 * sample the threshold is crossed. NULL when idle; every
+				 * use is short-circuit guarded by rt_i >= 0. */
+				struct looptrk *rt_p = (rt_i >= 0) ? &trk[rt_i] : (struct looptrk *)0;
 				/* M20 PRE-ROLL: nothing capturing and nothing still
 				 * flushing -> the ring is free, so keep the last
 				 * PREROLL_MAX samples of input in it. */
 				if (!g_done_pending &&
-				    (rt_i < 0 || trk[rt_i].state != TS_REC)) {
+				    (rt_i < 0 || rt_p->state != TS_REC)) {
 					{ /* CD-463: 24k pre-roll store (same absolute pair grid) */
 					  if ((_pre_w & 1u) == 0u) { g_cd_holdL = lsamp; g_cd_holdR = rsamp; }
 					  else { uint32_t _fi = ((_pre_w >> 1) & RRING_MASK);
@@ -3080,7 +3094,7 @@ static void looper_audio_block(int16_t *s)
 					_pre_w++;
 					if (_pre_val < PREROLL_MAX) _pre_val++;
 				}
-				if (rt_i >= 0 && trk[rt_i].state == TS_ARMED) {
+				if (rt_i >= 0 && rt_p->state == TS_ARMED) {
 					/* AUTO-START: hold armed until the input first crosses
 					 * the threshold. NO TIMEOUT any more: the old ~4 s
 					 * fallback started recording SILENCE on its own
@@ -3332,7 +3346,7 @@ static void looper_audio_block(int16_t *s)
 #if M82_PROBES
 				g_pa82[0] += DWT->CYCCNT - _r82; _r82 = DWT->CYCCNT;
 #endif
-				if (g_rec_track >= 0 && trk[g_rec_track].state == TS_REC) {
+				if (rt_i >= 0 && rt_p->state == TS_REC) {
 #if M82_PROBES
 					{ uint32_t _c86 = DWT->CYCCNT;
 					  rec_write_sample(lsamp, rsamp);
