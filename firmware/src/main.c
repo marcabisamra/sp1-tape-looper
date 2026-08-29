@@ -856,7 +856,13 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 #  elif SP1_CODEC == SP1_CODEC_ULAW
 #define META_MAGIC       0x53455534u                       /* 'SEU4' — 48 kHz, u-law 8-bit */
 #  else
-#define META_MAGIC       0x53454134u                       /* 'SEA4' — 48 kHz, IMA-ADPCM 4-bit */
+#define META_MAGIC       0x53453341u   /* 'SE3A' 3.0 two-tier. MG-509: was
+ * 0x53454134 'SEA4', which is the 48 kHz IMA-ADPCM magic AND is listed
+ * in SP1-3.0-FORMAT-BREAK-SPEC section 7 among the magics 3.0 must
+ * REFUSE. 500 edited the 'S816' literal instead -- but that lives in the
+ * SP1_CODEC_PCM arm, which the same script kills by selecting A7, so the
+ * edit landed on dead code and the log printed a magic we never built.
+ * THIS line is the live #else arm. Verified from the shipped binary. */                       /* 'SEA4' — 48 kHz, IMA-ADPCM 4-bit */
 #  endif
 #else
 #  if   SP1_CODEC == SP1_CODEC_PCM
@@ -4988,6 +4994,25 @@ static void streamer_thread(void *a, void *b, void *c)
 			memset(metabuf, 0, sizeof(metabuf));
 			memcpy(metabuf, &g_meta, sizeof(g_meta));
 			(void)meta_write_blocks(metabuf);
+			/* GX-509: clear EVERY side table, not just the one whose
+			 * magic changed (W111). GRID_EXT_MAGIC 'GRD1' is UNCHANGED
+			 * between 2.x and 3.0 -- confirmed present in both shipped
+			 * binaries -- and block 2 is read INDEPENDENTLY just below,
+			 * so a 2.7.2 card's per-song grid tempos would survive onto
+			 * the songs we have just cleared. The user would get 16 empty
+			 * songs that already carry tempos, and ungridded first-take
+			 * DETECTION would silently never fire, because a grid already
+			 * exists -- and by M43 a grid, once set, does not move.
+			 * The v3 table is self-validating, so a 2.x card reads as "no
+			 * data" today; but a 3.0 -> 2.x -> 3.0 round trip can leave a
+			 * VALID stale table describing songs that were cleared.
+			 * BUFFER SAFETY (W92): metabuf is META_BLOCKS*512 = 1024 B.
+			 * Never hand a 1024 B buffer to a 3-block write -- one block
+			 * at a time. */
+			memset(metabuf, 0, sizeof(metabuf));
+			(void)emmc_write_blocks(GRID_EXT_BLOCK, metabuf, 1u);
+			for (uint32_t _gb = 0; _gb < X3_NBLK; _gb++)
+				(void)emmc_write_blocks(X3_BLK + _gb, metabuf, 1u);
 		}
 	}
 	/* M8a: grid extension (block 2). Bad tag/sum -> all zeros = no grids. */
