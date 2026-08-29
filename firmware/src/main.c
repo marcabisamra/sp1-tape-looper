@@ -3129,8 +3129,24 @@ static void looper_audio_block(int16_t *s)
 						    now_f > g_grid_anchor) {
 							uint64_t unit = g_grid_beat_frames;
 							uint64_t off = now_f - g_grid_anchor;
-							uint64_t prev = g_grid_anchor +
-									(off / unit) * unit;
+							/* GP-506: this runs once per EMITTED SAMPLE for the
+							 * whole ARMED punch wait -- up to a full beat. The
+							 * 64/64 divide compiled to bl __aeabi_uldivmod
+							 * (~150-190 cyc incl. 14 stack accesses). Both
+							 * operands fit in 32 bits in every reachable case:
+							 * `unit` is a beat in frames (72,000 at the 40 BPM
+							 * floor) and `off` only reaches 2^32 if the anchor is
+							 * more than 24.9 h old. Unsigned division of values
+							 * below 2^32 yields the same quotient at either
+							 * width, and the 64-bit arm is KEPT for the rest, so
+							 * this is bit-exact by construction. */
+							uint64_t _q;
+							if (!(off >> 32) && !(unit >> 32))
+								_q = (uint64_t)((uint32_t)off /
+									       (uint32_t)unit);
+							else
+								_q = off / unit;
+							uint64_t prev = g_grid_anchor + _q * unit;
 							uint64_t back = now_f - prev;
 							uint32_t need = (uint32_t)
 								((back * g_cur_speed_q16) >> 16);
