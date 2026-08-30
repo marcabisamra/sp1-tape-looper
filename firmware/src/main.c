@@ -1142,9 +1142,12 @@ static volatile uint32_t g_grid_base_blocks;
  * build redefines them to read the track's codec geometry. The (void)
  * arg keeps every call site compile-checked NOW, so the later flip
  * cannot surface ~70 latent argument errors at once. */
-#define TSPB(tp)   ((void)(tp), (uint32_t)280u)   /* by looptrk pointer  */
-#define TSPBI(ix)  ((void)(ix), (uint32_t)280u)   /* by track index      */
-#define TLOOPB(ix) ((void)(ix), g_loop_blocks)    /* loop len in track-(ix) blocks */
+#define TSPB(tp)   ((uint32_t)((tp)->p16m ? 496u : 280u))   /* P16-522: LIVE per-track geometry */
+#define TSPBI(ix)  ((uint32_t)(trk[ix].p16m ? 496u : 280u))
+#define TLOOPB(ix) ({ uint32_t _ll = g_loop_len;   /* VF-523: ONE volatile read */ \
+		      _ll ? (uint32_t)((_ll + TSPBI(ix) / 2u) / TSPBI(ix)) : 0u; })
+#define P16M_DEFAULT 1u   /* P16-522 TEST BUILD: every NEW take records MONO.
+                           * The gesture build flips this to 0u + double-tap. */
 
 /* Blocks for n grid beats. Base-referenced when the song has one at the same
  * tempo (siblings then lock exactly); otherwise the whole run is rounded once
@@ -1361,6 +1364,7 @@ static void s8q_dec_span(const uint8_t *sec, uint32_t li, uint32_t cnt,
 }
 
 #define X3_CODEC_P14S 5u
+#define X3_CODEC_P16M 6u   /* P16-522: PCM16-mono take -- 496 engine fr / 248 stored samp per block */
 #define P14S_MARK     0x5Bu
 static uint8_t  g_p14s_mask;              /* bit i: track i is P14S (shadow OFF) */
 static int32_t  g_p14s_e1[2];             /* encode shaper, carried within a take */
@@ -1470,6 +1474,11 @@ enum trk_state { TS_EMPTY, TS_ARMED, TS_REC, TS_DONE, TS_PLAY };
 
 struct looptrk {
 	volatile uint8_t  state;
+	uint8_t  p16m;                       /* P16-522, VF-523: NOT volatile -- see W141.
+	                                      * Written only at take-create/load; a stale
+	                                      * read for one pass is harmless, and volatile
+	                                      * reads at the ~70 geometry sites reproduce
+	                                      * the W139 uniform-stall corner regression. */
 	volatile uint16_t vol_q8;            /* fader volume, 256 = unity */
 	int16_t  pring[RING_SAMPLES * 2u] __attribute__((aligned(4)));
 	                                     /* M63a play ring: STEREO frames (L,R int16
@@ -2912,6 +2921,9 @@ static void looper_audio_block(int16_t *s)
 			/* SEGMENT: restore this track's own length + phase anchor (older saves
 			 * with trk_len==0 fall back to the base length = one segment). */
 			if (pres && g_slot < NUM_SLOTS) {
+				trk[i].p16m = (g_x3_ok && g_x3.t[g_slot][i].codec_id
+				               == X3_CODEC_P16M) ? 1u : 0u;   /* P16-522:
+				               * BEFORE the TSPBI(i) length math below */
 				uint32_t L = g_meta.slot[g_slot].trk_len[i];
 				trk[i].len_blocks = L ? L : TLOOPB(i);
 				{	/* M22-B: rebuild the sample length from the stored
@@ -3296,6 +3308,7 @@ static void looper_audio_block(int16_t *s)
 								 * old floor put every overdub 0-5.3 ms
 								 * early, always early. Full sample
 								 * anchors are Phase B. */
+								rt->p16m = P16M_DEFAULT;   /* P16-522: BEFORE the anchor math */
 								rt->start_blk = (sp + TSPB(rt) / 2u)
 								              / TSPB(rt);
 								rt->start_samps = sp;   /* M22-B: exact */
@@ -3372,6 +3385,7 @@ static void looper_audio_block(int16_t *s)
 						g_p14s_e1[0] = 0; g_p14s_e1[1] = 0; g_p14s_sh = 0u;
 						g_p14s_prev[rt_i][0] = 0; g_p14s_prev[rt_i][1] = 0;
 						g_p14s_mask |= (uint8_t)(1u << rt_i);
+						rt->p16m = P16M_DEFAULT;   /* P16-522 TEST BUILD */
 						rt->state = TS_REC;
 					}
 				}
@@ -4157,7 +4171,7 @@ static int16_t a7_scrL[280], a7_scrR[280];   /* streamer-only scratch (A7 SONGS)
  * scratch->ring copy becomes two straight 32-bit memcpy spans
  * instead of a 16-bit-at-a-time interleave. Frame f is at
  * [f*2] = L, [f*2+1] = R. 562 not 560: see the upsample note. */
-static int16_t p14s_scr[562] __attribute__((aligned(4)));
+static int16_t p14s_scr[994] __attribute__((aligned(4)));   /* P16-522: 2*496+2 (P14S uses [0..561]) */
 static uint8_t a7_codes[560];
 static void a7_emit_block_i(const int16_t *ring, uint32_t ring_mask,
 			  uint32_t start, struct a7_enc *eL,
@@ -4749,15 +4763,81 @@ static void p14s_dec_scr(const uint8_t *blk)
 /* O2P-479: same reasoning -- this carries the scratch->ring copy, which
  * 476 measured at pk - ps = 15.9%% of the corner. */
 __attribute__((optimize("O2")))
+/* ==== P16-522: the PCM16-mono take codec (the spike's PROVEN arms) =====
+ * Storage: 512-B block = 16-B header ('P16M' sig, blk[11]=P14S_MARK kept
+ * so the block-level dispatch is untouched, blk[5]=0 mono, blk[12..13]=496)
+ * + 248 little-endian int16 stored samples (24 kHz mono). Unit map (W136):
+ * pack-internal f0 = STORED frames; decode s0 = ENGINE frames. */
+static void p16m_dec_scr(const uint8_t *blk)
+{
+	/* r2 interp upsample, ear-proven: frame 2i = v[i] (both channels),
+	 * frame 2i+1 = (v[i]+v[i+1]+1)>>1; the final odd frame holds. */
+	for (uint32_t i = 0; i < 248u; i++) {
+		int32_t v  = (int16_t)((uint16_t)blk[16u + i * 2u] |
+		                       ((uint16_t)blk[16u + i * 2u + 1u] << 8));
+		int32_t vn = (i < 247u)
+		           ? (int16_t)((uint16_t)blk[18u + i * 2u] |
+		                       ((uint16_t)blk[19u + i * 2u] << 8))
+		           : v;
+		int32_t h = (v + vn + 1) >> 1;
+		p14s_scr[i * 4u]      = (int16_t)v; p14s_scr[i * 4u + 1u] = (int16_t)v;
+		p14s_scr[i * 4u + 2u] = (int16_t)h; p14s_scr[i * 4u + 3u] = (int16_t)h;
+	}
+}
+
+static void p16m_pack_blocks(const int16_t *ring, uint32_t ring_mask,
+			     uint32_t start, uint8_t *out, uint32_t nblk)
+{
+	/* the spike r4 arm: 248 CONSECUTIVE stored frames per block, stride 1,
+	 * downmix (L+R+1)>>1. start is in STORED (24k) frames -- W136. */
+	for (uint32_t b = 0; b < nblk; b++) {
+		uint8_t *blk = out + b * EMMC_BLOCK_SIZE;
+		uint32_t f0 = start + b * 248u;   /* STORED (24k) frames */
+		blk[0] = 0x50u; blk[1] = 0x31u; blk[2] = 0x36u; blk[3] = 0x4Du;
+		blk[4] = 0; blk[5] = 0; blk[6] = 0; blk[7] = 0;
+		blk[8] = 0; blk[9] = 0; blk[10] = 0; blk[11] = P14S_MARK;
+		blk[12] = (uint8_t)(496u & 0xFFu);
+		blk[13] = (uint8_t)(496u >> 8);
+		blk[14] = 0; blk[15] = 0;
+		uint32_t o = 16u;
+		for (uint32_t i = 0; i < 248u; i++) {
+			uint32_t fa = ((f0 + i) & ring_mask) * 2u;
+			int32_t m = ((int32_t)ring[fa] + (int32_t)ring[fa + 1u] + 1) >> 1;
+			blk[o]      = (uint8_t)((uint16_t)m & 0xFFu);
+			blk[o + 1u] = (uint8_t)((uint16_t)m >> 8);
+			o += 2u;
+		}
+	}
+}
+
+static void takes_pack_blocks(struct looptrk *t, const int16_t *ring,
+			      uint32_t ring_mask, uint32_t start,
+			      uint8_t *out, uint32_t nblk)
+{
+	if (t->p16m) p16m_pack_blocks(ring, ring_mask, start, out, nblk);
+	else         p14s_pack_blocks(ring, ring_mask, start, out, nblk);
+}
+
+/* P16-522: the unpack family parameter is named `trk`, which SHADOWS
+ * the global track array -- TSPBI(trk) would expand to trk[trk].p16m.
+ * This helper lives OUTSIDE the shadowed scope. */
+static uint32_t p16m_trk_spb(int ti)
+{
+	return TSPBI(ti);
+}
+
 static void p14s_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 			const uint8_t *flash, uint32_t nblk, int trk)
 {
 	M73_T0();   /* UP-476 */
+	uint32_t s0 = start;   /* P16-522: stride = the TRACK's geometry */
 	for (uint32_t b = 0; b < nblk; b++) {
 		const uint8_t *blk = flash + b * EMMC_BLOCK_SIZE;
-		uint32_t s0 = start + b * SAMP_PER_BLK;
+		uint32_t _spb = p16m_trk_spb(trk);   /* P16-522: TRACK-driven -- the zeroed
+		                               * silence pad strides correctly too */
 		if (blk[11] == P14S_MARK) {
-			p14s_dec_scr(blk);
+			if (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
+			else                 p14s_dec_scr(blk);
 			{	/* CPY-483: the ring wraps at most once per block, so
 				 * split there and walk pointers instead of recomputing
 				 * (add, AND, shift) for all 280 frames. Bit-exact by
@@ -4765,7 +4845,7 @@ static void p14s_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 				uint32_t _cap  = ring_mask + 1u;
 				uint32_t _base = s0 & ring_mask;
 				uint32_t _run  = _cap - _base;
-				if (_run > SAMP_PER_BLK) _run = SAMP_PER_BLK;
+				if (_run > _spb) _run = _spb;
 				/* W2X-490: ONE 32-bit word per FRAME, INLINE.
 				 * 489 used memcpy() with a RUNTIME size -- GCC cannot
 				 * inline that, so it emitted `bl memcpy` into libc and
@@ -4776,20 +4856,28 @@ static void p14s_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 						(ring + (size_t)_base * 2u);
 				const uint32_t *_s32 = (const uint32_t *)(const void *)p14s_scr;
 				for (uint32_t f = 0; f < _run; f++) *_d32++ = *_s32++;
-				if (_run < SAMP_PER_BLK) {
+				if (_run < _spb) {
 					_d32 = (uint32_t *)(void *)ring;
-					for (uint32_t f = _run; f < SAMP_PER_BLK; f++)
+					for (uint32_t f = _run; f < _spb; f++)
 						*_d32++ = *_s32++;
 				}
 			}
 			{ uint32_t hp = ((s0 - 1u) & ring_mask) * 2u;
 			  ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + p14s_scr[0]) >> 1);
 			  ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + p14s_scr[1]) >> 1); }
-			g_p14s_prev[trk][0] = p14s_scr[556];
-			g_p14s_prev[trk][1] = p14s_scr[557];
+			g_p14s_prev[trk][0] = p14s_scr[_spb * 2u - 4u];   /* last EXACT frame; 556 for P14S */
+			g_p14s_prev[trk][1] = p14s_scr[_spb * 2u - 3u];
+		} else if (_spb == 496u) {
+			/* P16-522: a non-P16M block under a P16M take = the SILENCE
+			 * PAD -- write true silence at the caller's stride. */
+			for (uint32_t f = 0; f < _spb; f++) {
+				uint32_t fi = ((s0 + f) & ring_mask) * 2u;
+				ring[fi] = 0; ring[fi + 1u] = 0;
+			}
 		} else {
 			codec_unpack(ring, ring_mask, s0, blk, 1u);
 		}
+		s0 += _spb;   /* P16-522 */
 	}
 	if (M73_CY_NOW()) g_pk_blk += nblk;   /* UP-476 */
 	M73_ADD(g_t_pk);   /* UP-476 */
@@ -4808,14 +4896,17 @@ static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 	 * A7 blocks in the span fall through to codec_unpack_part. */
 	uint32_t f = skip;
 	uint32_t done = 0;
+	const uint32_t _spb = p16m_trk_spb(trk);   /* P16-522: TRACK-driven, so the
+	                                     * zeroed silence pad stays correct */
 	while (done < nsamp) {
-		uint32_t blkno = f / SAMP_PER_BLK;
-		uint32_t off   = f - blkno * SAMP_PER_BLK;
-		uint32_t run   = SAMP_PER_BLK - off;
+		uint32_t blkno = f / _spb;
+		uint32_t off   = f - blkno * _spb;
+		uint32_t run   = _spb - off;
 		if (run > nsamp - done) run = nsamp - done;
 		const uint8_t *blk = flash + blkno * EMMC_BLOCK_SIZE;
 		if (blk[11] == P14S_MARK) {
-			p14s_dec_scr(blk);
+			if (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
+			else                 p14s_dec_scr(blk);
 			for (uint32_t k = 0; k < run; k++) {
 				uint32_t fi = ((start + done + k) & ring_mask) * 2u;
 				ring[fi]      = p14s_scr[(off + k) * 2u];
@@ -4829,11 +4920,19 @@ static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 				ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + p14s_scr[0]) >> 1);
 				ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + p14s_scr[1]) >> 1);
 			}
-			if (off + run >= 279u) {
+			if (off + run >= _spb - 1u) {   /* P16-522: was 279u = 280-1 */
 				/* this pass decoded through the block's last stored
 				 * frame -> it becomes the prev for the next entry. */
-				g_p14s_prev[trk][0] = p14s_scr[556];
-				g_p14s_prev[trk][1] = p14s_scr[557];
+				g_p14s_prev[trk][0] = p14s_scr[_spb * 2u - 4u];   /* P16-522 */
+				g_p14s_prev[trk][1] = p14s_scr[_spb * 2u - 3u];
+			}
+		} else if (_spb == 496u) {
+			/* P16-522: a non-P16M block under a P16M take = the SILENCE
+			 * PAD. Write true silence; the A7 fallthrough would page a
+			 * zeroed buffer at the wrong geometry. */
+			for (uint32_t k = 0; k < run; k++) {
+				uint32_t fi = ((start + done + k) & ring_mask) * 2u;
+				ring[fi] = 0; ring[fi + 1u] = 0;
 			}
 		} else {
 			codec_unpack_part(ring, ring_mask, start + done, flash, f, run);
@@ -4845,18 +4944,22 @@ static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
 			    const uint8_t *flash, uint32_t nblk)
 {
+	uint32_t _s0 = start;   /* P16-522: per-block stride, as in p14s_unpack */
 	for (uint32_t b = 0; b < nblk; b++) {
 		const uint8_t *blk = flash + b * EMMC_BLOCK_SIZE;
+		uint32_t _spb = (blk[11] == P14S_MARK && blk[2] == 0x36u) ? 496u : SAMP_PER_BLK;
 		if (blk[11] == P14S_MARK) {
-			p14s_dec_scr(blk);
-			for (uint32_t f = 0; f < SAMP_PER_BLK; f++) {
-				uint32_t fi = ((start + b * SAMP_PER_BLK + f) & ring_mask) * 2u;
-				ring[fi]      = p14s_scr[(SAMP_PER_BLK - 1u - f) * 2u];
-				ring[fi + 1u] = p14s_scr[(SAMP_PER_BLK - 1u - f) * 2u + 1u];
+			if (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
+			else                 p14s_dec_scr(blk);
+			for (uint32_t f = 0; f < _spb; f++) {
+				uint32_t fi = ((_s0 + f) & ring_mask) * 2u;
+				ring[fi]      = p14s_scr[(_spb - 1u - f) * 2u];
+				ring[fi + 1u] = p14s_scr[(_spb - 1u - f) * 2u + 1u];
 			}
 		} else {
-			codec_unpack_rev(ring, ring_mask, start + b * SAMP_PER_BLK, blk, 1u);
+			codec_unpack_rev(ring, ring_mask, _s0, blk, 1u);
 		}
+		_s0 += _spb;
 	}
 }
 
@@ -4865,8 +4968,12 @@ static void p14s_mask_from_x3(uint32_t slot)
 	g_p14s_mask = 0;
 	if (g_x3_ok && slot < NUM_SLOTS)
 		for (int xi = 0; xi < NTRK; xi++)
-			if (g_x3.t[slot][xi].codec_id == X3_CODEC_P14S)
+			if (g_x3.t[slot][xi].codec_id == X3_CODEC_P14S ||
+			    g_x3.t[slot][xi].codec_id == X3_CODEC_P16M) {
 				g_p14s_mask |= (uint8_t)(1u << xi);
+				trk[xi].p16m = (g_x3.t[slot][xi].codec_id
+				                == X3_CODEC_P16M) ? 1u : 0u;   /* P16-522 */
+			}
 }
 
 static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
@@ -4920,7 +5027,14 @@ static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
 }
 
 
-static void streamer_thread(void *a, void *b, void *c)
+/* ALN-525 (W143): PIN the streamer to a 2048-byte flash boundary.
+ * The night of 2026-08-30 proved the max+stream corner regresses when
+ * ANY upstream code growth shifts this function's address (0x25aac
+ * clean everywhere, 0x25b34 regressed; the PAD probe -- dead bytes,
+ * code unmoved -- ran clean). Pinning makes every future stage
+ * placement-immune. If THIS build regresses, phase 0 is unlucky:
+ * iterate the alignment offset, do not unpin. */
+static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	static uint8_t blk[EMMC_BLOCK_SIZE];
@@ -5264,7 +5378,9 @@ static void streamer_thread(void *a, void *b, void *c)
 						xe->len_samps      = trk[xi].len_samps;
 						xe->content_blocks = trk[xi].content_blocks;
 						xe->codec_id       = (g_p14s_mask & (1u << xi))
-						                     ? X3_CODEC_P14S : X3_CODEC_A7;  /* two-tier */
+						                     ? (trk[xi].p16m ? X3_CODEC_P16M
+						                                     : X3_CODEC_P14S)
+						                     : X3_CODEC_A7;  /* two-tier + P16-522 */
 						xe->flags          = (uint8_t)(g_cap_stereo ? 1u : 0u);  /* bit0 = stereo content; derived, so M63b-2 makes it correct for free */
 						xe->pan            = 128u;
 					}
@@ -5373,12 +5489,12 @@ static void streamer_thread(void *a, void *b, void *c)
 						bool aw3_burst_wait(void);
 						uint32_t _tw4 = DWT->CYCCNT;
 						g_w4_pk++; g_w4_pb += 16u;
-						p14s_pack_blocks(g_rring, RRING_MASK, (t->r_r >> 1) & RRING_MASK,
+						takes_pack_blocks(t, g_rring, RRING_MASK, (t->r_r >> 1) & RRING_MASK,
 						           batchbuf, 16u);
 						bool _ok1 = aw3_burst_start(blkno, batchbuf, 16u);
 						g_w4_pk++; g_w4_pb += 16u;
-						p14s_pack_blocks(g_rring, RRING_MASK,
-						           ((t->r_r >> 1) + 16u * 140u) & RRING_MASK,
+						takes_pack_blocks(t, g_rring, RRING_MASK,
+						           ((t->r_r >> 1) + 16u * (t->p16m ? 248u : 140u)) & RRING_MASK,
 						           batchbuf + 16u * EMMC_BLOCK_SIZE, 16u);
 						if (_ok1) _ok1 = aw3_burst_wait();
 						if (_ok1) {
@@ -5409,7 +5525,7 @@ static void streamer_thread(void *a, void *b, void *c)
 						continue;
 					}
 					g_w4_pk++; g_w4_pb += n;   /* W4P */
-					p14s_pack_blocks(g_rring, RRING_MASK, (t->r_r >> 1) & RRING_MASK,
+					takes_pack_blocks(t, g_rring, RRING_MASK, (t->r_r >> 1) & RRING_MASK,
 					           batchbuf, n);
 					static uint32_t wfail_start;   /* 0 = no failure streak */
 					static uint32_t wfail_key;     /* streak identity (track|flush pos) */
@@ -5470,6 +5586,17 @@ static void streamer_thread(void *a, void *b, void *c)
 					t->r_r += n * TSPB(t);
 					t->flush_blk += n;
 					work = true;
+					/* FB-529 (W137): PROACTIVE page pacing at high tape
+					 * speed. The tail flush's back-to-back 16-block bursts
+					 * monopolize the bus exactly when the play rings drain
+					 * 1.5x faster (STV pf = 148-259 at the corner, all with
+					 * g_done_pending). One page per streamer pass, then
+					 * PASS 2 serves; full writes-first priority returns the
+					 * moment the backlog crosses half capacity, so data
+					 * safety is unchanged (the ring holds ~341 ms). */
+					if (g_cur_speed_q16 >= CX_SPEED_MIN &&
+					    (t->r_w - t->r_r) < RRING_SAMPLES)
+						break;
 					/* POST-STALL DRAIN ORDER: a big rec backlog must not
 					 * starve the playing rings at their emptiest moment.
 					 * After each burst, if any playing ring is inside its
@@ -6991,6 +7118,8 @@ static void controls_diag(void)
 
 
 
+		printk("P16,m=%u%u%u%u\n", (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
+		       (unsigned)trk[2].p16m, (unsigned)trk[3].p16m);
 		printk("STV,lo=%u,up=%u,cx=%u,pf=%u,re=%u,rhw=%u\n",
 		       (unsigned)g_stv_lo, (unsigned)g_stv_up,
 		       (unsigned)g_stv_re,
