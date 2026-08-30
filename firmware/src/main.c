@@ -1556,6 +1556,11 @@ static volatile uint8_t  g_done_pending;  /* a take is still flushing: ring is B
  * load, like brightness (M8c). Old indexes read bit 1 = 0 -> instant,
  * so the default reaches every existing device. */
 static volatile uint8_t  g_instant_rec = 1;
+static volatile uint8_t g_rp_enable = 0u;  /* RPD-513: master switch.
+ * DEFAULT OFF. Flip to 1u to arm record-priority ducking. Natural
+ * home later is the meta settings word (row 97 preferences), where
+ * `led_full` already carries instant-record and survives reflash. */
+static volatile uint8_t g_rp_duck;          /* live duck state */
 static volatile uint32_t g_rec_overruns;         /* diag: rec ring overflow events */
 static volatile uint32_t g_starve_cnt[NTRK];     /* diag: per-track play-ring underrun episodes */
 /* M98: g_starve_cnt is cumulative-since-boot, and Protocol A connects
@@ -3442,6 +3447,15 @@ static void looper_audio_block(int16_t *s)
 	g_frames_since = _fsince; g_pre_w = _pre_w;
 	g_pre_valid = _pre_val; g_consume_pos = _cpos;
 
+	{ /* RPD-512: engage above the corner threshold while recording;
+	   * release with hysteresis so a hovering speed cannot flutter. */
+		if (g_rp_enable && g_rec_track >= 0 &&
+		    g_cur_speed_q16 >= CX_SPEED_MIN)
+			g_rp_duck = 1u;
+		else if (!g_rp_enable || g_rec_track < 0 ||
+		         g_cur_speed_q16 < CX_SPEED_MIN - 4096u)
+			g_rp_duck = 0u;
+	}
 	/* ==== PASS B: accumulate each playing track over the whole block ==== */
 	for (int i = 0; i < NTRK; i++) {
 		if (trk[i].state != TS_PLAY && !head_active(i)) continue;
@@ -3455,8 +3469,13 @@ static void looper_audio_block(int16_t *s)
 		 * entirely once its ramp settles at zero. */
 		/* M14: a pending blip mutes this track for ~3 blocks (~16 ms),
 		 * riding the existing ramp for clickless edges. */
-		const int32_t vtar = (trk[i].muted || g_head_blip[i])
-				   ? 0 : (int32_t)vol_s[i];
+		const int32_t vtar = (trk[i].muted || g_head_blip[i] ||
+				      (g_rp_duck && i != g_rec_track))
+				   ? 0 : (int32_t)vol_s[i];   /* RPD-512: record priority.
+				      * Rides the ramp, so the duck is clickless; a settled
+				      * zero track stops being SERVED (the W55 fader trick),
+				      * which hands the card bus to the recording. Auto-
+				      * resumes the same way when the take ends. */
 		if (g_head_blip[i]) g_head_blip[i]--;
 		const int32_t vprev = (int32_t)trk[i].vol_now;
 		int32_t vd = vtar - vprev;                   /* 0 in the common case */
