@@ -1146,8 +1146,8 @@ static volatile uint32_t g_grid_base_blocks;
 #define TSPBI(ix)  ((uint32_t)(trk[ix].p16m ? 496u : 280u))
 #define TLOOPB(ix) ({ uint32_t _ll = g_loop_len;   /* VF-523: ONE volatile read */ \
 		      _ll ? (uint32_t)((_ll + TSPBI(ix) / 2u) / TSPBI(ix)) : 0u; })
-#define P16M_DEFAULT 1u   /* P16-522 TEST BUILD: every NEW take records MONO.
-                           * The gesture build flips this to 0u + double-tap. */
+#define P16M_DEFAULT 0u   /* GS-531: STEREO default; double-tap a track to
+                           * toggle its record mode (gesture map v2). */
 
 /* Blocks for n grid beats. Base-referenced when the song has one at the same
  * tempo (siblings then lock exactly); otherwise the whole run is rounded once
@@ -1474,6 +1474,11 @@ enum trk_state { TS_EMPTY, TS_ARMED, TS_REC, TS_DONE, TS_PLAY };
 
 struct looptrk {
 	volatile uint8_t  state;
+	uint8_t  p16m_next;                  /* GS2-532: record mode for the NEXT take --
+	                                      * the double-tap toggles THIS, never p16m,
+	                                      * so a loaded take's live geometry can
+	                                      * never flip under the streamer (the
+	                                      * half-plugged-guitar noise, W147). */
 	uint8_t  p16m;                       /* P16-522, VF-523: NOT volatile -- see W141.
 	                                      * Written only at take-create/load; a stale
 	                                      * read for one pass is harmless, and volatile
@@ -1704,6 +1709,7 @@ static volatile uint8_t  g_bnc_active;
 static volatile uint8_t  g_bnc_done;
 static volatile uint8_t  g_bnc_abort;
 static volatile uint8_t  g_led_shrug;      /* track row "no" double-blink */
+static volatile uint8_t  g_pg_open;        /* PG-533: T4 MODE PAGE open (FN held) */
 static uint8_t  bnc_src, bnc_dst;
 static uint8_t  bnc_pos[NTRK], bnc_rev[NTRK], bnc_mut[NTRK];
 static uint16_t bnc_vol[NTRK];
@@ -1814,7 +1820,10 @@ static volatile uint32_t g_stop_lat_max;
  * A tap means nothing on an empty track, so there is nothing else to
  * disambiguate. Fresh-tapped-grid empty keeps 0 (A-r2). */
 #define EMPTY_ARM_MS     48
-#define DTAP_GAP_MS      420   /* 2nd tap within this of the 1st tap's release => DOUBLE-TAP delete */
+#define DTAP_GAP_MS      420   /* 2nd tap within this of the 1st tap's release => DOUBLE-TAP */
+#define DTAP_DEL_HOLD_MS 400   /* GS-531 (map v2 row 99): the 2nd tap HELD this long = DELETE.
+                                * A QUICK 2nd tap = the mono/stereo record toggle -- the
+                                * destructive gesture gets the dwell, the safe one the tap. */
 
 /* BEAT GRID for the LED pulse + MIDI clock — defaults to the nominal beat, but
  * the first-track TEMPO ESTIMATOR replaces it with the detected beat period so
@@ -2346,6 +2355,14 @@ static void looper_audio_block(int16_t *s)
 			g_meta.slot[g_slot].trk_len[i] = 0;
 			g_meta.slot[g_slot].trk_start[i] = 0;
 			g_meta.trk_content[g_slot][i] = 0;   /* keep the on-flash block self-consistent */
+			{	/* FX3-537: the x3 row dies with the take (the removed
+				 * save-service refresh used to do this). rsv survives:
+				 * the per-song preference outlives its takes. */
+				struct x3_trk *_xe = &g_x3.t[g_slot][i];
+				_xe->start_samps = 0; _xe->len_samps = 0;
+				_xe->content_blocks = 0;
+				_xe->codec_id = 0; _xe->flags = 0; _xe->pan = 128u;
+			}
 			g_meta.song_mode[g_slot] &= (uint8_t)~(uint8_t)(0x10u << i); /* M7-r4: unmute */
 		}
 		int any = 0;
@@ -2918,12 +2935,32 @@ static void looper_audio_block(int16_t *s)
 			/* M7-r4: the song's saved mutes come back with it */
 			trk[i].muted = (pres && g_slot < NUM_SLOTS &&
 			                (g_meta.song_mode[g_slot] & (0x10u << i))) ? 1u : 0u;
+			{	/* FX2-536: the per-song NEXT-mode preference loads for
+				 * EVERY track -- the old latch sat inside the presence
+				 * guard, so empty tracks (the main use case) never
+				 * restored it (marc: "songs not saving the settings"). */
+				uint8_t _rv = (g_x3_ok && g_slot < NUM_SLOTS)
+				            ? g_x3.t[g_slot][i].rsv : 0u;
+				if (_rv & 0x80u)
+					trk[i].p16m_next = (uint8_t)(_rv & 1u);
+				if (!pres) {
+					trk[i].p16m = 0;   /* empty: no take, clean geometry */
+					if (!(_rv & 0x80u)) trk[i].p16m_next = 0;
+				}
+			}
 			/* SEGMENT: restore this track's own length + phase anchor (older saves
 			 * with trk_len==0 fall back to the base length = one segment). */
 			if (pres && g_slot < NUM_SLOTS) {
 				trk[i].p16m = (g_x3_ok && g_x3.t[g_slot][i].codec_id
 				               == X3_CODEC_P16M) ? 1u : 0u;   /* P16-522:
 				               * BEFORE the TSPBI(i) length math below */
+				{	/* PS-535: per-song NEXT-mode preference. */
+					uint8_t _rv = (g_x3_ok && g_slot < NUM_SLOTS)
+					            ? g_x3.t[g_slot][i].rsv : 0u;
+					trk[i].p16m_next = (_rv & 0x80u)
+					                 ? (uint8_t)(_rv & 1u)
+					                 : trk[i].p16m;   /* old cards: follow the take */
+				}
 				uint32_t L = g_meta.slot[g_slot].trk_len[i];
 				trk[i].len_blocks = L ? L : TLOOPB(i);
 				{	/* M22-B: rebuild the sample length from the stored
@@ -3308,7 +3345,7 @@ static void looper_audio_block(int16_t *s)
 								 * old floor put every overdub 0-5.3 ms
 								 * early, always early. Full sample
 								 * anchors are Phase B. */
-								rt->p16m = P16M_DEFAULT;   /* P16-522: BEFORE the anchor math */
+								rt->p16m = rt->p16m_next;   /* GS2-532: the toggled record mode */
 								rt->start_blk = (sp + TSPB(rt) / 2u)
 								              / TSPB(rt);
 								rt->start_samps = sp;   /* M22-B: exact */
@@ -3385,7 +3422,7 @@ static void looper_audio_block(int16_t *s)
 						g_p14s_e1[0] = 0; g_p14s_e1[1] = 0; g_p14s_sh = 0u;
 						g_p14s_prev[rt_i][0] = 0; g_p14s_prev[rt_i][1] = 0;
 						g_p14s_mask |= (uint8_t)(1u << rt_i);
-						rt->p16m = P16M_DEFAULT;   /* P16-522 TEST BUILD */
+						rt->p16m = rt->p16m_next;   /* GS2-532 */
 						rt->state = TS_REC;
 					}
 				}
@@ -4836,8 +4873,12 @@ static void p14s_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 		uint32_t _spb = p16m_trk_spb(trk);   /* P16-522: TRACK-driven -- the zeroed
 		                               * silence pad strides correctly too */
 		if (blk[11] == P14S_MARK) {
-			if (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
-			else                 p14s_dec_scr(blk);
+			if      (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
+			else if (blk[2] == 0x34u) p14s_dec_scr(blk);
+			else    /* GS-531 (W144): mark present but FOREIGN sig -- a
+			         * future codec or cross-version content. SILENCE,
+			         * never garbage. */
+				memset(p14s_scr, 0, (size_t)_spb * 4u);
 			{	/* CPY-483: the ring wraps at most once per block, so
 				 * split there and walk pointers instead of recomputing
 				 * (add, AND, shift) for all 280 frames. Bit-exact by
@@ -4905,8 +4946,12 @@ static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 		if (run > nsamp - done) run = nsamp - done;
 		const uint8_t *blk = flash + blkno * EMMC_BLOCK_SIZE;
 		if (blk[11] == P14S_MARK) {
-			if (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
-			else                 p14s_dec_scr(blk);
+			if      (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
+			else if (blk[2] == 0x34u) p14s_dec_scr(blk);
+			else    /* GS-531 (W144): mark present but FOREIGN sig -- a
+			         * future codec or cross-version content. SILENCE,
+			         * never garbage. */
+				memset(p14s_scr, 0, (size_t)_spb * 4u);
 			for (uint32_t k = 0; k < run; k++) {
 				uint32_t fi = ((start + done + k) & ring_mask) * 2u;
 				ring[fi]      = p14s_scr[(off + k) * 2u];
@@ -4949,8 +4994,12 @@ static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
 		const uint8_t *blk = flash + b * EMMC_BLOCK_SIZE;
 		uint32_t _spb = (blk[11] == P14S_MARK && blk[2] == 0x36u) ? 496u : SAMP_PER_BLK;
 		if (blk[11] == P14S_MARK) {
-			if (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
-			else                 p14s_dec_scr(blk);
+			if      (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
+			else if (blk[2] == 0x34u) p14s_dec_scr(blk);
+			else    /* GS-531 (W144): mark present but FOREIGN sig -- a
+			         * future codec or cross-version content. SILENCE,
+			         * never garbage. */
+				memset(p14s_scr, 0, (size_t)_spb * 4u);
 			for (uint32_t f = 0; f < _spb; f++) {
 				uint32_t fi = ((_s0 + f) & ring_mask) * 2u;
 				ring[fi]      = p14s_scr[(_spb - 1u - f) * 2u];
@@ -4973,6 +5022,12 @@ static void p14s_mask_from_x3(uint32_t slot)
 				g_p14s_mask |= (uint8_t)(1u << xi);
 				trk[xi].p16m = (g_x3.t[slot][xi].codec_id
 				                == X3_CODEC_P16M) ? 1u : 0u;   /* P16-522 */
+				{	/* PS-535, as in the restore path */
+					uint8_t _rv = g_x3.t[slot][xi].rsv;
+					trk[xi].p16m_next = (_rv & 0x80u)
+					                  ? (uint8_t)(_rv & 1u)
+					                  : trk[xi].p16m;
+				}
 			}
 }
 
@@ -5368,22 +5423,18 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				memcpy(metabuf, &g_meta, sizeof(g_meta));
 				(void)meta_write_blocks(metabuf);
 				work = true;
-				/* M72: refresh this slot's v3 rows from LIVE state
-				 * and persist blocks 3-5 alongside the index. The
-				 * reload cross-check makes write order irrelevant. */
+				/* FX3-537: the M72 refresh is GONE. It re-authored this
+				 * slot's rows from live trk[], and a song jump could
+				 * slip between g_slot flipping (gesture thread) and the
+				 * trk[] restore (audio thread) -- this pass then stamped
+				 * the DESTINATION song's rows with the OLD song's state
+				 * (marc's no-recording corruption). The cross-check that
+				 * once made write order irrelevant never covered
+				 * codec_id (522), which has no g_meta fallback. Rows are
+				 * now authored ONLY at their events: boot load, take
+				 * promotion (FX2), page toggle (FX2), delete (below).
+				 * This service just writes RAM to the card. */
 				if (slot < NUM_SLOTS) {
-					for (int xi = 0; xi < NTRK; xi++) {
-						struct x3_trk *xe = &g_x3.t[slot][xi];
-						xe->start_samps    = trk[xi].start_samps;
-						xe->len_samps      = trk[xi].len_samps;
-						xe->content_blocks = trk[xi].content_blocks;
-						xe->codec_id       = (g_p14s_mask & (1u << xi))
-						                     ? (trk[xi].p16m ? X3_CODEC_P16M
-						                                     : X3_CODEC_P14S)
-						                     : X3_CODEC_A7;  /* two-tier + P16-522 */
-						xe->flags          = (uint8_t)(g_cap_stereo ? 1u : 0u);  /* bit0 = stereo content; derived, so M63b-2 makes it correct for free */
-						xe->pan            = 128u;
-					}
 					g_x3.magic = X3_MAGIC; g_x3.ver = X3_VER;
 					g_x3.sum = x3_sum(&g_x3);
 					memset(batchbuf, 0, X3_NBLK * EMMC_BLOCK_SIZE);
@@ -5640,6 +5691,23 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 						g_meta.slot[slot].trk_len[i]   = t->len_blocks;  /* SEGMENT: per-track length */
 						g_meta.slot[slot].trk_start[i] = t->start_blk;   /* + phase anchor */
 						g_meta.trk_content[slot][i]    = t->content_blocks; /* silence-pad boundary */
+						{	/* FX2-536: the x3 entry, stamped IN RAM at
+							 * promotion. A deferred stamp raced song
+							 * switches: the new take's codec_id was
+							 * never written for THIS slot, and the
+							 * stale id mis-strided the track-driven
+							 * reader on return (the aux-cable sound). */
+							struct x3_trk *_xe = &g_x3.t[slot][i];
+							_xe->start_samps    = t->start_samps;
+							_xe->len_samps      = t->len_samps;
+							_xe->content_blocks = t->content_blocks;
+							_xe->codec_id       = t->p16m ? X3_CODEC_P16M
+							                              : X3_CODEC_P14S;
+							_xe->flags          = (uint8_t)(g_cap_stereo ? 1u : 0u);
+							_xe->pan            = 128u;
+							_xe->rsv            = (uint8_t)(0x80u |
+							                      (t->p16m_next & 1u));
+						}
 					}
 					g_meta_save_req = 1;             /* persist the new recording */
 #if SP1_CODEC == SP1_CODEC_PCM
@@ -7118,8 +7186,11 @@ static void controls_diag(void)
 
 
 
-		printk("P16,m=%u%u%u%u\n", (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
-		       (unsigned)trk[2].p16m, (unsigned)trk[3].p16m);
+		printk("P16,m=%u%u%u%u,n=%u%u%u%u\n",
+		       (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
+		       (unsigned)trk[2].p16m, (unsigned)trk[3].p16m,
+		       (unsigned)trk[0].p16m_next, (unsigned)trk[1].p16m_next,
+		       (unsigned)trk[2].p16m_next, (unsigned)trk[3].p16m_next);
 		printk("STV,lo=%u,up=%u,cx=%u,pf=%u,re=%u,rhw=%u\n",
 		       (unsigned)g_stv_lo, (unsigned)g_stv_up,
 		       (unsigned)g_stv_re,
@@ -7646,7 +7717,17 @@ static void led_service(void)
 	for (int i = 0; i < NTRK; i++)
 		if (trk[i].state != TS_EMPTY) active = 1;
 
-	if (g_snap_sweep) {
+	if (g_pg_open) {
+		/* PG-533/LS-534: the MODE PAGE view -- each track LED shows
+		 * its NEXT-record mode live: BLINK = stereo, SOLID = mono
+		 * (marc's call: mono is the special state, it gets the
+		 * steady light). */
+		uint32_t _ph = (k_uptime_get_32() >> 7) & 1u;
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
+			uint8_t _on = trk[i].p16m_next ? 1u : (uint8_t)_ph;
+			if (_on) track_led_on(i); else track_led_off(i);
+		}
+	} else if (g_snap_sweep) {
 		/* M23-r5 THE HOOK. A one-shot nudge deserves a one-shot picture:
 		 * the row sweeps BACK AND FORTH — hunting, not yet sure — and
 		 * then catches the beat and rides it BACKWARD, hand-in-hand,
@@ -8448,6 +8529,8 @@ int main(void)
 	enum trk_btn bj_cand = TRK_NONE; /* FUNCTION+Track bank jump: sticky candidate band */
 	int bj_cnt = 0;                  /*   consecutive passes the candidate has held     */
 	int bj_fired = -1;               /*   band already jumped during this FUNCTION press */
+	int64_t pg_t0 = 0;               /* PG-533: when the pending FN+track press began */
+	int pg_pend = -1;                /* PG-533: pressed track -- jump-on-release or page-on-dwell */
 	int64_t fnp_edge = -1;           /* FUNCTION+PLAY dim toggle: last PLAY press edge */
 	int fnp_chain = 0;               /* M13: consecutive PLAY taps (2 = 1.0x snap, 3 = heads) */
 	int fnp_pend_snap = 0;           /* M15-r3: snap DEFERRED past the triple window */
@@ -8757,21 +8840,46 @@ int main(void)
 					else { bj_cand = tb; bj_cnt = 1; }
 					if (bj_cnt == 3) {   /* exact edge: once per press */
 						combo_seen = 1;      /* never a power-off now */
-						bj_fired = (int)tb;
-						uint32_t bank = (uint32_t)tb * 4u;
-						/* M8a: pressing the SAME track again steps
-						 * through that bank's four songs; another
-						 * track jumps to its bank. All 16 songs
-						 * under one FUNCTION hold (FN-tap is tap
-						 * tempo now, not next-song). */
-						if (g_slot / 4u == (uint32_t)tb)
-							jump_to_slot(bank + ((g_slot % 4u) + 1u) % 4u);
-						else
-							jump_to_slot(bank);
+						if (g_pg_open) {
+							/* PG-533: in the MODE PAGE a track tap
+							 * toggles that track's NEXT-record mode.
+							 * No mute, no audio side effect -- the
+							 * LEDs answer (solid=stereo, blink=mono). */
+							trk[(int)tb].p16m_next = !trk[(int)tb].p16m_next;
+							if (g_slot < NUM_SLOTS)   /* FX2-536: stamp NOW --
+							 * a deferred stamp can land on the wrong
+							 * slot if a jump beats the save service. */
+								g_x3.t[g_slot][(int)tb].rsv = (uint8_t)(0x80u |
+								    (trk[(int)tb].p16m_next & 1u));
+							g_meta_save_req = 1;   /* PS-535: persist per song */
+							bj_fired = (int)tb;
+						} else {
+							/* PG-533: the jump now resolves on RELEASE
+							 * (the map's pages prerequisite); a held T4
+							 * becomes the MODE PAGE instead. */
+							pg_t0 = k_uptime_get();
+							pg_pend = (int)tb;
+						}
+					}
+					if (!g_pg_open && pg_pend == (int)TRK_4 &&
+					    k_uptime_get() - pg_t0 >= 400) {
+						g_pg_open = 1;   /* PG-533: FN + hold T4 = MODE PAGE */
+						pg_pend = -1;
 					}
 					led_service();           /* live song display mid-hold */
 					k_msleep(25);
 					continue;                /* track held: combo owns the button */
+				}
+				if (pg_pend >= 0) {
+					/* PG-533: the press ended before the dwell -- fire the
+					 * M8a bank jump ON RELEASE, semantics unchanged. */
+					uint32_t bank = (uint32_t)pg_pend * 4u;
+					if (g_slot / 4u == (uint32_t)pg_pend)
+						jump_to_slot(bank + ((g_slot % 4u) + 1u) % 4u);
+					else
+						jump_to_slot(bank);
+					bj_fired = pg_pend;
+					pg_pend = -1;
 				}
 				bj_cand = TRK_NONE; bj_cnt = 0;
 			}
@@ -9324,6 +9432,7 @@ int main(void)
 			g_play_bpm = 80;
 		}
 		bj_cand = TRK_NONE; bj_cnt = 0; bj_fired = -1; fnp_edge = -1; fnp_chain = 0;
+		g_pg_open = 0; pg_pend = -1;   /* PG-533: releasing FUNCTION closes the page */
 		fnp_presses = 0;
 		cp_cand = VOL_NONE; cp_cnt = 0; cp_dcl_band = -1;
 
@@ -9650,9 +9759,13 @@ int main(void)
 						   !g_heads_mode) {
 						/* (heads mode: taps only mute — never
 						 * delete or arm; the mode is playback) */
-						tap_deadline[ti] = 0;   /* 2nd tap -> DELETE */
-						g_del_req[ti] = 1;
-						trk[ti].muted = 0;
+						/* PG-533: the base-layer toggle is REMOVED -- marc's
+						 * rule: no gesture passes THROUGH mute. The toggle
+						 * lives on the FN+hold-T4 MODE PAGE. A quick 2nd
+						 * tap is just another mute; the DELETE dwell (kept,
+						 * marc-approved) still owns the held 2nd tap. */
+						tap_deadline[ti] = 0;
+						trk[ti].muted = !trk[ti].muted;
 					} else if (tap_deadline[ti] > 0 && tnow <= tap_deadline[ti]) {
 						/* M15: heads mode double-tap = REVERSE that
 						 * head. The first tap toggled the mute — undo
@@ -9827,14 +9940,45 @@ int main(void)
 						bnc_content = bs->content_blocks
 							    ? bs->content_blocks : gb;
 						bnc_done_blocks = 0;
-						__DSB();   /* snapshot lands before the request */
-						g_bnc_req = (int8_t)ti;
+						{	/* GS-531: the bounce accumulator is 280-frame
+							 * geometry; a P16M source would overflow it
+							 * (496*3 > 1024). Refuse with the shrug until
+							 * the accumulator learns mixed geometry. */
+							uint8_t _p16s = 0;
+							for (int _j = 0; _j < NTRK; _j++)
+								if (trk[_j].p16m && trk[_j].state == TS_PLAY)
+									_p16s = 1;
+							if (_p16s) {
+								g_led_shrug = 1;   /* the M19b 'no' */
+								armed_press[ti] = 1;
+								tap_deadline[ti] = 0;
+							} else {
+								__DSB();   /* snapshot lands before the request */
+								g_bnc_req = (int8_t)ti;
+							}
+						}
 					}
 					armed_press[ti] = 1;   /* spend the press */
 					tap_deadline[ti] = 0;
 				}
-				if (!armed_press[ti] && ti != stop_tap_trk &&
+				/* GS-531 (map v2 row 99): DOUBLE-TAP-AND-HOLD = DELETE. The press
+			 * began inside the window (stable test: the deadline is only
+			 * consumed by the quick-toggle or by this delete, so it cannot
+			 * lapse mid-hold) and has dwelt DTAP_DEL_HOLD_MS. */
+			if (!armed_press[ti] && ti != stop_tap_trk && !g_heads_mode &&
+			    tap_deadline[ti] > 0 && press_t[ti] <= tap_deadline[ti] &&
+			    k_uptime_get() - press_t[ti] >= DTAP_DEL_HOLD_MS) {
+				tap_deadline[ti] = 0;
+				g_del_req[ti] = 1;
+				trk[ti].muted = 0;
+				armed_press[ti] = 1;   /* spend the press: its release
+				                        * must not read as a mute */
+			}
+			if (!armed_press[ti] && ti != stop_tap_trk &&
 				    g_rec_track < 0 && !g_heads_mode &&
+				    !(tap_deadline[ti] > 0 &&
+				      press_t[ti] <= tap_deadline[ti]) &&   /* GS-531: inside the
+				      * double-tap window a hold means DELETE (below), never ARM */
 				    trk[ti].state != TS_DONE &&
 				    k_uptime_get() - press_t[ti] >=
 				        (empt ? (((g_grid_active && g_grid_fresh) ||
