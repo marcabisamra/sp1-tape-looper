@@ -1713,7 +1713,9 @@ static volatile uint8_t  g_led_shrug;      /* track row "no" double-blink */
 static volatile uint8_t  g_fn_held;        /* LED-549: FUNCTION is down (LED routing) */
 static volatile uint8_t  g_vu;             /* LED-549: master VU, 0..255, decayed */
 static volatile uint8_t  g_pg_sweep;       /* LED-549 r8: page sweep/land counter */
-#define PG_LAST 12u   /* LED-549 r12: pages 1..12 are all reachable now,
+#define PG_LAST 8u   /* PG8-560: EIGHT pages, every one with a handler.
+                       * (was 12, of which ten fell through to MODE -- W212.)
+                       * LED-549 r12: all reachable,
                        * content or not, so the counting scheme can be
                        * exercised across all three group shapes. */
 static volatile uint8_t  g_pg_exit;        /* LED-549 r11: exit sweep counter */
@@ -1779,6 +1781,7 @@ static volatile uint8_t  g_dst_amt;
  * the classic chorus window. The first value swept to 60 ms, which
  * is a slapback echo. */
 #define CHR_LFO_INC   60850u       /* ~0.68 Hz sweep */
+#define FX2_LFO_INC 107374u   /* FX2-558: ~1.2 Hz at 48 kHz (2^32 / 48000 = 89478 per Hz). Slow enough to feel like motion rather than modulation. */
 #define CHR_D_MIN     192          /* 4 ms, in frames */
 #define CHR_D_SPAN    672          /* +14 ms, in frames */
 /* FX2-550 r3. The threshold is now RELATIVE TO THE SIGNAL'S OWN RUNNING
@@ -1855,6 +1858,65 @@ static uint32_t g_chr_w;
 static uint32_t g_chr_ph;         /* LFO phase, full 32-bit wrap */
 static volatile uint8_t  g_chr_mix;       /* FX2-550: chorus depth/mix, fader 2 */
 static volatile uint8_t  g_gat_amt;       /* FX2-550: gate threshold,   fader 4 */
+
+/* ===== FX2-558: PAGE 5 -- four effects that need ZERO new RAM =====
+ * Each is skipped outright when its control is at rest, exactly as the
+ * FX1 chain already does (flt_mode / chr_mix / dst_g / tg_sf). Neutral
+ * is genuinely free -- verified by reading the loop, not the values.
+ *   fader 1  BITCRUSH  0 = clean
+ *   fader 2  RING MOD  0 = off  (LAYOUT-562; width was cut)
+ *   fader 3  AUTO-WAH  0 = off
+ *   fader 4  ECHO      reserved -- inert until Campaign R
+ * PAGE 3 is phaser / sweep / tremolo / [empty].
+ * ECHO is NOT here: the play ring holds only ~39 ms behind the read
+ * pointer and the streamer overwrites it, so the "free ring tap" does
+ * not exist (W203). A real echo needs ~7 KB and waits on Campaign R. */
+static volatile uint8_t g_bcr_amt;         /* bitcrush depth */
+static volatile uint8_t g_swp_amt;         /* auto-pan depth */
+static volatile uint8_t g_trm_amt;         /* tremolo depth */
+static uint32_t g_fx2_lfo;                 /* shared LFO phase, 32-bit wrap */
+static int32_t  g_bcr_hL, g_bcr_hR;        /* sample-and-hold state */
+static uint32_t g_bcr_ph;
+
+/* ===== FX 3 (PG8-560) -- page 3: ring mod / auto-wah / phaser / tremolo =====
+ * All three new kernels are ZERO-or-near-zero RAM, which is the whole reason
+ * they were chosen over echo: echo needs ~7 KB and the build is at 96.08%.
+ *   RING MOD  0 B   -- one phase accumulator in .bss
+ *   AUTO-WAH  20 B  -- its OWN SVF pair + envelope. It does not borrow the
+ *                      FX1 filter: an effect on page 3 that only worked when
+ *                      page 1 happened to be engaged would be a trap.
+ *   PHASER    32 B  -- 4 allpass stages x 2 channels
+ * Every one of them is inside the FXFAST-559 fx_any gate, so with the page at
+ * neutral they cost exactly nothing -- not even the test. */
+static volatile uint8_t g_rng_amt;         /* ring mod: depth AND carrier freq */
+static volatile uint8_t g_awh_amt;         /* auto-wah depth */
+static volatile uint8_t g_phs_amt;         /* phaser depth */
+static uint32_t g_rng_ph;                  /* ring carrier phase */
+static int32_t  g_awh_lowL, g_awh_bandL;   /* auto-wah SVF, L */
+static int32_t  g_awh_lowR, g_awh_bandR;   /* auto-wah SVF, R */
+static int32_t  g_awh_env;                 /* envelope follower */
+static int32_t  g_phs_z[8];                /* 4 allpass stages x 2 channels */
+static int32_t  g_phs_fbL, g_phs_fbR;      /* FXRST-563: phaser feedback */
+static volatile uint8_t g_fxrst_lock;      /* FXRST2-564: swallow the chord release */
+
+/* FXRST-563: ONE gesture puts every effect back to neutral.
+ * Deliberately does NOT touch page 8 (mono/stereo) -- that is a record
+ * setting, not an effect, and a panic button that silently changed how the
+ * next take is encoded would be a trap.
+ * Re-arming the pickup latch matters as much as the values: after a reset
+ * every fader is stale, and without this the next fader touch would jump
+ * its parameter straight back up to wherever the fader happens to sit. */
+static void fx_reset_all(void)
+{
+        g_flt_pos = 128u;   /* bypass, not zero -- the filter is bipolar */
+        g_chr_mix = 0u;  g_dst_amt = 0u;  g_gat_amt = 0u;
+        g_bcr_amt = 0u;  g_rng_amt = 0u;  g_awh_amt = 0u;
+        g_phs_amt = 0u;  g_swp_amt = 0u;  g_trm_amt = 0u;
+        for (int _f = 0; _f < 4; _f++) {
+                g_fx_pick[_f]  = 1;
+                g_fx_lastq[_f] = -1;
+        }
+}
 static const int16_t flt_lp_tab[14] = {   /* 80 Hz .. 6.5 kHz, exp */
 	172, 241, 337, 473, 664, 931, 1306, 1831,
 	2566, 3595, 5033, 7032, 9788, 13524 };
@@ -3824,6 +3886,25 @@ static void looper_audio_block(int16_t *s)
 		 * coefficient so fader moves never zipper. dst_g 4096 = unity;
 		 * full drive is ~8x in, with the trim taking ~6 dB back out. */
 		int32_t vu_pk = 0;   /* LED-549: this block's output peak */
+		/* FX2-558 per-block constants -- hoisted so the frame loop only
+		 * branches on an int, never recomputes a shift table. */
+		const uint32_t bcr_hold = g_bcr_amt
+		                        ? (1u + (((uint32_t)g_bcr_amt * 15u) >> 8)) : 0u;
+		const int32_t  bcr_mask = (int32_t)(0xFFFFFFFFu <<
+		                          (((uint32_t)g_bcr_amt * 8u) >> 8));
+		const int32_t  swp_d    = (int32_t)g_swp_amt;
+		const int32_t  trm_d    = (int32_t)g_trm_amt;
+		const int      fx2_lfo_on = (swp_d || trm_d) ? 1 : 0;
+		/* PG8-560 FX3 per-block constants. */
+		const int32_t  rng_d    = (int32_t)g_rng_amt;
+		const int32_t  awh_d    = (int32_t)g_awh_amt;
+		const int32_t  phs_d    = (int32_t)g_phs_amt;
+		/* Ring carrier: ONE fader sets depth and pitch together, 40 Hz at the
+		 * bottom to ~1.2 kHz at the top. Low = growl, high = clangorous metal.
+		 * 2^32 / 48000 = 89478 phase units per Hz. */
+		const uint32_t rng_inc  = 3579139u + (uint32_t)g_rng_amt * 406000u;
+		/* ONE accumulator serves sweep, tremolo and the phaser. */
+		const int      lfo_on   = (swp_d || trm_d || phs_d) ? 1 : 0;
 		/* FX2-550: both new kernels are read ONCE per block into a local,
 		 * exactly like the filter and the distortion. Reading a volatile
 		 * inside the frame loop would re-load it 128 times and would also
@@ -3926,6 +4007,39 @@ static void looper_audio_block(int16_t *s)
 		const int32_t gd = ge - ge_prev;
 		const int32_t g0 = ge_prev;
 		ge_prev = ge;
+		/* ===== FXFAST-559: ONE gate for the WHOLE chain =====
+		 * The frame loop used to ask SEVEN questions per frame -- filter,
+		 * chorus, drive, gate, bitcrush, width, LFO -- 1,792 branch
+		 * evaluations a block with every fader down. Skipping a BODY is not
+		 * the same as not ASKING (W205): at 48 kHz a test you take 12,288
+		 * times a second is a real cost.
+		 * So decide ONCE per block, then run a loop that cannot ask.
+		 * The lean path is master volume -> limiter -> store -> decimated
+		 * VU, and nothing else. It costs flash (a duplicated loop) and
+		 * returns cycles, which is the right trade on a part with plenty of
+		 * flash and ~4%% idle. ⚠ NOTE: this is an OPTIMISATION, not a
+		 * regression fix -- W206 measured the same-bin corner spread at
+		 * 24%% / 2x, so nothing smaller than that was ever demonstrated. */
+		const int fx_any = (flt_mode != 0u) || (chr_mix != 0) || (dst_g != 0)
+		                || (tg_sf != 0u)   || (bcr_hold != 0u)
+		                || (fx2_lfo_on != 0)
+		                || (rng_d != 0)    || (awh_d != 0)
+		                || (phs_d != 0);
+		if (!fx_any) {
+			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+				int32_t m = gd ? (g0 + ((gd * (int32_t)(f + 1)) >> 8)) : ge;
+				int32_t oL = soft_limit((mix32[f]  * m) >> 8);
+				int32_t oR = soft_limit((mix32R[f] * m) >> 8);
+				s[2 * f]      = oL;
+				s[2 * f + 1u] = oR;
+				if ((f & 3u) == 0u) {
+					int32_t aL = oL < 0 ? -oL : oL;
+					int32_t aR = oR < 0 ? -oR : oR;
+					int32_t a  = (aL > aR) ? aL : aR;
+					if (a > vu_pk) vu_pk = a;
+				}
+			}
+		} else
 		for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 			int32_t xL = mix32[f];
 			int32_t xR = mix32R[f];
@@ -4015,14 +4129,135 @@ static void looper_audio_block(int16_t *s)
 				xL = (int32_t)(((int64_t)xL * g_gat_g) >> 12);
 				xR = (int32_t)(((int64_t)xR * g_gat_g) >> 12);
 			}
+			/* ==== FX2-558: bitcrush -> width -> sweep -> tremolo ====
+			 * Placed AFTER the FX1 chain and BEFORE master volume, so the
+			 * master stays a monitoring control (the bounce plan's rule).
+			 * Every arm is gated on its own control being at rest. */
+			if (bcr_hold) {
+				/* BITCRUSH: sample-and-hold + bit mask. The hold is what
+				 * makes it sound like a sampler rather than just quiet
+				 * distortion; the mask alone is nearly inaudible until it
+				 * is severe. */
+				if (++g_bcr_ph >= bcr_hold) {
+					g_bcr_ph = 0u;
+					g_bcr_hL = xL & bcr_mask;
+					g_bcr_hR = xR & bcr_mask;
+				}
+				xL = g_bcr_hL; xR = g_bcr_hR;
+			}
+			if (lfo_on) g_fx2_lfo += FX2_LFO_INC;   /* PG8-560: advanced ONCE */
+			if (rng_d) {
+				/* RING MOD: multiply by an audio-rate triangle carrier. No
+				 * delay line, no filter state -- one accumulator and two
+				 * multiplies. It is the most dramatic thing available for
+				 * free, which is exactly why it is here instead of echo. */
+				g_rng_ph += rng_inc;
+				int32_t _c = (int32_t)((g_rng_ph >> 23) & 511u);
+				_c = (_c < 256) ? (_c - 128) : (383 - _c);   /* -128..127 */
+				int32_t _wL = (xL * _c) >> 7;
+				int32_t _wR = (xR * _c) >> 7;
+				xL += ((_wL - xL) * rng_d) >> 8;
+				xR += ((_wR - xR) * rng_d) >> 8;
+			}
+			if (awh_d) {
+				/* AUTO-WAH: an envelope follower driving its own Chamberlin
+				 * SVF, bandpass output. Fast attack, slow release -- that
+				 * asymmetry IS the wah; a symmetric follower just wobbles.
+				 * Coefficients are the same Q14 domain as flt_lp_tab, so
+				 * 850 ~ 400 Hz and 4900 ~ 2.3 kHz. */
+				/* LAYOUT-562: fast attack, FAST release -- the filter has to
+				 * close between hits or every note rides one drifting peak. */
+				int32_t _aa = (xL < 0 ? -xL : xL) + (xR < 0 ? -xR : xR);
+				if (_aa > g_awh_env) g_awh_env += (_aa - g_awh_env) >> 4;
+				else                 g_awh_env -= (g_awh_env - _aa) >> 7;
+				int32_t _e = g_awh_env >> 6;      /* 4x more sensitive */
+				if (_e > 255) _e = 255;
+				int32_t _cf = 300 + ((_e * awh_d) >> 3);   /* ~140 Hz .. ~4 kHz */
+				if (_cf > 9000) _cf = 9000;
+				/* RESONANCE: damping 1/2 instead of 1 (Q = 2). Without a peak
+				 * this is a moving tone control, not a wah -- that missing
+				 * peak is why 560's version read as subtle. */
+				g_awh_lowL += (int32_t)(((int64_t)_cf * g_awh_bandL) >> 14);
+				int32_t _hL = xL - g_awh_lowL - (g_awh_bandL >> 1);
+				g_awh_bandL += (int32_t)(((int64_t)_cf * _hL) >> 14);
+				g_awh_lowR += (int32_t)(((int64_t)_cf * g_awh_bandR) >> 14);
+				int32_t _hR = xR - g_awh_lowR - (g_awh_bandR >> 1);
+				g_awh_bandR += (int32_t)(((int64_t)_cf * _hR) >> 14);
+				xL += ((g_awh_bandL - xL) * awh_d) >> 8;
+				xR += ((g_awh_bandR - xR) * awh_d) >> 8;
+			}
+			if (phs_d) {
+				/* PHASER: four one-pole allpasses per channel, swept by the
+				 * shared LFO. It does NOT change the level and it does NOT
+				 * cut a band -- it moves narrow NOTCHES through the
+				 * spectrum, which is what separates it from both the trance
+				 * gate (amplitude) and the filter (removal). Mixed at half
+				 * depth because a phaser's notches come from dry+wet
+				 * cancellation: an all-wet phaser is inaudible. */
+				uint32_t _pu = g_fx2_lfo >> 23;
+				int32_t  _pt = (_pu < 256u) ? (int32_t)_pu
+				                            : (int32_t)(511u - _pu);
+				/* FXRST-563: wider sweep, 0.17..0.93 instead of 0.30..0.95 --
+				 * more octaves of travel, so the notches move further. */
+				int32_t _pa = 700 + ((_pt * 3100) >> 8);   /* Q12 coeff */
+				/* FXRST-563 FEEDBACK -- the resonance. An allpass chain has
+				 * unity magnitude, so a loop gain of 1/2 is stable but sharpens
+				 * the notches into ringing peaks. WITHOUT it a phaser is a
+				 * gentle sweep of shallow dips -- the same defect the auto-wah
+				 * had in 560: a correct kernel with no character. */
+				int32_t _y = xL + (g_phs_fbL >> 1);   /* PHS3-565: 3/4 -> 1/2 (marc) */
+				for (int _k = 0; _k < 4; _k++) {
+					int32_t _t2 = g_phs_z[_k] - (int32_t)(((int64_t)_pa * _y) >> 12);
+					g_phs_z[_k] = _y + (int32_t)(((int64_t)_pa * _t2) >> 12);
+					_y = _t2;
+				}
+				g_phs_fbL = _y;
+				xL += ((_y - xL) * phs_d) >> 9;
+				_y = xR + (g_phs_fbR >> 1);
+				for (int _k = 0; _k < 4; _k++) {
+					int32_t _t2 = g_phs_z[4 + _k] - (int32_t)(((int64_t)_pa * _y) >> 12);
+					g_phs_z[4 + _k] = _y + (int32_t)(((int64_t)_pa * _t2) >> 12);
+					_y = _t2;
+				}
+				g_phs_fbR = _y;
+				xR += ((_y - xR) * phs_d) >> 9;
+			}
+			if (fx2_lfo_on) {
+				/* ONE triangle LFO drives both sweep and tremolo -- they are
+				 * the same motion applied to pan and to level, so sharing the
+				 * phase makes them lock musically instead of beating. */
+				uint32_t _t = g_fx2_lfo >> 23;              /* 0..511 */
+				int32_t  _tri = (_t < 256u) ? (int32_t)_t
+				                            : (int32_t)(511u - _t);   /* 0..255 */
+				if (swp_d) {
+					int32_t _d = ((_tri - 128) * swp_d) >> 8;
+					xL = (xL * (128 - _d)) >> 7;
+					xR = (xR * (128 + _d)) >> 7;
+				}
+				if (trm_d) {
+					/* W209: tremolo reads the shared accumulator at 4x --
+					 * ~4.8 Hz, a flutter you can hear -- while sweep keeps
+					 * the slow 1.2 Hz drift an auto-pan wants. One
+					 * accumulator, two speeds, one shift. */
+					uint32_t _ts = (g_fx2_lfo << 2) >> 23;      /* 0..511 */
+					int32_t  _tt = (_ts < 256u) ? (int32_t)_ts
+					                           : (int32_t)(511u - _ts);
+					int32_t _g = 128 - ((_tt * trm_d) >> 9);
+					xL = (xL * _g) >> 7;
+					xR = (xR * _g) >> 7;
+				}
+			}
 			int32_t m = gd ? (g0 + ((gd * (int32_t)(f + 1)) >> 8)) : ge;
 			int32_t oL = soft_limit((xL * m) >> 8);
 			int32_t oR = soft_limit((xR * m) >> 8);
 			s[2 * f]      = oL;
 			s[2 * f + 1u] = oR;
-			{   /* LED-549: VU = block peak of the FINAL output. Two
-			     * compares and a max per frame; the decay runs once per
-			     * block below, so the meter is nearly free. */
+			if ((f & 3u) == 0u) {   /* VU-558: 1-in-4 frames. A peak meter
+			     * driving 12 LEDs at ~16 Hz does not need all 256 frames of a
+			     * 5.33 ms block; 64 is the same picture. The comment below
+			     * said "nearly free" and nobody measured it -- it was the ONLY
+			     * unconditional per-frame addition between 545 and 549 (W202).
+			     * LED-549: VU = block peak of the FINAL output. */
 				int32_t aL = oL < 0 ? -oL : oL;
 				int32_t aR = oR < 0 ? -oR : oR;
 				int32_t a  = (aL > aR) ? aL : aR;
@@ -7504,12 +7739,16 @@ static void controls_diag(void)
 
 
 
-		printk("PF,v=5,pg=%u,id=%u,flt=%u,dst=%u,chr=%u,gat=%u,rate=%u,pat=%u,step=%u,gg=%u,vu=%u,fn=%u\n",
+		printk("PF,v=5,pg=%u,id=%u,flt=%u,dst=%u,chr=%u,gat=%u,rate=%u,pat=%u,step=%u,gg=%u,vu=%u,fn=%u,bcr=%u,rng=%u,awh=%u,phs=%u,swp=%u,trm=%u,awe=%d\n",
 		       (unsigned)g_pg_open, (unsigned)g_pg_id, (unsigned)g_flt_pos,
 		       (unsigned)g_dst_amt, (unsigned)g_chr_mix, (unsigned)g_gat_amt,
 		       (unsigned)g_gat_amt, (unsigned)g_gat_pat, (unsigned)g_tg_idx,
 		       (unsigned)g_gat_g,
-		       (unsigned)g_vu, (unsigned)g_fn_held);
+		       (unsigned)g_vu, (unsigned)g_fn_held,
+		       (unsigned)g_bcr_amt, (unsigned)g_rng_amt,
+		       (unsigned)g_awh_amt, (unsigned)g_phs_amt,
+		       (unsigned)g_swp_amt, (unsigned)g_trm_amt,
+		       (int)g_awh_env);
 		printk("P16,m=%u%u%u%u,n=%u%u%u%u\n",
 		       (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
 		       (unsigned)trk[2].p16m, (unsigned)trk[3].p16m,
@@ -8277,6 +8516,17 @@ static void led_service(void)
 	} else if (g_pg_exit) {
 		show_page_exit();    /* LED-549 r11: and hands it back on close */
 	} else if (g_pg_open && g_pg_id == 2u) {
+		/* LAYOUT-562: PAGE 2 VIEW -- bitcrush / ring mod / auto-wah / [echo]. */
+		uint8_t _b = (g_bcr_amt > 0u) ? 1u : 0u;
+		uint8_t _r = (g_rng_amt > 0u) ? 1u : 0u;
+		uint8_t _a = (g_awh_amt > 0u) ? 1u : 0u;
+		uint8_t _t = 0u;   /* LAYOUT-562: fader 4 RESERVED for echo */
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
+			uint8_t _on = (i == 0) ? _b : (i == 1) ? _r
+			            : (i == 2) ? _a : _t;
+			if (_on) track_led_on(i); else track_led_off(i);
+		}
+	} else if (g_pg_open && g_pg_id == 1u) {
 		/* FXP-547: THE FX PAGE VIEW -- one LED per effect, lit when
 		 * that effect is ENGAGED (away from neutral). Filter only
 		 * this rung; T2-T4 stay dark until their kernels land. */
@@ -8292,7 +8542,25 @@ static void led_service(void)
 			            : (i == 2) ? _don : _gon;   /* FX2-550: all four */
 			if (_on) track_led_on(i); else track_led_off(i);
 		}
-	} else if (g_pg_open) {
+	} else if (g_pg_open && g_pg_id == 3u) {
+		/* LAYOUT-562: PAGE 3 VIEW -- phaser / sweep / tremolo / [empty]. */
+		uint8_t _p = (g_phs_amt > 0u) ? 1u : 0u;
+		uint8_t _s = (g_swp_amt > 0u) ? 1u : 0u;
+		uint8_t _m = (g_trm_amt > 0u) ? 1u : 0u;
+		uint8_t _e = 0u;   /* LAYOUT-562: fader 4 EMPTY for now */
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
+			uint8_t _on = (i == 0) ? _p : (i == 1) ? _s
+			            : (i == 2) ? _m : _e;
+			if (_on) track_led_on(i); else track_led_off(i);
+		}
+	} else if (g_pg_open && g_pg_id >= 4u && g_pg_id <= 7u) {
+		/* PG8-560: pages 4-7 are RESERVED (tape / EQ / place / take+timing)
+		 * and are not built yet. A reserved page shows a DARK row and
+		 * swallows track taps. Until this stage it showed the MODE page and
+		 * a tap silently rewrote a track's next-record codec (W212) -- the
+		 * page was lying about what it was, on ten different ids. */
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) track_led_off(i);
+	} else if (g_pg_open && g_pg_id == 8u) {
 		/* PG-533/LS-534: the MODE PAGE view -- each track LED shows
 		 * its NEXT-record mode live: BLINK = stereo, SOLID = mono
 		 * (marc's call: mono is the special state, it gets the
@@ -9406,6 +9674,26 @@ int main(void)
 				 * fired phantom jump_to_slot() calls - songs switched by themselves
 				 * and could land on an empty slot. Combos under FN now do NOTHING.
 				 * Bands from SP1-BUTTON-LADDER-MAP.md, gaps between bands excluded. */
+				/* ===== FXRST2-564: FN + T1 + T4 = RESET EVERY FX =====
+				 * This lives HERE, inside the FN-held branch, because the branch
+				 * ends in an unconditional `continue` -- nothing downstream of it
+				 * runs while FN is down. 563 put the same handler after that
+				 * continue and it could never execute.
+				 * 1+4 reads ~1303, outside all four single-track bands below, so
+				 * it is invisible to the bank-jump and page decoders (M31-r2 left
+				 * combos under FN doing nothing). Two consecutive reads (~50 ms)
+				 * is the same debounce depth the combo path uses; firing at
+				 * exactly 2 makes it a CLICK, once per press, never a dwell. */
+				static int fxr_cnt;
+				if (fraw >= 1256 && fraw < 1347) {
+					if (++fxr_cnt == 2) {
+						fx_reset_all();
+						g_fxrst_lock = 1;
+					}
+					if (fxr_cnt > 1000) fxr_cnt = 1000;   /* no wrap on a long hold */
+				} else if (fraw < 110) {
+					fxr_cnt = 0;                          /* re-arm on true idle */
+				}
 				enum trk_btn tb = TRK_NONE;
 				if      (fraw >= 110  && fraw <  308) tb = TRK_1;   /* ~213  */
 				else if (fraw >= 308  && fraw <  488) tb = TRK_2;   /* ~404  */
@@ -9423,11 +9711,15 @@ int main(void)
 						pg_t0 = k_uptime_get();
 						pg_pend = (int)tb;
 					}
-					if ((pg_pend == (int)TRK_4 || pg_pend == (int)TRK_2) &&
+					if (pg_pend >= (int)TRK_1 && pg_pend <= (int)TRK_4 &&
 					    k_uptime_get() - pg_t0 >= 400) {
 						{	/* FXP-547: same-TN dwell toggles ITS page;
 							 * a different TN SWITCHES pages directly. */
-							uint8_t _id = (pg_pend == (int)TRK_4) ? 4u : 2u;
+							/* PGOPEN-561: TRK_1 is 0, so +1 maps the four
+							 * bookmark buttons onto pages 1-4 directly. The
+							 * old ternary could only ever emit 2 or 4 -- a
+							 * two-page constant that outlived two pages. */
+							uint8_t _id = (uint8_t)(pg_pend - (int)TRK_1 + 1);
 							if (g_pg_open && g_pg_id == _id) {
 								g_pg_open = 0;
 								g_pg_sweep = 0;    /* r11: cancel an entry mid-flight */
@@ -9458,10 +9750,10 @@ int main(void)
 							}
 						}   /* PF-545 r4: the same
 						          * FN+hold-TN dwell TOGGLES its page (W156).
-						          * T1-T3 have no page yet and get NO shrug
-						          * (marc: all four land before release) --
-						          * their holds just resolve as bank jumps on
-						          * release, exactly as they do today. */
+						          * PGOPEN-561: ALL FOUR now open their own
+						          * page on the dwell. A QUICK tap is still the
+						          * bank jump -- the dwell cancels it by
+						          * clearing pg_pend, as T2/T4 already did. */
 						pg_pend = -1;
 					}
 					led_service();           /* live song display mid-hold */
@@ -10147,9 +10439,24 @@ int main(void)
 				if (combo_now == combo_cand) { if (combo_cnt < 3) combo_cnt++; }
 				else { combo_cand = combo_now; combo_cnt = 1; }
 				if (combo_cnt >= 2) combo_held |= (uint8_t)combo_now;   /* rule 1 + 3 */
-				if (combo_now == 0x9) {  /* ONLY exactly 1+4 arms the bootloader */
+				if (g_fxrst_lock) {
+					/* FXRST2-564: an FX reset just fired under FN. If FN is
+					 * lifted before the tracks -- which is the natural way to
+					 * let go -- the chord arrives here as a bare 1+4 and would
+					 * mute tracks 1 and 4, or (held long enough) reach the
+					 * bootloader. Swallow it until the ladder is truly idle.
+					 * ⚠ THIS is the real hazard. 563 guarded an imaginary one
+					 * in code that never executes. */
+					combo14_t  = -1;
+					combo_held = 0;
+					raw = TRK_NONE;
+				} else if (combo_now == 0x9) {  /* ONLY exactly 1+4 arms the bootloader */
 					/* time-based (not a +8/iter counter) so the diag-print path
-					 * can't skew the threshold. */
+					 * can't skew the threshold.
+					 * ⚠ UNGUARDED BY DESIGN. There is no reset pin; this is the
+					 * only way back. FN cannot reach here anyway (the FN branch
+					 * continues out ~230 lines above), so a modifier test would
+					 * be theatre. */
 					if (combo14_t < 0) combo14_t = k_uptime_get();
 					else if (k_uptime_get() - combo14_t >= DFU_HOLD_MS) enter_dfu();
 				} else {
@@ -10179,6 +10486,7 @@ int main(void)
 				}
 			} else {
 				combo14_t = -1;
+				g_fxrst_lock = 0;   /* FXRST2-564: ladder idle, lock released */
 				combo_cand = 0; combo_cnt = 0;
 				raw = decode_tracks(trk_raw);
 			}
@@ -10386,6 +10694,16 @@ int main(void)
 					int ti = b;
 					if (g_pg_open && g_pg_id == 2u && g_rec_track < 0 &&
 					    !armed_press[ti]) {
+						/* FX2-558: a track tap on page 5 resets that effect
+						 * to neutral -- the same blind kill switch page 2 has. */
+						if (ti == 0) g_bcr_amt = 0u;
+						if (ti == 1) g_rng_amt = 0u;
+						if (ti == 2) g_awh_amt = 0u;
+						/* LAYOUT-562: track 4 reserved for echo -- no-op */
+						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
+						tap_deadline[ti] = 0;
+					} else if (g_pg_open && g_pg_id == 1u && g_rec_track < 0 &&
+					    !armed_press[ti]) {
 						/* FXP-547: on the FX PAGE a track tap RESETS that
 						 * effect to neutral -- a kill switch you can hit
 						 * blind mid-performance. Only the filter exists
@@ -10401,7 +10719,21 @@ int main(void)
 						}
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
-					} else if (g_pg_open && g_rec_track < 0 &&
+					} else if (g_pg_open && g_pg_id == 3u && g_rec_track < 0 &&
+					    !armed_press[ti]) {
+						/* PG8-560: page 3 tap = kill that effect. */
+						if (ti == 0) g_phs_amt = 0u;
+						if (ti == 1) g_swp_amt = 0u;
+						if (ti == 2) g_trm_amt = 0u;
+						/* LAYOUT-562: track 4 empty -- no-op */
+						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
+						tap_deadline[ti] = 0;
+					} else if (g_pg_open && g_pg_id >= 4u && g_pg_id <= 7u &&
+					    g_rec_track < 0 && !armed_press[ti]) {
+						/* PG8-560: reserved page -- SWALLOW. Without this the
+						 * tap falls through to stop / mute / delete. */
+						tap_deadline[ti] = 0;
+					} else if (g_pg_open && g_pg_id == 8u && g_rec_track < 0 &&
 					    !armed_press[ti]) {
 						/* PF-545: the OPEN PAGE owns track taps (sticky
 						 * pages, W156). MODE page: flip the NEXT-record
@@ -10822,6 +11154,26 @@ int main(void)
 							g_fh_latch[fi] = 0;
 					}
 					if (g_pg_open && g_pg_id == 2u) {
+						/* FX2-558: page 5 owns the faders, same pickup law. */
+						uint8_t _pv = (fi == 0) ? g_bcr_amt
+						            : (fi == 1) ? g_rng_amt
+						            : (fi == 2) ? g_awh_amt : 0u;
+						int _q8 = (int)((q > 255u) ? 255u : q);
+						if (g_fx_pick[fi]) {
+							int _d = _q8 - (int)_pv;
+							int _p = g_fx_lastq[fi];
+							g_fx_lastq[fi] = _q8;
+							if ((_d >= -6 && _d <= 6) ||
+							    (_p >= 0 && ((_p - (int)_pv > 0) != (_d > 0))))
+								g_fx_pick[fi] = 0;
+						}
+						if (!g_fx_pick[fi]) {
+							if      (fi == 0) g_bcr_amt = (uint8_t)_q8;
+							else if (fi == 1) g_rng_amt = (uint8_t)_q8;
+							else if (fi == 2) g_awh_amt = (uint8_t)_q8;
+							/* LAYOUT-562: fader 4 inert until echo lands */
+						}
+					} else if (g_pg_open && g_pg_id == 1u) {
 						/* FXP-547: THE FX PAGE OWNS THE FADERS while it is
 						 * open (track volumes are untouched and resume
 						 * exactly where they were). PICKUP (framework law,
@@ -10854,6 +11206,29 @@ int main(void)
 							g_flt_pos = (uint8_t)_q8;   /* ONE filter,
 							 * two handles: FN+fader-4 and this page fader
 							 * drive the SAME state (the map's decision) */
+					} else if (g_pg_open && g_pg_id == 3u) {
+						/* PG8-560: page 3 owns the faders, same pickup law
+						 * (W155) -- a fader does nothing until it CROSSES the
+						 * stored value, so opening a page can never jump a
+						 * parameter to wherever the fader happens to sit. */
+						uint8_t _pv = (fi == 0) ? g_phs_amt
+						            : (fi == 1) ? g_swp_amt
+						            : (fi == 2) ? g_trm_amt : 0u;
+						int _q8 = (int)((q > 255u) ? 255u : q);
+						if (g_fx_pick[fi]) {
+							int _d = _q8 - (int)_pv;
+							int _p = g_fx_lastq[fi];
+							g_fx_lastq[fi] = _q8;
+							if ((_d >= -6 && _d <= 6) ||
+							    (_p >= 0 && ((_p - (int)_pv > 0) != (_d > 0))))
+								g_fx_pick[fi] = 0;
+						}
+						if (!g_fx_pick[fi]) {
+							if      (fi == 0) g_phs_amt = (uint8_t)_q8;
+							else if (fi == 1) g_swp_amt = (uint8_t)_q8;
+							else if (fi == 2) g_trm_amt = (uint8_t)_q8;
+							/* LAYOUT-562: fader 4 empty -- no-op */
+						}
 					} else if (!g_fh_latch[fi])
 						trk[fi].vol_q8 = (uint16_t)q;
 				}
