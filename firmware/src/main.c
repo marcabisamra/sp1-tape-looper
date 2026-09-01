@@ -7186,6 +7186,7 @@ static void controls_diag(void)
 
 
 
+		printk("PF,v=1,pg=%u\n", (unsigned)g_pg_open);
 		printk("P16,m=%u%u%u%u,n=%u%u%u%u\n",
 		       (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
 		       (unsigned)trk[2].p16m, (unsigned)trk[3].p16m,
@@ -8840,30 +8841,21 @@ int main(void)
 					else { bj_cand = tb; bj_cnt = 1; }
 					if (bj_cnt == 3) {   /* exact edge: once per press */
 						combo_seen = 1;      /* never a power-off now */
-						if (g_pg_open) {
-							/* PG-533: in the MODE PAGE a track tap
-							 * toggles that track's NEXT-record mode.
-							 * No mute, no audio side effect -- the
-							 * LEDs answer (solid=stereo, blink=mono). */
-							trk[(int)tb].p16m_next = !trk[(int)tb].p16m_next;
-							if (g_slot < NUM_SLOTS)   /* FX2-536: stamp NOW --
-							 * a deferred stamp can land on the wrong
-							 * slot if a jump beats the save service. */
-								g_x3.t[g_slot][(int)tb].rsv = (uint8_t)(0x80u |
-								    (trk[(int)tb].p16m_next & 1u));
-							g_meta_save_req = 1;   /* PS-535: persist per song */
-							bj_fired = (int)tb;
-						} else {
-							/* PG-533: the jump now resolves on RELEASE
-							 * (the map's pages prerequisite); a held T4
-							 * becomes the MODE PAGE instead. */
-							pg_t0 = k_uptime_get();
-							pg_pend = (int)tb;
-						}
+						/* PF-545: page toggles moved to the BASE layer
+						 * (sticky pages, W156). With FN held a track
+						 * press is ALWAYS the jump-on-release / page-
+						 * dwell candidate, page open or not. */
+						pg_t0 = k_uptime_get();
+						pg_pend = (int)tb;
 					}
-					if (!g_pg_open && pg_pend == (int)TRK_4 &&
+					if (pg_pend == (int)TRK_4 &&
 					    k_uptime_get() - pg_t0 >= 400) {
-						g_pg_open = 1;   /* PG-533: FN + hold T4 = MODE PAGE */
+						g_pg_open = !g_pg_open;   /* PF-545 r4: the same
+						          * FN+hold-TN dwell TOGGLES its page (W156).
+						          * T1-T3 have no page yet and get NO shrug
+						          * (marc: all four land before release) --
+						          * their holds just resolve as bank jumps on
+						          * release, exactly as they do today. */
 						pg_pend = -1;
 					}
 					led_service();           /* live song display mid-hold */
@@ -9402,6 +9394,13 @@ int main(void)
 			 * it can't leak into the normal decode as a restart / play-stop. */
 			if (combo_seen &&
 			    ladder_read(&adc_ladder[LAD_TRACKS]) >= 110) suppress_play = 1;
+			if (g_pg_open && !combo_seen)
+				g_pg_open = 0;   /* PF-545 r3: a BARE FN tap closes the
+				                  * page (W156). EDGE-ONLY -- inside the
+				                  * release block; r2 ran every pass and
+				                  * closed one pass after combo_seen
+				                  * cleared. Any combo (jump, chop, the
+				                  * opening dwell) leaves it OPEN. */
 		}
 		press_start = -1;
 		combo_start = -1;
@@ -9432,7 +9431,7 @@ int main(void)
 			g_play_bpm = 80;
 		}
 		bj_cand = TRK_NONE; bj_cnt = 0; bj_fired = -1; fnp_edge = -1; fnp_chain = 0;
-		g_pg_open = 0; pg_pend = -1;   /* PG-533: releasing FUNCTION closes the page */
+		pg_pend = -1;   /* PF-545: the momentary close is GONE (sticky) */
 		fnp_presses = 0;
 		cp_cand = VOL_NONE; cp_cnt = 0; cp_dcl_band = -1;
 
@@ -9734,7 +9733,20 @@ int main(void)
 				}
 				if (b >= TRK_1 && b <= TRK_4) {
 					int ti = b;
-					if (ti == stop_tap_trk) {
+					if (g_pg_open && g_rec_track < 0 &&
+					    !armed_press[ti]) {
+						/* PF-545: the OPEN PAGE owns track taps (sticky
+						 * pages, W156). MODE page: flip the NEXT-record
+						 * mode, stamp + persist (the FX2/E3 discipline).
+						 * No mute, no delete window; record stays one
+						 * gesture away (a HOLD arms straight through). */
+						trk[ti].p16m_next = !trk[ti].p16m_next;
+						if (g_slot < NUM_SLOTS)
+							g_x3.t[g_slot][ti].rsv = (uint8_t)(0x80u |
+							    (trk[ti].p16m_next & 1u));
+						g_meta_save_req = 1;
+						tap_deadline[ti] = 0;
+					} else if (ti == stop_tap_trk) {
 						stop_tap_trk = -1;   /* R1: stop fired at press;
 						                      * this release is spent */
 					} else if (armed_press[ti]) {
@@ -9975,7 +9987,7 @@ int main(void)
 				                        * must not read as a mute */
 			}
 			if (!armed_press[ti] && ti != stop_tap_trk &&
-				    g_rec_track < 0 && !g_heads_mode &&
+				    g_rec_track < 0 && !g_heads_mode && !g_pg_open &&
 				    !(tap_deadline[ti] > 0 &&
 				      press_t[ti] <= tap_deadline[ti]) &&   /* GS-531: inside the
 				      * double-tap window a hold means DELETE (below), never ARM */
