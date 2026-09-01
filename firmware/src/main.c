@@ -115,6 +115,7 @@ static const struct led track_leds[] = {
 static volatile uint8_t g_led_dim = 1;
 
 static void track_led_on(int i);
+static void track_led_off(int i);   /* LED-549 r10: show_page_sweep */
 static void track_all_off(void);
 static bool usb_present(void);
 static bool charging(void);
@@ -1709,7 +1710,18 @@ static volatile uint8_t  g_bnc_active;
 static volatile uint8_t  g_bnc_done;
 static volatile uint8_t  g_bnc_abort;
 static volatile uint8_t  g_led_shrug;      /* track row "no" double-blink */
-static volatile uint8_t  g_pg_open;        /* PG-533: T4 MODE PAGE open (FN held) */
+static volatile uint8_t  g_fn_held;        /* LED-549: FUNCTION is down (LED routing) */
+static volatile uint8_t  g_vu;             /* LED-549: master VU, 0..255, decayed */
+static volatile uint8_t  g_pg_sweep;       /* LED-549 r8: page sweep/land counter */
+#define PG_LAST 12u   /* LED-549 r12: pages 1..12 are all reachable now,
+                       * content or not, so the counting scheme can be
+                       * exercised across all three group shapes. */
+static volatile uint8_t  g_pg_exit;        /* LED-549 r11: exit sweep counter */
+static volatile uint16_t g_pg_cnt;         /* LED-549 r11: page-number count phase */
+static volatile uint8_t  g_pg_open;        /* PG-533: a page is open (PF-545: sticky) */
+static volatile uint8_t  g_pg_id;          /* FXP-547: WHICH page -- 4 = MODE (T4), 2 = FX (T2) */
+static uint8_t           g_fx_pick[4];     /* FXP-547: fader owes a pickup cross on this page */
+static int               g_fx_lastq[4];    /* FXP-547: last raw read while un-picked */
 static uint8_t  bnc_src, bnc_dst;
 static uint8_t  bnc_pos[NTRK], bnc_rev[NTRK], bnc_mut[NTRK];
 static uint16_t bnc_vol[NTRK];
@@ -1751,6 +1763,98 @@ static volatile uint8_t  g_win_rev;
  * from the tables below, per-block smoothed so sweeps never zipper.
  * Latches where the fader leaves it; resets to neutral at power-on. */
 static volatile uint8_t  g_flt_pos = 128;
+/* DST-548: stock-parity DISTORTION on the FX page (fader 3).
+ * 0 = clean (the branch is skipped entirely), 255 = full drive.
+ * Cubic soft clip y = x - x^3/3 in Q15, pre-gained: gentle at low
+ * settings, hard-clipped grit at the top, no lookup table. */
+static volatile uint8_t  g_dst_amt;
+/* FX2-550 tuning. EVERY ONE of these was wrong on the first pass and was
+ * caught by simulating the kernels before building -- worth stating,
+ * because all four are the kind of error that sounds like a broken
+ * effect rather than a mistuned one.
+ * CHR_LFO_INC: one LFO cycle is 2^32/INC frames, so 60850 gives
+ * ~0.68 Hz at 48 kHz. The first value was 48x too fast (33 Hz) --
+ * that is ring modulation, not chorus.
+ * CHR_D_SPAN: the delay sweeps CHR_D_MIN..+SPAN frames = 4..18 ms,
+ * the classic chorus window. The first value swept to 60 ms, which
+ * is a slapback echo. */
+#define CHR_LFO_INC   60850u       /* ~0.68 Hz sweep */
+#define CHR_D_MIN     192          /* 4 ms, in frames */
+#define CHR_D_SPAN    672          /* +14 ms, in frames */
+/* FX2-550 r3. The threshold is now RELATIVE TO THE SIGNAL'S OWN RUNNING
+ * PEAK, not to an absolute level, because I got the absolute scale wrong
+ * twice and the second wrong answer was indistinguishable from the first
+ * to anyone using it: the fader just made everything silent.
+ * An absolute threshold has to be stated in SOME unit, and there is no
+ * stable one here. The kernel sees the pre-master mix, whose level moves
+ * with the master volume, with all four track faders, and -- once the
+ * distortion is engaged -- with its output trim, which caps the signal
+ * near 3,700 counts however loud the take was. Any fixed number is
+ * therefore right for one setting of the instrument and wrong for the
+ * rest, and "wrong" here means the gate is either deaf or shut.
+ * A peak follower with a ~1.4 s release tracks how loud this material
+ * actually runs, and the fader sets a FRACTION of that, 0 to 0.78. Now
+ * the control means the same thing at every volume, with or without
+ * distortion, on a quiet take and a loud one: it cannot be mis-scaled,
+ * because it no longer carries a scale. */
+/* TG-551 PATTERNS: 16 steps, bit 0 = step 0. The RATE sets each step's
+ * duration, so one pattern set spans a bar-long swell (1/4) through a
+ * 32nd stutter. */
+/* r2: STRAIGHT (0xFFFF) is GONE and its removal is a bug fix, not a
+ * taste change -- every step on means the gate NEVER CLOSES, so it
+ * was a no-op, and it was pattern 0, the DEFAULT. The first thing
+ * fader 4 did on a fresh boot was nothing at all. OFFBEAT is gone
+ * at marc's request. Every surviving pattern has holes in it, so
+ * the control is audible the moment it leaves the bottom. */
+/* r22 (marc): only the 2nd and 3rd survive. TRESILLO and THREES
+ * were both SPARSE (6 of 16 steps), and at this band -- where a
+ * step is 30-80 ms -- sparse reads as dropout rather than as
+ * rhythm. The two that kept their character are the DENSE ones. */
+static const uint16_t tg_pat[2] = {
+	0xDDDDu,   /* 0 GALLOP -- x.xx per four, 12 of 16 steps */
+	0x3333u,   /* 1 HALVES -- two on two off,  8 of 16 steps */
+};
+/* Steps per BEAT per rate. r2 (marc: "they feel way too slow except
+ * for the max and max even kind of feels a little too slow"): the
+ * ladder is now a NARROW, FAST band, tuned by ear over three
+ * rounds. It went 1/4..1/32 (all too slow), then 1/16..1/64T
+ * (top too fast), and now sits between those: 1/16T at the
+ * bottom to 1/32T at the top -- the top being a little faster
+ * than the 1/32 that felt closest, and the whole slow half
+ * removed. At a bar-long step you were not hearing a gate, you
+ * were hearing the loop stop; past ~25 ms it stops being rhythm
+ * and becomes timbre. This band is the part that is neither.
+ * The middle rungs (7, 9, 10 per beat) are not classical
+ * divisions, but they are still exact multiples of the beat and
+ * re-anchored to the grid every block, so they stay locked --
+ * they simply repeat over 2 or 3 bars instead of one.
+ * r23: the TOP goes up, the bottom stays. 83 ms at the bottom,
+ * 21 ms at the top (was 31). The rungs spread rather than
+ * shift, so the familiar middle is where it was.
+ * Note 21 ms was REJECTED as too fast two passes ago -- with
+ * SPARSE patterns. The dense ones are what make the fast end
+ * work: a sparse pattern at 21 ms is mostly silence, a dense
+ * one is flutter. Same number, different effect, because the
+ * rate and the pattern are not independent controls.
+ * 1/16T  1/32  ~1/40  1/32T  1/64  1/64T */
+static const uint8_t tg_spb[7] = { 0u, 6u, 8u, 10u, 12u, 16u, 24u };
+#define TG_ATK  256   /* 16 frames = 0.33 ms open (stock ramps one block) */
+#define TG_REL   64   /* 64 frames = 1.3 ms close. Softer than the open,
+                       * which is what reads as rhythmic rather than as
+                       * damage. Both are far shorter than the shortest
+                       * step (1/32 at 160 BPM ~ 1,125 frames). */
+static volatile uint8_t g_gat_pat;   /* pattern index; the T4 tap cycles */
+static uint32_t g_tg_idx;            /* step 0..15, re-anchored per block */
+static uint32_t g_tg_ph;             /* frames into the current step */
+/* The gate gain is Q12: 4096 = unity. */
+static int32_t g_gat_g = 4096;
+#define CHR_LEN   1024u          /* 21.3 ms at 48 kHz */
+#define CHR_MASK  (CHR_LEN - 1u)
+static int16_t  g_chr_buf[CHR_LEN];
+static uint32_t g_chr_w;
+static uint32_t g_chr_ph;         /* LFO phase, full 32-bit wrap */
+static volatile uint8_t  g_chr_mix;       /* FX2-550: chorus depth/mix, fader 2 */
+static volatile uint8_t  g_gat_amt;       /* FX2-550: gate threshold,   fader 4 */
 static const int16_t flt_lp_tab[14] = {   /* 80 Hz .. 6.5 kHz, exp */
 	172, 241, 337, 473, 664, 931, 1306, 1831,
 	2566, 3595, 5033, 7032, 9788, 13524 };
@@ -3716,6 +3820,106 @@ static void looper_audio_block(int16_t *s)
 				flt_f += fd;
 			}
 		}
+		/* DST-548: per-block drive/trim, RAMPED like the filter's
+		 * coefficient so fader moves never zipper. dst_g 4096 = unity;
+		 * full drive is ~8x in, with the trim taking ~6 dB back out. */
+		int32_t vu_pk = 0;   /* LED-549: this block's output peak */
+		/* FX2-550: both new kernels are read ONCE per block into a local,
+		 * exactly like the filter and the distortion. Reading a volatile
+		 * inside the frame loop would re-load it 128 times and would also
+		 * let a fader move mid-block. */
+		const int32_t chr_mix = (int32_t)g_chr_mix;
+		/* TG-551: the grid anchor, recomputed once per block.
+		 * g_grid_beat_frames is in OUTPUT frames -- the tape domain has its
+		 * own g_gridrec_beat_samps -- so this locks to WHAT YOU HEAR and
+		 * stays locked under varispeed for free. Re-deriving the step index
+		 * from the grid every block means the pattern can never drift, and
+		 * the per-frame path is then just an increment and a compare.
+		 * No grid on this song -> fall back to the tape's own BPM label. An
+		 * effect that silently does nothing is indistinguishable from a
+		 * broken one; today proved that twice. */
+		const uint32_t tg_rate = g_gat_amt
+		                       ? (1u + (((uint32_t)g_gat_amt * 6u) >> 8)) : 0u;
+		uint32_t tg_sf = 0u;
+		if (tg_rate) {
+			uint32_t _bf = (g_grid_active && g_grid_beat_frames)
+			             ? g_grid_beat_frames
+			             : ((g_play_bpm > 0)
+			                ? (48000u * 60u / (uint32_t)g_play_bpm) : 0u);
+			uint64_t _anc = (g_grid_active && g_grid_beat_frames)
+			              ? g_grid_anchor : 0u;
+			uint32_t _spb = tg_spb[tg_rate];
+			if (_bf && _spb) tg_sf = _bf / _spb;
+			/* r21: pattern slot 4 is OFF -- the fifth tap position. */
+			if (g_gat_pat >= 2u) tg_sf = 0u;
+			if (tg_sf) {
+				uint64_t _ph = g_sample_clock - _anc;
+				g_tg_idx = (uint32_t)((_ph / tg_sf) & 15u);
+				g_tg_ph  = (uint32_t)(_ph % tg_sf);
+			}
+		}
+		const uint16_t tg_mask = tg_pat[(g_gat_pat < 2u) ? g_gat_pat : 0u];
+		/* r21: whenever the gate is not running -- fader down OR tapped to
+		 * OFF -- hand the gain back at UNITY. Without this a bypass taken
+		 * mid-close would leave the last partial gain applied forever. */
+		if (!tg_sf) g_gat_g = 4096;
+		static int32_t dst_g_s;
+		{
+			/* DST-548 r2 (marc: "make it more obvious"). Two faults.
+			 * (1) RANGE. Max drive was 8x = +18 dB, and real loop
+			 * material peaks near -20 dBFS -- so at the TOP of the
+			 * fader the signal barely reached full scale and barely
+			 * clipped at all. Now 32x = +30 dB, which puts that same
+			 * material 10 dB INTO the clipper at the top.
+			 * (2) TAPER. It was LINEAR in gain, so the first 80%% of
+			 * the throw spent itself on the quiet dBs and every
+			 * audible change crowded into the last inch. Now it is
+			 * EXPONENTIAL -- five octaves, so every 20%% of travel
+			 * DOUBLES the drive and the grit arrives evenly.
+			 * (2^x is linear-interpolated inside each octave: ~6%%
+			 * worst-case error, inaudible, and no table or divide.) */
+			int32_t tg;
+			if (g_dst_amt == 0u) {
+				tg = 0;
+			} else {
+				uint32_t _o5  = (uint32_t)g_dst_amt * 5u;   /* 0..1275 */
+				uint32_t _oct = _o5 / 255u;                 /* 0..5    */
+				uint32_t _fr  = _o5 - _oct * 255u;          /* 0..254  */
+				/* r3 (marc: "louder in the bottom half, distortion only
+				 * at the top"). The range now STARTS at 2x. Below ~5x
+				 * nothing audible happens to a -20 dBFS take except
+				 * level, so a range starting at 1x spent its whole
+				 * bottom half being a volume knob. 2x..64x puts the
+				 * clipping threshold around a THIRD of the way up. */
+				uint32_t _b   = 8192u << _oct;   /* 2x .. 64x */
+				tg = (int32_t)(_b + ((_b * _fr) / 255u));
+			}
+			int32_t d = (tg - dst_g_s) >> 3;
+			if (d == 0) d = (tg > dst_g_s) ? 1 : ((tg < dst_g_s) ? -1 : 0);
+			dst_g_s += d;
+		}
+		const int32_t dst_g = (g_dst_amt == 0u && dst_g_s < 4160) ? 0 : dst_g_s;
+		/* DST-548 r2: the trim used to cancel the drive EXACTLY, which
+		 * kept the level honest but also removed the loudness cue that
+		 * makes distortion read as distortion. It now allows up to +6 dB
+		 * of makeup and no more: below 2x drive there is no trim at all
+		 * (the level simply rises), and above it the trim holds the net
+		 * at 2x so everything further is pure GRIT, not volume. */
+		/* DST-548 r3: THE TRIM LAW. r2 allowed +6 dB of makeup below
+		 * 2x drive, which is exactly the "it just gets louder" marc
+		 * heard -- and worse, past ~6x it kept dividing by the drive
+		 * long after the clipper had stopped getting louder, so the
+		 * top of the fader went QUIET. Both come from trimming by the
+		 * drive when what matters is the OUTPUT.
+		 * The soft clipper saturates at 2/3 full scale no matter how
+		 * hard it is driven. So the honest trim is 1/drive only while
+		 * the signal is still LINEAR, and a CONSTANT once it clips.
+		 * The 700 floor is that constant. Measured against a -20 dBFS
+		 * take the output now sits within ~1 dB from 2x to 64x: every
+		 * bit of the fader is TIMBRE, and none of it is volume. */
+		int32_t _dt = (dst_g == 0) ? 4096 : (int32_t)(16777216 / dst_g);
+		if (_dt < 700) _dt = 700;
+		const int32_t dst_trim = _dt;
 		const int32_t mv = (int32_t)g_master_vol_q8;
 		const int32_t ge = (mv * env_q8) >> 8;
 		static int32_t ge_prev;
@@ -3737,9 +3941,123 @@ static void looper_audio_block(int16_t *s)
 				flt_bandR += (int32_t)(((int64_t)flt_f * hiR) >> 14);
 				xR = (flt_mode == 1u) ? flt_lowR : hiR;
 			}
+			if (chr_mix) {
+				/* FX2-550 CHORUS: one mono delay line read at two LFO
+				 * phases a quarter cycle apart -- that phase offset IS
+				 * the stereo image, and it costs one buffer instead of
+				 * two. Triangle LFO (no table, no divide), linearly
+				 * interpolated read so the pitch bend is smooth rather
+				 * than stepped -- an integer-only read is what makes a
+				 * cheap chorus sound like a broken one. */
+				g_chr_buf[g_chr_w & CHR_MASK] = (int16_t)((xL + xR) >> 1);
+				g_chr_ph += CHR_LFO_INC;
+				for (int _c = 0; _c < 2; _c++) {
+					uint32_t _ph = g_chr_ph + (_c ? 0x40000000u : 0u);
+					/* triangle: 0..65535 from the top 17 bits */
+					uint32_t _t = _ph >> 15;             /* 0..131071 */
+					int32_t  _tri = (_t < 65536u) ? (int32_t)_t
+					                              : (int32_t)(131071u - _t);
+					/* delay = 4 ms .. 18 ms, in Q8 frames */
+					int32_t _d8 = (CHR_D_MIN << 8) +
+					              ((_tri * CHR_D_SPAN) >> 8);
+					uint32_t _di = (uint32_t)(_d8 >> 8);
+					int32_t  _fr = _d8 & 255;
+					int32_t  _a = g_chr_buf[(g_chr_w - _di)      & CHR_MASK];
+					int32_t  _b = g_chr_buf[(g_chr_w - _di - 1u) & CHR_MASK];
+					int32_t  _w = _a + (((_b - _a) * _fr) >> 8);
+					if (_c) xR += (_w * chr_mix) >> 8;
+					else    xL += (_w * chr_mix) >> 8;
+				}
+				g_chr_w++;
+			}
+			if (dst_g) {
+				/* DST-548: cubic soft clip, Q15, per channel. The
+				 * drive gain rides IN (more drive = more clipping)
+				 * and a compensating trim rides OUT, so the fader
+				 * adds grit without becoming a volume knob. */
+				/* DST-548 r2: 64-bit product. At the old 8x ceiling
+				 * xL * dst_g just fit in int32; at 32x it does NOT
+				 * (32767 * 131072 = 4.29e9 against a 2.15e9 limit)
+				 * and would WRAP -- which sounds like a fuzz pedal
+				 * exactly often enough to be mistaken for working. */
+				int32_t dL = (int32_t)(((int64_t)xL * dst_g) >> 12);
+				int32_t dR = (int32_t)(((int64_t)xR * dst_g) >> 12);
+				if (dL >  32767) dL =  32767;
+				if (dL < -32767) dL = -32767;
+				if (dR >  32767) dR =  32767;
+				if (dR < -32767) dR = -32767;
+				{ int32_t t = (dL * dL) >> 15;
+				  dL = dL - (((t * dL) >> 15) * 10923 >> 15); }
+				{ int32_t t = (dR * dR) >> 15;
+				  dR = dR - (((t * dR) >> 15) * 10923 >> 15); }
+				xL = (dL * dst_trim) >> 12;
+				xR = (dR * dst_trim) >> 12;
+			}
+			if (tg_sf) {
+				/* TG-551 TRANCE GATE -- tempo-synced amplitude gating on a
+				 * 16-step pattern. It obeys the CLOCK and does not listen to
+				 * the signal, which is the whole difference from what was
+				 * here before and the reason it cannot be mis-scaled.
+				 * Last in the chain (filter -> chorus -> drive -> gate), so
+				 * the grit gets chopped rather than the chop getting fuzzed. */
+				if (++g_tg_ph >= tg_sf) {
+					g_tg_ph = 0u;
+					g_tg_idx = (g_tg_idx + 1u) & 15u;
+				}
+				int32_t _tgt = ((tg_mask >> g_tg_idx) & 1u) ? 4096 : 0;
+				if (_tgt > g_gat_g) {
+					g_gat_g += TG_ATK;
+					if (g_gat_g > 4096) g_gat_g = 4096;
+				} else if (_tgt < g_gat_g) {
+					g_gat_g -= TG_REL;
+					if (g_gat_g < 0) g_gat_g = 0;
+				}
+				xL = (int32_t)(((int64_t)xL * g_gat_g) >> 12);
+				xR = (int32_t)(((int64_t)xR * g_gat_g) >> 12);
+			}
 			int32_t m = gd ? (g0 + ((gd * (int32_t)(f + 1)) >> 8)) : ge;
-			s[2 * f]      = soft_limit((xL * m) >> 8);
-			s[2 * f + 1u] = soft_limit((xR * m) >> 8);
+			int32_t oL = soft_limit((xL * m) >> 8);
+			int32_t oR = soft_limit((xR * m) >> 8);
+			s[2 * f]      = oL;
+			s[2 * f + 1u] = oR;
+			{   /* LED-549: VU = block peak of the FINAL output. Two
+			     * compares and a max per frame; the decay runs once per
+			     * block below, so the meter is nearly free. */
+				int32_t aL = oL < 0 ? -oL : oL;
+				int32_t aR = oR < 0 ? -oR : oR;
+				int32_t a  = (aL > aR) ? aL : aR;
+				if (a > vu_pk) vu_pk = a;
+			}
+		}
+		{   /* LED-549 r4: a level ANCHORED AT FULL SCALE, so the
+		     * bar can actually reach the top. 12 steps of 3 dB =
+		     * 36 dB of travel, with 12 at 0 dBFS. r3 anchored at the
+		     * floor instead and capped at 24/47 -- the meter was
+		     * mathematically unable to leave the bottom half.
+		     * BALLISTICS: instant attack (it is a peak), release one
+		     * step per 8 blocks (~40 ms/step, ~0.5 s top to bottom) --
+		     * slow enough to read as a level, not a twitch. */
+			int lv = 0;
+			if (vu_pk > 8) {
+				int b = 31 - __builtin_clz((uint32_t)vu_pk);
+				int hf = (int)(((uint32_t)vu_pk >> (b - 1)) & 1u);
+				lv = b * 2 + hf - 13;   /* LED-549 r6: the TOP of the
+				     * bar is now -12 dBFS, not 0 -- real loop material
+				     * peaked around -18 and only ever reached the bottom
+				     * two LEDs. 12 steps x 3 dB now spans -48..-12 dBFS,
+				     * so normal playing lives in the upper half and loud
+				     * moments peg the top, which is how a meter should
+				     * read. */
+				if (lv < 0) lv = 0;
+				if (lv > 12) lv = 12;
+			}
+			static uint8_t vu_hold;
+			if ((uint8_t)lv >= g_vu) {
+				g_vu = (uint8_t)lv; vu_hold = 0;
+			} else if (++vu_hold >= 8u) {
+				vu_hold = 0;
+				if (g_vu) g_vu--;
+			}
 		}
 	}
 	g_sample_clock += BLK_FRAMES;
@@ -7186,7 +7504,12 @@ static void controls_diag(void)
 
 
 
-		printk("PF,v=1,pg=%u\n", (unsigned)g_pg_open);
+		printk("PF,v=5,pg=%u,id=%u,flt=%u,dst=%u,chr=%u,gat=%u,rate=%u,pat=%u,step=%u,gg=%u,vu=%u,fn=%u\n",
+		       (unsigned)g_pg_open, (unsigned)g_pg_id, (unsigned)g_flt_pos,
+		       (unsigned)g_dst_amt, (unsigned)g_chr_mix, (unsigned)g_gat_amt,
+		       (unsigned)g_gat_amt, (unsigned)g_gat_pat, (unsigned)g_tg_idx,
+		       (unsigned)g_gat_g,
+		       (unsigned)g_vu, (unsigned)g_fn_held);
 		printk("P16,m=%u%u%u%u,n=%u%u%u%u\n",
 		       (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
 		       (unsigned)trk[2].p16m, (unsigned)trk[3].p16m,
@@ -7623,7 +7946,40 @@ static void led_off(int i)
 	if (leds[i].port == NRF_P0) g_led_p0_on &= ~(1u << leds[i].pin);
 	else                        g_led_p1_on &= ~(1u << leds[i].pin);
 }
-static void all_off(void)  { for (int i = 0; i < NUM_LEDS; i++) led_off(i); }
+/* TG-551: set the STATUS row's PWM on-time directly. b is 0..255 of the
+ * nominal LED_STATUS_ON_US window. SQUARED on the way in because
+ * perceived brightness goes roughly as duty^(1/2.2) -- a linear ramp
+ * appears to hang at the top and jump at the bottom. Clamped to at least
+ * 1 us so a lit LED never goes fully dark mid-breath. */
+static void status_level(uint32_t b)
+{
+	if (b > 255u) b = 255u;
+	uint32_t cc = (LED_STATUS_ON_US * b * b) / (255u * 255u);
+	if (cc < 1u) cc = 1u;
+	if (cc > LED_PWM_PERIOD_US - 1u) cc = LED_PWM_PERIOD_US - 1u;
+	LED_PWM_TIMER->CC[2] = cc;
+}
+
+static void led_ghost(int i)
+{
+	/* LED-549: the status row gains the GHOST (dim) duty the track
+	 * row already had -- the third brightness the VU needs to GLOW
+	 * rather than merely switch. */
+	if (leds[i].port == NRF_P0) { g_led_p0_ghost |= (1u << leds[i].pin);
+	                              g_led_p0_on &= ~(1u << leds[i].pin); }
+	else                        { g_led_p1_ghost |= (1u << leds[i].pin);
+	                              g_led_p1_on &= ~(1u << leds[i].pin); }
+}
+static void led_clear(int i)
+{
+	/* LED-549: clears BOTH duties. led_off() leaves the ghost bit set,
+	 * which is why the VU's dim bits survived into the song display. */
+	if (leds[i].port == NRF_P0) { g_led_p0_on &= ~(1u << leds[i].pin);
+	                              g_led_p0_ghost &= ~(1u << leds[i].pin); }
+	else                        { g_led_p1_on &= ~(1u << leds[i].pin);
+	                              g_led_p1_ghost &= ~(1u << leds[i].pin); }
+}
+static void all_off(void)  { for (int i = 0; i < NUM_LEDS; i++) led_clear(i); }
 /* Status row = song indicator, 16 songs via TWO LIGHTS ("scheme E", chosen
  * in the LED lab): the POSITION LED (song % 4) is SOLID, and the BANK LED
  * (song / 4) BLINKS ~2 Hz (250 ms on/off). When position == bank — songs 1,
@@ -7634,6 +7990,7 @@ static void all_off(void)  { for (int i = 0; i < NUM_LEDS; i++) led_off(i); }
  * blocking, ~8 ms resolution. (Same LEDs the power on/off sweep uses.) */
 static void show_song_leds(void)
 {
+	status_level(255u);   /* TG-551: restore the nominal row brightness */
 	uint32_t slot = g_slot;                 /* volatile: read once */
 	uint32_t pos  = slot & 3u;              /* slot % 4 */
 	uint32_t bank = slot >> 2;              /* 0..3 */
@@ -7650,15 +8007,203 @@ static void show_song_leds(void)
 	}
 	for (int i = 0; i < NUM_LEDS; i++) {
 		int on;
+		/* LED-549 (marc): SOLID = BANK, BLINK = SONG. Blinking reads
+		 * as the lighter of the two and a song is the lighter thing;
+		 * the bank is the heavier, so it gets the steady light. When
+		 * both land on one LED (bank 2, song 2) it BLINKS. */
 		if ((uint32_t)i == pos && pos == bank)
-			on = blink;                     /* both roles: same blink */
-		else if ((uint32_t)i == pos)
-			on = 1;                         /* position: solid */
+			on = blink;                     /* both roles: BLINK */
 		else if ((uint32_t)i == bank)
-			on = blink;                     /* bank: blink */
+			on = 1;                         /* bank: SOLID */
+		else if ((uint32_t)i == pos)
+			on = blink;                     /* song: BLINK */
 		else
 			on = 0;
-		on ? led_on(i) : led_off(i);
+		on ? led_on(i) : led_clear(i);   /* LED-549 r6: clear the GHOST
+		 * bit too. led_off() only clears "on", so after the VU had the
+		 * row its dim bits survived and the bottom LEDs glowed faintly
+		 * under the song display (marc saw it while paused). */
+	}
+}
+
+static void show_vu_leds(void)
+{
+	status_level(255u);   /* TG-551: restore the nominal row brightness */
+	/* LED-549 r4 (row 100, petercolombo; shape by marc): a stock-style
+	 * VU on the status row while playing, filling BOTTOM-UP and glowing
+	 * through the ghost duty. HOLD FUNCTION for the song indicators.
+	 * r4 fixed two faults: the level index was anchored at the FLOOR
+	 * and capped at half the bar (full-scale audio could not light the
+	 * top LEDs -- an arithmetic ceiling, not a taste problem), and a
+	 * 16 Hz ghost/on dither read as FLICKER. g_vu is now 0..12 with 12
+	 * at 0 dBFS; each LED owns 3 steps: dark, GHOST, SOLID. */
+	int v = (int)g_vu;
+	for (int i = 0; i < NUM_LEDS; i++) {
+		int li = NUM_LEDS - 1 - i;      /* BOTTOM-UP: last LED first */
+		int t = v - i * 3;
+		if (t <= 0)      led_clear(li);
+		else if (t == 1) led_ghost(li);
+		else             led_on(li);
+	}
+}
+
+static void show_page_sweep(void)
+{
+	/* LED-549 r9 (marc): pages ANNOUNCE, then get out of the way. A
+	 * persistent page light cost the song indicators for as long as the
+	 * page stayed open -- which is most of the time. This borrows the
+	 * M23 snap-sweep's vocabulary instead, and (r9, marc) it runs on the
+	 * TRACK ROW: the row WALKS UP, BOUNCES BACK, and LANDS ON THE TRACK
+	 * BUTTON THAT OPENED THE PAGE -- T2 for FX, T4 for MODE -- and then
+	 * the page's own content takes the row over. The STATUS row is never
+	 * touched, so the song indicators and the VU are never lost. The
+	 * LANDING names the page, right where your finger already is.
+	 * Two-phase counter so the landing cannot disturb the walk:
+	 * 9..24 = walking (2 frames per LED: 1-2-3-4-3-2-1), 1..8 = landed
+	 * and holding the page's LED, then done. */
+	uint32_t tgt = ((g_pg_id >= 1u && g_pg_id <= NUM_TRACK_LEDS) ? g_pg_id : 1u) - 1u;
+	uint32_t pos;
+	if (g_pg_sweep <= 8u) {
+		pos = tgt;                        /* LANDED: hold, then release */
+	} else {
+		uint32_t step = (24u - (uint32_t)g_pg_sweep) / 2u;
+		pos = (step <= 3u) ? step : ((step >= 6u) ? 0u : (6u - step));
+		if (step >= 3u && pos == tgt) g_pg_sweep = 9u;   /* land next frame */
+	}
+	for (int i = 0; i < NUM_TRACK_LEDS; i++)
+		((uint32_t)i == pos) ? track_led_on(i) : track_led_off(i);
+	g_pg_sweep--;
+}
+
+/* LED-549 r11: the walk table the entry sweep uses, so the EXIT can replay
+ * it. Step s = 0..6 -> LED 0,1,2,3,2,1,0; the entry LANDS on the first step
+ * >= 3 whose LED is the page's, i.e. step (6 - tgt). */
+static uint32_t pg_walk_pos(uint32_t s)
+{
+	return (s <= 3u) ? s : ((s >= 6u) ? 0u : (6u - s));
+}
+
+static void show_page_exit(void)
+{
+	/* LED-549 r11 (marc: "lets also do an exit animation"). The entry
+	 * sweep PLAYED BACKWARDS: the row holds on the page's own button for
+	 * a beat, then walks back out the way it came in and goes dark. Same
+	 * vocabulary, mirrored -- closing costs nothing new to learn, and the
+	 * track row is visibly HANDED BACK rather than just blinking off. */
+	uint32_t tgt  = ((g_pg_id >= 1u && g_pg_id <= NUM_TRACK_LEDS) ? g_pg_id : 1u) - 1u;
+	uint32_t land = 6u - tgt;                    /* the step the entry landed on */
+	uint32_t f    = 24u - (uint32_t)g_pg_exit;   /* frames elapsed since the close */
+	int pos;
+	if (f < 8u) {
+		pos = (int)tgt;                          /* HOLD where the entry landed */
+	} else {
+		uint32_t back = (f - 8u) / 2u;           /* 0..land, then done */
+		pos = (back > land) ? -1 : (int)pg_walk_pos(land - back);
+	}
+	for (int i = 0; i < NUM_TRACK_LEDS; i++)
+		(i == pos) ? track_led_on(i) : track_led_off(i);
+	g_pg_exit--;
+	if (pos < 0) g_pg_exit = 0;                  /* walked off the end: done */
+}
+
+/* Page-number count, in frames of the ~8 ms LED tick. */
+/* r2 (marc: "dont fade too dark with the breathing and speed it up"). */
+#define TG_BREATH    275u   /* ~2.2 s at the 8 ms LED tick (was 3.5) */
+#define TG_BR_FLOOR  150u   /* of 255. After the gamma squaring this
+                             * is ~62%% of perceived full brightness at
+                             * the dimmest point, where 64 was ~28%%
+                             * -- a breath, not a blink. */
+#define PGN_HOLD       62u   /* a COUNTING group sits solid ~0.5 s */
+#define PGN_LAST_HOLD 625u   /* the LAST group sits solid 5 s -- the whole
+                              * end-of-count marker is that long stillness */
+#define PGN_FADE        8u   /* fade OFF between groups, ~64 ms (marc: the
+                              * fade-off speed is right as it is) */
+#define PGN_RESET     250u   /* dark for 2 s, then the count loops */
+
+static void show_page_number(void)
+{
+	/* LED-549 r11 (marc): while a page is open the status row COUNTS THE
+	 * PAGE NUMBER instead of running the VU. Pages 5+ are real -- the four
+	 * track buttons are BOOKMARKS into an ordered list and FN + VOL-/VOL+
+	 * walks the tail (ROADMAP §1.4, request row 88) -- so four LEDs have to
+	 * be able to say more than four.
+	 *
+	 * They count in GROUPS OF FOUR: page 6 = a group of 4, then a group of
+	 * 2; page 10 = 4, 4, 2. Full groups pulse all the way to FULL
+	 * brightness and go completely dark between them, so the groups are
+	 * unmistakably separate events rather than one long shape.
+	 *
+	 * The LAST group only ever reaches GHOST and holds far longer: a
+	 * PARTIAL fade means "this is the end of the count", whether that
+	 * group holds four lights or two. It then BREATHES there -- the
+	 * resting state, so a glance at any moment says which page you are in
+	 * -- and after a few breaths the whole count LOOPS.
+	 *
+	 * Three honest brightness levels only (dark / ghost / solid). r5
+	 * proved that dithering between ghost and solid to fake intermediate
+	 * steps reads as FLICKER, so the "fade" is a slow walk through the
+	 * three the hardware actually has. */
+	uint32_t n     = (g_pg_id >= 1u) ? (uint32_t)g_pg_id : 1u;
+	uint32_t last  = n % 4u;  if (last == 0u) last = 4u;
+	uint32_t nfull = (n - last) / 4u;   /* whole groups of four before the last */
+
+	uint32_t lit = 0u, bright = 0u;     /* bright: 0 dark, 1 ghost, 2 solid */
+
+	if (nfull == 0u) {
+		/* FOUR OR FEWER (r14, marc): no animation at all. The number fits
+		 * the row, so the row simply IS the number. A light that does not
+		 * move is the calmest thing to put above four faders, and it can
+		 * never be mistaken for the VU or for a song blink. */
+		lit = last; bright = 2u;
+		/* TG-551: four or fewer still means "the row IS the number", but it
+		 * now BREATHES instead of sitting flat. Phase 0 is MAXIMUM, so
+		 * opening a page starts bright and breathes out, then in. ~3.5 s
+		 * period; the floor keeps it clearly lit at its dimmest. */
+		{
+			uint32_t _t = (uint32_t)g_pg_cnt % TG_BREATH;
+			uint32_t _h = TG_BREATH / 2u;
+			uint32_t _tri = (_t < _h) ? (_h - _t) : (_t - _h);  /* max at 0 */
+			status_level(TG_BR_FLOOR +
+			             ((255u - TG_BR_FLOOR) * _tri) / _h);
+			g_pg_cnt++;
+		}
+	} else {
+		/* MORE THAN FOUR: count it out. Each group of four sits solid for
+		 * half a second and FADES OFF; the last group sits solid for five,
+		 * fades off, and the row stays dark two seconds before the count
+		 * starts again. The long hold and the long dark are what separate
+		 * "the answer" from "still counting" -- no dimmer level, no pulse,
+		 * nothing that competes with the FX page under your hands. */
+		status_level(255u);   /* TG-551: the COUNT is read, not admired */
+		uint32_t slot_n = PGN_HOLD + PGN_FADE;
+		uint32_t cnt_len = nfull * slot_n;
+		uint32_t cycle  = cnt_len + PGN_LAST_HOLD + PGN_FADE + PGN_RESET;
+		uint32_t f      = (uint32_t)g_pg_cnt % cycle;
+
+		if (f < cnt_len) {
+			uint32_t k = f % slot_n;
+			lit = 4u;
+			bright = (k < PGN_HOLD) ? 2u
+			       : ((k < PGN_HOLD + PGN_FADE / 2u) ? 1u : 0u);
+		} else {
+			uint32_t k = f - cnt_len;
+			if (k < PGN_LAST_HOLD + PGN_FADE) {
+				lit = last;
+				bright = (k < PGN_LAST_HOLD) ? 2u
+				       : ((k < PGN_LAST_HOLD + PGN_FADE / 2u) ? 1u : 0u);
+			}
+			/* else: the reset gap -- everything stays dark */
+		}
+		g_pg_cnt++;
+	}
+
+	for (int i = 0; i < NUM_LEDS; i++) {
+		/* r12 (marc): count from the TOP DOWN, the same direction the song
+		 * indicators read. The VU fills bottom-up because it is a meter;
+		 * this is a NUMBER, so it reads like the other numbers. */
+		if ((uint32_t)i >= lit || bright == 0u) led_clear(i);
+		else if (bright == 1u)                  led_ghost(i);
+		else                                    led_on(i);
 	}
 }
 
@@ -7712,13 +8257,42 @@ static void led_service(void)
 	static int ever_streamed;
 	if (g_usb_streaming) ever_streamed = 1;
 
-	show_song_leds();                              /* status row = current song */
+	/* LED-549: the status row has four jobs now, in priority order:
+	 * a PAGE is open -> which page (+ announce) · FUNCTION held ->
+	 * the song indicators (row 100's escape hatch) · PLAYING -> the
+	 * VU meter · otherwise -> the song indicators. */
+	if (g_fn_held)            show_song_leds();
+	else if (g_pg_open)       show_page_number();   /* LED-549 r11 */
+	else if (g_playing)       show_vu_leds();
+	else                      show_song_leds();
 
 	int active = g_loop_active;
 	for (int i = 0; i < NTRK; i++)
 		if (trk[i].state != TS_EMPTY) active = 1;
 
-	if (g_pg_open) {
+	if (g_pg_sweep) {
+		show_page_sweep();   /* LED-549 r9: the activation sweep owns the
+		                      * track row until it lands on the page's own
+		                      * button; then the page content takes over. */
+	} else if (g_pg_exit) {
+		show_page_exit();    /* LED-549 r11: and hands it back on close */
+	} else if (g_pg_open && g_pg_id == 2u) {
+		/* FXP-547: THE FX PAGE VIEW -- one LED per effect, lit when
+		 * that effect is ENGAGED (away from neutral). Filter only
+		 * this rung; T2-T4 stay dark until their kernels land. */
+		uint8_t _fon = (g_flt_pos < 112u || g_flt_pos > 143u) ? 1u : 0u;
+		uint8_t _don = (g_dst_amt > 0u) ? 1u : 0u;   /* DST-548 */
+		uint8_t _con = (g_chr_mix > 0u) ? 1u : 0u;   /* FX2-550 */
+		/* r21: LED 4 tracks whether the gate is actually DOING anything,
+		 * which is the fader up AND a pattern selected -- not just the
+		 * fader up. A lit LED for a bypassed effect is a lie. */
+		uint8_t _gon = (g_gat_amt > 0u && g_gat_pat < 2u) ? 1u : 0u;
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
+			uint8_t _on = (i == 0) ? _fon : (i == 1) ? _con
+			            : (i == 2) ? _don : _gon;   /* FX2-550: all four */
+			if (_on) track_led_on(i); else track_led_off(i);
+		}
+	} else if (g_pg_open) {
 		/* PG-533/LS-534: the MODE PAGE view -- each track LED shows
 		 * its NEXT-record mode live: BLINK = stereo, SOLID = mono
 		 * (marc's call: mono is the special state, it gets the
@@ -8614,6 +9188,7 @@ int main(void)
 			ctl_flush = 1;
 			if (press_start < 0) {
 				press_start = k_uptime_get();
+				g_fn_held = 1;   /* LED-549 */
 				/* M20 F9: stamp the PRESS, not the release. The tap
 				 * cannot be CLASSIFIED until the release (a long hold
 				 * means something else), but the moment it names is
@@ -8848,9 +9423,40 @@ int main(void)
 						pg_t0 = k_uptime_get();
 						pg_pend = (int)tb;
 					}
-					if (pg_pend == (int)TRK_4 &&
+					if ((pg_pend == (int)TRK_4 || pg_pend == (int)TRK_2) &&
 					    k_uptime_get() - pg_t0 >= 400) {
-						g_pg_open = !g_pg_open;   /* PF-545 r4: the same
+						{	/* FXP-547: same-TN dwell toggles ITS page;
+							 * a different TN SWITCHES pages directly. */
+							uint8_t _id = (pg_pend == (int)TRK_4) ? 4u : 2u;
+							if (g_pg_open && g_pg_id == _id) {
+								g_pg_open = 0;
+								g_pg_sweep = 0;    /* r11: cancel an entry mid-flight */
+								g_pg_exit  = 24;   /* r11: hold, then walk back out */
+								
+								/* PF-549 r15 (marc): HAND THE FADERS BACK WITH PICKUP.
+								 * Closing a page dropped the faders straight onto the track
+								 * volumes with no catch, so the very next poll wrote the
+								 * PHYSICAL position into trk[].vol_q8 -- open the page, run
+								 * the FX fader to the top, close, and a track that had been
+								 * all the way DOWN came back all the way UP. The page takes
+								 * the faders with pickup and has to return them the same
+								 * way. This is the SAME latch heads mode uses on ITS exit;
+								 * the volume simply stays put until a fader crosses it. */
+								for (int _f = 0; _f < 4; _f++) {
+									g_fh_latch[_f] = 1;
+									g_fh_lastq[_f] = -1;
+								}
+							} else {
+								g_pg_open = 1; g_pg_id = _id;
+								g_pg_sweep = 24;   /* LED-549 r8: walk, then land */
+								g_pg_exit  = 0;    /* r11: opening cancels an exit */
+								g_pg_cnt   = 0;    /* r11: count from the top */
+								for (int _f = 0; _f < 4; _f++) {
+									g_fx_pick[_f] = 1;   /* pickup law */
+									g_fx_lastq[_f] = -1;
+								}
+							}
+						}   /* PF-545 r4: the same
 						          * FN+hold-TN dwell TOGGLES its page (W156).
 						          * T1-T3 have no page yet and get NO shrug
 						          * (marc: all four land before release) --
@@ -8890,7 +9496,25 @@ int main(void)
 				if (vb != VOL_NONE) {
 					if (vb == cp_cand) { if (cp_cnt < 1000) cp_cnt++; }
 					else { cp_cand = vb; cp_cnt = 1; }
-					if (cp_cnt == 3) {          /* committed press edge */
+					if (g_pg_open && (vb == VOL_UP || vb == VOL_DOWN)) {
+						if (cp_cnt == 3) {   /* PF-549 r12: WALK THE PAGE LIST */
+							uint32_t _n = (uint32_t)g_pg_id;
+							if (_n < 1u || _n > PG_LAST) _n = 1u;
+							_n = (vb == VOL_UP) ? ((_n % PG_LAST) + 1u)
+							                   : (((_n + PG_LAST - 2u) % PG_LAST) + 1u);
+							g_pg_id    = (uint8_t)_n;
+							g_pg_sweep = 0;   /* no landing: pages 5+ have no button */
+							g_pg_exit  = 0;
+							g_pg_cnt   = 0;   /* the count restarts on the new number */
+							combo_seen = 1;   /* a flip is a COMBO: the FN release
+							                   * must not also close the page */
+							cp_rep_at  = 0;   /* and it does not hold-to-glide */
+							for (int _f = 0; _f < 4; _f++) {
+								g_fx_pick[_f]  = 1;   /* pickup law, as on open */
+								g_fx_lastq[_f] = -1;
+							}
+						}
+					} else if (cp_cnt == 3) {   /* committed press edge */
 						int64_t cnow = k_uptime_get();
 						combo_seen = 1;
 						/* M23-r11 (nervouskidz): the buttons reclaim
@@ -9282,6 +9906,11 @@ int main(void)
 			} else if (held > 400 && g_snap_sweep) {
 				all_off();          /* side row dark; sweep is the message */
 				led_service();
+			} else {
+				/* LED-549 r16: a PLAIN FUNCTION hold. Keep servicing the
+				 * LEDs -- this is the branch the song-indicator escape
+				 * hatch lives on, and without it the row just freezes. */
+				led_service();
 			}
 			k_msleep(25);
 			continue;
@@ -9394,14 +10023,36 @@ int main(void)
 			 * it can't leak into the normal decode as a restart / play-stop. */
 			if (combo_seen &&
 			    ladder_read(&adc_ladder[LAD_TRACKS]) >= 110) suppress_play = 1;
-			if (g_pg_open && !combo_seen)
+			/* PF-549 r17: a HOLD previews the songs (see the FN-held arm of
+			 * the LED router) and leaves the page alone; only a TAP closes.
+			 * Same 600 ms window FN already uses for tap-tempo. */
+			if (g_pg_open && !combo_seen &&
+			    (k_uptime_get() - press_start) < 600) {
+				g_pg_sweep = 0;    /* LED-549 r11: cancel an entry mid-flight */
+				g_pg_exit  = 24;   /* LED-549 r11: hold, then walk back out */
+				
+				/* PF-549 r15 (marc): HAND THE FADERS BACK WITH PICKUP.
+				 * Closing a page dropped the faders straight onto the track
+				 * volumes with no catch, so the very next poll wrote the
+				 * PHYSICAL position into trk[].vol_q8 -- open the page, run
+				 * the FX fader to the top, close, and a track that had been
+				 * all the way DOWN came back all the way UP. The page takes
+				 * the faders with pickup and has to return them the same
+				 * way. This is the SAME latch heads mode uses on ITS exit;
+				 * the volume simply stays put until a fader crosses it. */
+				for (int _f = 0; _f < 4; _f++) {
+					g_fh_latch[_f] = 1;
+					g_fh_lastq[_f] = -1;
+				}
 				g_pg_open = 0;   /* PF-545 r3: a BARE FN tap closes the
 				                  * page (W156). EDGE-ONLY -- inside the
 				                  * release block; r2 ran every pass and
 				                  * closed one pass after combo_seen
 				                  * cleared. Any combo (jump, chop, the
 				                  * opening dwell) leaves it OPEN. */
+			}
 		}
+		g_fn_held = 0;   /* LED-549 */
 		press_start = -1;
 		combo_start = -1;
 		combo_fired = 0;
@@ -9733,7 +10384,24 @@ int main(void)
 				}
 				if (b >= TRK_1 && b <= TRK_4) {
 					int ti = b;
-					if (g_pg_open && g_rec_track < 0 &&
+					if (g_pg_open && g_pg_id == 2u && g_rec_track < 0 &&
+					    !armed_press[ti]) {
+						/* FXP-547: on the FX PAGE a track tap RESETS that
+						 * effect to neutral -- a kill switch you can hit
+						 * blind mid-performance. Only the filter exists
+						 * this rung; the others land with their kernels. */
+						if (ti == 0) g_flt_pos = 128u;   /* bypass */
+						if (ti == 1) g_chr_mix = 0u;     /* FX2-550: dry   */
+						if (ti == 2) g_dst_amt = 0u;     /* DST-548: clean */
+						if (ti == 3) {                   /* TG-551: next pattern */
+							g_gat_pat = (uint8_t)((g_gat_pat + 1u) % 3u);
+							g_gat_g = 4096;   /* Q12 unity. The old 256 here was a
+							                   * Q8 constant in a Q12 gain and cut
+							                   * the output by 24 dB on every tap. */
+						}
+						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
+						tap_deadline[ti] = 0;
+					} else if (g_pg_open && g_rec_track < 0 &&
 					    !armed_press[ti]) {
 						/* PF-545: the OPEN PAGE owns track taps (sticky
 						 * pages, W156). MODE page: flip the NEXT-record
@@ -10153,7 +10821,40 @@ int main(void)
 						     ((p - (int)trk[fi].vol_q8 > 0) != (d > 0))))
 							g_fh_latch[fi] = 0;
 					}
-					if (!g_fh_latch[fi])
+					if (g_pg_open && g_pg_id == 2u) {
+						/* FXP-547: THE FX PAGE OWNS THE FADERS while it is
+						 * open (track volumes are untouched and resume
+						 * exactly where they were). PICKUP (framework law,
+						 * W155): a fader does nothing until it CROSSES the
+						 * parameter's stored value, so opening a page can
+						 * never jump a parameter to the fader's position. */
+						uint8_t _pv = (fi == 0) ? g_flt_pos
+						            : (fi == 1) ? g_chr_mix
+						            : (fi == 2) ? g_dst_amt
+						            : g_gat_amt;   /* FX2-550: all four live */
+						int _q8 = (int)((q > 255u) ? 255u : q);
+						if (g_fx_pick[fi]) {
+							int _d = _q8 - (int)_pv;
+							int _p = g_fx_lastq[fi];
+							g_fx_lastq[fi] = _q8;
+							if ((_d >= -6 && _d <= 6) ||
+							    (_p >= 0 && ((_p - (int)_pv > 0) != (_d > 0))))
+								g_fx_pick[fi] = 0;   /* crossed: live now */
+						}
+						if (!g_fx_pick[fi] && fi == 1)
+							g_chr_mix = (uint8_t)_q8;   /* FX2-550:
+							 * fader 2 = chorus depth; bottom = dry */
+						if (!g_fx_pick[fi] && fi == 3)
+							g_gat_amt = (uint8_t)_q8;   /* FX2-550:
+							 * fader 4 = gate threshold; bottom = open */
+						if (!g_fx_pick[fi] && fi == 2)
+							g_dst_amt = (uint8_t)_q8;   /* DST-548:
+							 * fader 3 = drive; bottom = clean */
+						if (!g_fx_pick[fi] && fi == 0)
+							g_flt_pos = (uint8_t)_q8;   /* ONE filter,
+							 * two handles: FN+fader-4 and this page fader
+							 * drive the SAME state (the map's decision) */
+					} else if (!g_fh_latch[fi])
 						trk[fi].vol_q8 = (uint16_t)q;
 				}
 				fi = (fi + 1) & 3;
