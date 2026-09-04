@@ -8715,9 +8715,14 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					if (sj == TS_ARMED || sj == TS_REC || sj == TS_DONE)
 						quiet = false;
 				}
+			/* HK-613 (audit §2.3): only while the write cache is DIRTY, and at
+			 * most once a second. The flush used to run every 50 ms of idle --
+			 * CMD6 + busy + CMD13, ~1-1.7 ms -- against a cache nothing had
+			 * written to. The take-fills-the-cache case it was built for is
+			 * still covered: the first idle window after a write drains it. */
 			static int64_t flush_last;
 			int64_t nowms = k_uptime_get();
-			if (quiet && nowms - flush_last >= 50) {
+			if (quiet && emmc_cache_dirty() && nowms - flush_last >= 1000) {
 				flush_last = nowms;
 				(void)emmc_cache_flush_try();
 			}
@@ -8864,6 +8869,16 @@ static void midi_send(uint8_t b)
 /* BASIC MIDI ONLY: just Start/Stop + 24-PPQN clock on the MIDI line. The
  * Pocket-Operator / Volca 2-PPQN sync (the POSYNC GPIO pulses + k_uptime polling)
  * has been removed to keep this thread minimal. */
+/* HK-613: with CONFIG_SCHED_THREAD_USAGE=n the runtime-stats struct has no
+ * execution_cycles member (kernel/thread.h). The two diag readers below go
+ * through this macro and read 0 -- the CPU= line goes quiet, M80 res/all = 0.
+ * The W4Y 1 ms census is the CPU instrument (473 onward). */
+#if IS_ENABLED(CONFIG_SCHED_THREAD_USAGE)
+#define HK_RS_CYC(rs) ((rs).execution_cycles)
+#else
+#define HK_RS_CYC(rs) ((void)(rs), 0ull)
+#endif
+
 static void midi_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -9347,11 +9362,11 @@ static void controls_diag(void)
 	  if (_d80) {
 		k_thread_runtime_stats_t _rs;
 		uint64_t _all = 0, _kn = 0;
-		if (!k_thread_runtime_stats_all_get(&_rs)) _all = _rs.execution_cycles;
-		if (!k_thread_runtime_stats_get(&audio_tcb, &_rs))    _kn += _rs.execution_cycles;
-		if (!k_thread_runtime_stats_get(&streamer_tcb, &_rs)) _kn += _rs.execution_cycles;
-		if (!k_thread_runtime_stats_get(&midi_tcb, &_rs))     _kn += _rs.execution_cycles;
-		if (!k_thread_runtime_stats_get(k_current_get(), &_rs)) _kn += _rs.execution_cycles;
+		if (!k_thread_runtime_stats_all_get(&_rs)) _all = HK_RS_CYC(_rs);
+		if (!k_thread_runtime_stats_get(&audio_tcb, &_rs))    _kn += HK_RS_CYC(_rs);
+		if (!k_thread_runtime_stats_get(&streamer_tcb, &_rs)) _kn += HK_RS_CYC(_rs);
+		if (!k_thread_runtime_stats_get(&midi_tcb, &_rs))     _kn += HK_RS_CYC(_rs);
+		if (!k_thread_runtime_stats_get(k_current_get(), &_rs)) _kn += HK_RS_CYC(_rs);
 		/* M80-r2: cb/sof are DWT (64 MHz -> /64000 = ms). res/all are
 		 * RUNTIME-STATS cycles -- the 32768 Hz RTC on this config, NOT
 		 * DWT. r1 divided them by 64000 and printed 0 forever (time-base
@@ -9650,11 +9665,11 @@ static void controls_diag(void)
 		static uint64_t l_aud, l_str, l_mid, l_mai, l_all;
 		k_thread_runtime_stats_t rs;
 		uint64_t aud = 0, str = 0, mid = 0, mai = 0, all = 0;
-		if (!k_thread_runtime_stats_get(&audio_tcb, &rs))    aud = rs.execution_cycles;
-		if (!k_thread_runtime_stats_get(&streamer_tcb, &rs)) str = rs.execution_cycles;
-		if (!k_thread_runtime_stats_get(&midi_tcb, &rs))     mid = rs.execution_cycles;
-		if (!k_thread_runtime_stats_get(k_current_get(), &rs)) mai = rs.execution_cycles;
-		if (!k_thread_runtime_stats_all_get(&rs))            all = rs.execution_cycles;
+		if (!k_thread_runtime_stats_get(&audio_tcb, &rs))    aud = HK_RS_CYC(rs);
+		if (!k_thread_runtime_stats_get(&streamer_tcb, &rs)) str = HK_RS_CYC(rs);
+		if (!k_thread_runtime_stats_get(&midi_tcb, &rs))     mid = HK_RS_CYC(rs);
+		if (!k_thread_runtime_stats_get(k_current_get(), &rs)) mai = HK_RS_CYC(rs);
+		if (!k_thread_runtime_stats_all_get(&rs))            all = HK_RS_CYC(rs);
 		uint64_t d_all = all - l_all;
 		if (d_all) {
 			printk("CPU aud=%u%% str=%u%% midi=%u%% main=%u%%\n",
@@ -9698,7 +9713,7 @@ static void controls_diag(void)
 		int32_t _ulw = g_usb_lowat;
 		if (_ulw == 0x7FFFFFFF) _ulw = -1;
 		int _fbd = (int)((int32_t)atomic_get(&g_fb_value) - (int32_t)FB_TRUE);
-		printk("EMMC48 wus=%u/%u rus=%u sus=%u bto=%u low=%dms hiw=%ums gl=%u iwf=%u aus=%u rr=%x flt=%x@%x hi=%u,%u uu=%u uo=%u up=%u ufl=%d,%u fb=%d ec=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x\n",
+		printk("EMMC48 wus=%u/%u rus=%u sus=%u bto=%u low=%dms hiw=%ums gl=%u iwf=%u aus=%u rr=%x flt=%x@%x hi=%u,%u cf=%u,%u uu=%u uo=%u up=%u ufl=%d,%u fb=%d ec=%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x\n",
 		       (unsigned)emmc_dbg_wr_busy_us_max, (unsigned)emmc_dbg_wr_busy_us_peak,
 		       (unsigned)emmc_dbg_rd_wait_us_max, (unsigned)emmc_dbg_switch_busy_us_max,
 		       (unsigned)emmc_dbg_busy_timeouts, _lw,
@@ -9708,6 +9723,7 @@ static void controls_diag(void)
 		       (unsigned)g_resetreas,
 		       (unsigned)g_last_fault_reason, (unsigned)g_last_fault_pc,
 		       (unsigned)g_hpi_on, (unsigned)emmc_dbg_hpi_fires,
+		       (unsigned)emmc_dbg_cf_fires, (unsigned)emmc_dbg_cf_ok,   /* HK-613 */
 		       (unsigned)g_ring_underruns, (unsigned)g_ring_overflows,
 		       _updelta, _ulw, (unsigned)g_usb_hiwat, _fbd,
 		       g_extcsd_dump[0], g_extcsd_dump[1], g_extcsd_dump[2],
@@ -10631,7 +10647,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 2\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 6\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and

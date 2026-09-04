@@ -61,6 +61,9 @@ extern volatile uint32_t emmc_dbg_rd_wait_us_max;    /* worst read start-bit acc
 extern volatile uint32_t emmc_dbg_switch_busy_us_max;/* worst R1b busy: CMD6 flush/BKOPS/TRIM, us */
 extern volatile uint32_t emmc_dbg_busy_timeouts;     /* busy-poll expiries (SEPARATE from CRC errs) */
 extern volatile uint32_t emmc_dbg_hpi_fires;         /* HPI aborts issued (maintenance ops cut short) */
+extern volatile uint32_t emmc_dbg_cf_fires;          /* HK-613: idle cache flushes attempted */
+extern volatile uint32_t emmc_dbg_cf_ok;             /* HK-613: idle cache flushes completed */
+bool emmc_cache_dirty(void);                         /* HK-613: written since the last successful flush */
 
 
 bool emmc_init(void);

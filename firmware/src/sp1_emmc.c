@@ -786,6 +786,14 @@ bool emmc_read_ext_csd(uint8_t *buf)
 static bool (*s_abort_cb)(void);
 static bool s_hpi_on;
 volatile uint32_t emmc_dbg_hpi_fires;
+/* HK-613: the write cache is DIRTY from the first write after a flush until a
+ * flush succeeds. The streamer's idle-window flush (main.c) fires only while
+ * dirty and at most once a second -- it used to issue CMD6+CMD13 every 50 ms
+ * of idle whether or not anything had been written (audit §2.3). */
+static volatile bool s_cache_dirty;
+volatile uint32_t emmc_dbg_cf_fires;   /* idle flushes attempted */
+volatile uint32_t emmc_dbg_cf_ok;      /* idle flushes that completed */
+bool emmc_cache_dirty(void) { return s_cache_dirty; }
 
 /* Fire HPI: CMD12 with arg = RCA | HPI bit, then clock until DAT0 releases
  * (bounded well above the 100 ms OUT_OF_INTERRUPT_TIME). On timeout DAT0 is
@@ -930,7 +938,11 @@ bool emmc_cache_flush(void)
 	if (!s_ready) {
 		return false;
 	}
-	return emmc_switch_us(0x03200100u, 8000000u); /* write-byte FLUSH_CACHE[32]=1; up to 8 s for a full 4MB cache */
+	{
+		bool ok = emmc_switch_us(0x03200100u, 8000000u); /* write-byte FLUSH_CACHE[32]=1; up to 8 s for a full 4MB cache */
+		if (ok) s_cache_dirty = false;   /* HK-613 */
+		return ok;
+	}
 }
 
 /* ABORTABLE cache flush for mid-session idle windows: if the busy-abort
@@ -942,6 +954,7 @@ bool emmc_cache_flush_try(void)
 	if (!s_ready) {
 		return false;
 	}
+	emmc_dbg_cf_fires++;   /* HK-613 */
 	uint8_t r1[6];
 	if (!send_command_retry(6, 0x03200100u, r1, 8)) {
 		return false;
@@ -958,6 +971,8 @@ bool emmc_cache_flush_try(void)
 	if (!(r1[3] & 0x01)) {
 		return false;
 	}
+	s_cache_dirty = false;   /* HK-613 */
+	emmc_dbg_cf_ok++;
 	return true;
 }
 
@@ -1593,6 +1608,7 @@ bool aw2_write_burst(uint32_t blk, const uint8_t *frames, uint32_t n)
 bool emmc_write_blocks_async(uint32_t blk, const uint8_t *buf, uint32_t count)
 {
 	uint8_t r1[6];
+	s_cache_dirty = true;   /* HK-613 */
 	aw2_setup();
 	if (!send_command_retry(25, blk, r1, 4)) {
 		return false;
