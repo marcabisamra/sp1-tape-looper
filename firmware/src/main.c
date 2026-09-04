@@ -7157,6 +7157,99 @@ static uint32_t p16m_trk_spb(int ti)
 	return TSPBI(ti);
 }
 
+/* ==== UNPK-616: decode STRAIGHT INTO THE RING (audit tier 2 row 12) ====
+ * The scratch round trip -- decode 280 frames into p14s_scr, run the
+ * midpoint pass over it, then copy 280 words into the ring and heal the
+ * previous odd frame -- was ~1,400 memory ops per block that the ring
+ * write can absorb: the midpoints are formed from the two exact frames in
+ * registers and every frame is stored ONCE, as one aligned 32-bit word
+ * (L low half, R high half). The ring wraps at most once per block, so a
+ * countdown replaces the per-frame mask. Bit-exact with the scratch path
+ * by construction (same expressions, same rounding) and proven on the host
+ * over random blocks / wrap positions / continuity before every build.
+ * The scratch decoders stay for the reverse path (p14s_unpack_rev). */
+#define UNPK_EMIT(l, r) do { \
+		*_d++ = (uint32_t)(uint16_t)(l) | ((uint32_t)(uint16_t)(r) << 16); \
+		if (--_left == 0u) { _d = (uint32_t *)(void *)ring; _left = 0xFFFFFFFFu; } \
+	} while (0)
+
+/* O2P-479's intent, made explicit: the decode+store loop at -O2 (the old
+ * copy loop had it; p16m_dec_scr had it by placement). A different optimize
+ * level also keeps GCC from inlining these into the -Os unpack, so the
+ * unpack's pinned 32-byte line and its own text stay small and stable. */
+static void __attribute__((optimize("O2"))) p14s_dec_ring(const uint8_t *blk, int16_t *ring, uint32_t ring_mask, uint32_t s0, int trk)
+{
+	M73_T0();   /* UP-476 */
+	const uint32_t _sh = (uint32_t)(blk[14] & 3u);   /* BG-470 block gain */
+	const uint8_t *o = blk + 16u;
+	const uint32_t _base = s0 & ring_mask;
+	uint32_t  _left = ring_mask + 1u - _base;          /* frames before the wrap */
+	uint32_t *_d    = (uint32_t *)(void *)(ring + (size_t)_base * 2u);
+	int32_t pl = g_p14s_prev[trk][0], pr = g_p14s_prev[trk][1];
+	for (uint32_t g = 0; g < 70u; g++) {
+		/* X32-477: two overlapping big-endian 32-bit words replace the
+		 * uint64_t. A = v64 bits 55..24, B = v64 bits 31..0. */
+		uint32_t _a32, _b32;
+		memcpy(&_a32, o, 4);
+		memcpy(&_b32, o + 3, 4);
+		_a32 = __builtin_bswap32(_a32);
+		_b32 = __builtin_bswap32(_b32);
+		o += 7u;
+		int32_t s0v = (int32_t)((_a32 >> 18) & 0x3FFFu);
+		int32_t s1v = (int32_t)((_a32 >>  4) & 0x3FFFu);
+		int32_t s2v = (int32_t)((_b32 >> 14) & 0x3FFFu);
+		int32_t s3v = (int32_t)( _b32        & 0x3FFFu);
+		if (s0v > 8191) s0v -= 16384; if (s1v > 8191) s1v -= 16384;
+		if (s2v > 8191) s2v -= 16384; if (s3v > 8191) s3v -= 16384;
+		const int32_t l0 = (int16_t)((s0v << 2) >> _sh), r0 = (int16_t)((s1v << 2) >> _sh);
+		const int32_t l1 = (int16_t)((s2v << 2) >> _sh), r1 = (int16_t)((s3v << 2) >> _sh);
+		if (g == 0u) {
+			/* the HEAL: frame s0-1 = midpoint of the previous block's last
+			 * exact frame and this block's first (the copy path wrote it
+			 * after the copy; same value, same place) */
+			uint32_t hp = ((s0 - 1u) & ring_mask) * 2u;
+			ring[hp]      = (int16_t)((pl + l0) >> 1);
+			ring[hp + 1u] = (int16_t)((pr + r0) >> 1);
+		} else {
+			UNPK_EMIT((int16_t)((pl + l0) >> 1), (int16_t)((pr + r0) >> 1));   /* frame 2k-1 */
+		}
+		UNPK_EMIT((int16_t)l0, (int16_t)r0);                                       /* frame 2k   */
+		UNPK_EMIT((int16_t)((l0 + l1) >> 1), (int16_t)((r0 + r1) >> 1));          /* frame 2k+1 */
+		UNPK_EMIT((int16_t)l1, (int16_t)r1);                                       /* frame 2k+2 */
+		pl = l1; pr = r1;
+	}
+	UNPK_EMIT((int16_t)pl, (int16_t)pr);   /* frame 279: the hold, healed by the next block */
+	g_p14s_prev[trk][0] = (int16_t)pl;     /* last EXACT frame (278) */
+	g_p14s_prev[trk][1] = (int16_t)pr;
+	M73_ADD(g_t_ps);   /* UP-476 */
+}
+
+static void __attribute__((optimize("O2"))) p16m_dec_ring(const uint8_t *blk, int16_t *ring, uint32_t ring_mask, uint32_t s0, int trk)
+{
+	/* P16-522 r2 interp upsample: frame 2i = v[i] (both channels), frame
+	 * 2i+1 = (v[i]+v[i+1]+1)>>1; the final odd frame holds. */
+	const uint32_t _base = s0 & ring_mask;
+	uint32_t  _left = ring_mask + 1u - _base;
+	uint32_t *_d    = (uint32_t *)(void *)(ring + (size_t)_base * 2u);
+	int32_t v = (int16_t)((uint16_t)blk[16u] | ((uint16_t)blk[17u] << 8));
+	{	/* the HEAL, exactly as the generic tail did it from scratch[0..1] */
+		uint32_t hp = ((s0 - 1u) & ring_mask) * 2u;
+		ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + v) >> 1);
+		ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + v) >> 1);
+	}
+	for (uint32_t i = 0; i < 248u; i++) {
+		int32_t vn = (i < 247u)
+		           ? (int16_t)((uint16_t)blk[18u + i * 2u] | ((uint16_t)blk[19u + i * 2u] << 8))
+		           : v;
+		int32_t h = (v + vn + 1) >> 1;
+		UNPK_EMIT((int16_t)v, (int16_t)v);
+		UNPK_EMIT((int16_t)h, (int16_t)h);
+		v = vn;
+	}
+	g_p14s_prev[trk][0] = (int16_t)v;     /* frame 494 = v[247] */
+	g_p14s_prev[trk][1] = (int16_t)v;
+}
+
 /* ALN2-573 (W256): PIN THE UNPACK TO A 32-BYTE ICACHE LINE.
  * 572's at-rest corner regressed 56%% on pk/call with every feature OFF.
  * The added instructions total ~137 cyc/block (0.04%%). The UNPACK -- code
@@ -7178,41 +7271,23 @@ static void __attribute__((aligned(32))) p14s_unpack(int16_t *ring, uint32_t rin
 		uint32_t _spb = p16m_trk_spb(trk);   /* P16-522: TRACK-driven -- the zeroed
 		                               * silence pad strides correctly too */
 		if (blk[11] == P14S_MARK) {
-			if      (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
-			else if (blk[2] == 0x34u) p14s_dec_scr(blk);
-			else    /* GS-531 (W144): mark present but FOREIGN sig -- a
-			         * future codec or cross-version content. SILENCE,
-			         * never garbage. */
-				memset(p14s_scr, 0, (size_t)_spb * 4u);
-			{	/* CPY-483: the ring wraps at most once per block, so
-				 * split there and walk pointers instead of recomputing
-				 * (add, AND, shift) for all 280 frames. Bit-exact by
-				 * construction -- see the stage header. */
-				uint32_t _cap  = ring_mask + 1u;
-				uint32_t _base = s0 & ring_mask;
-				uint32_t _run  = _cap - _base;
-				if (_run > _spb) _run = _spb;
-				/* W2X-490: ONE 32-bit word per FRAME, INLINE.
-				 * 489 used memcpy() with a RUNTIME size -- GCC cannot
-				 * inline that, so it emitted `bl memcpy` into libc and
-				 * the copy got 3x SLOWER than the -O2 hand loop (W44).
-				 * Both sides are aligned(4), so a word move is legal and
-				 * halves the memory ops: 560 halfwords -> 280 words. */
-				uint32_t *_d32 = (uint32_t *)(void *)
-						(ring + (size_t)_base * 2u);
-				const uint32_t *_s32 = (const uint32_t *)(const void *)p14s_scr;
-				for (uint32_t f = 0; f < _run; f++) *_d32++ = *_s32++;
-				if (_run < _spb) {
-					_d32 = (uint32_t *)(void *)ring;
-					for (uint32_t f = _run; f < _spb; f++)
-						*_d32++ = *_s32++;
+			/* UNPK-616: decode straight into the ring; the heal and the
+			 * per-track continuity live inside the decoders now. */
+			if      (blk[2] == 0x36u) p16m_dec_ring(blk, ring, ring_mask, s0, trk);   /* P16-522 */
+			else if (blk[2] == 0x34u) p14s_dec_ring(blk, ring, ring_mask, s0, trk);
+			else {	/* GS-531 (W144): mark present but FOREIGN sig -- a
+				 * future codec or cross-version content. SILENCE,
+				 * never garbage -- with the continuity the scratch path
+				 * gave it (healed against 0, prev = 0). */
+				for (uint32_t f = 0; f < _spb; f++) {
+					uint32_t fi = ((s0 + f) & ring_mask) * 2u;
+					ring[fi] = 0; ring[fi + 1u] = 0;
 				}
+				uint32_t hp = ((s0 - 1u) & ring_mask) * 2u;
+				ring[hp]      = (int16_t)((int32_t)g_p14s_prev[trk][0] >> 1);
+				ring[hp + 1u] = (int16_t)((int32_t)g_p14s_prev[trk][1] >> 1);
+				g_p14s_prev[trk][0] = 0; g_p14s_prev[trk][1] = 0;
 			}
-			{ uint32_t hp = ((s0 - 1u) & ring_mask) * 2u;
-			  ring[hp]      = (int16_t)(((int32_t)g_p14s_prev[trk][0] + p14s_scr[0]) >> 1);
-			  ring[hp + 1u] = (int16_t)(((int32_t)g_p14s_prev[trk][1] + p14s_scr[1]) >> 1); }
-			g_p14s_prev[trk][0] = p14s_scr[_spb * 2u - 4u];   /* last EXACT frame; 556 for P14S */
-			g_p14s_prev[trk][1] = p14s_scr[_spb * 2u - 3u];
 		} else if (_spb == 496u) {
 			/* P16-522: a non-P16M block under a P16M take = the SILENCE
 			 * PAD -- write true silence at the caller's stride. */
