@@ -1002,6 +1002,12 @@ static volatile uint64_t g_grid_next_tick;
 static uint64_t          g_grid_tick_base;      /* M22-A: exact tick schedule base */
 static uint64_t          g_grid_tick_base_sync; /* M22-A: last value WE wrote to next_tick */
 static uint32_t          g_grid_tick_idx;       /* M22-A: ticks since the base */
+/* GRIDSPD-622 (W301): the grid's definition -- a beat is g_grid_ref_nf wall
+ * frames when the tape runs at g_grid_ref_spd; the loop's beat in tape
+ * samples (their product) never changes. The service keeps
+ * g_grid_beat_frames = ref_nf * ref_spd / speed as the tape speed moves. */
+static uint32_t          g_grid_ref_nf, g_grid_ref_spd, g_grid_nf_shadow, g_grid_saved_nf;
+static volatile uint32_t g_grid_follow_n;   /* diag: rescales since boot */
 /* M22b-r2 INSTRUMENTATION (diagnostic only): every quantity the -62 ms bench
  * anomaly could implicate, captured at the moments they are decided. */
 static volatile uint32_t g_dbg_tap_bs;     /* stored beat at tap commit (frames=samples at 1.0x) */
@@ -1913,6 +1919,18 @@ static int16_t           g_bnc_live[BLK_FRAMES * 2u];   /* BNC3-605: the jack, s
 #define BNC_PRE_HALF 4u   /* PRE-608: the pre-emphasis FIR's delay, bus samples */
 static int32_t           g_bnc_pre_hist[2][8];   /* PRE-608: the FIR's last 8 bus samples, L/R */
 static volatile uint8_t  g_bnc_anch;        /* the take's first REC block has been anchored */
+/* BAKE-619 (W298): the SPEED-BAKE. A print armed at tape speed s is
+ * resampled by s on its way to flash (the streamer's flush), so it stores
+ * what was heard at 1x. Captured at the anchor; consumed by the flush;
+ * cleared at promotion. 1.0x bounces leave g_bk_spd at 0 = the 616 path. */
+#define BK_ONE 65536u
+static volatile uint32_t g_bk_spd;        /* Q16 input frames per baked frame; 0 = no bake */
+static volatile int8_t   g_bk_trk = -1;   /* the print being baked */
+static volatile uint32_t g_bk_ph;         /* Q16 phase from p0 (the frame at r_r) */
+static volatile uint32_t g_bk_blocks;     /* baked blocks committed this print */
+static uint32_t          s_bk_ph_next, s_bk_cons_next;   /* pack -> commit handoff */
+static volatile uint32_t g_bk_prints, g_bk_last_spd, g_bk_last_len, g_bk_capped;   /* diag */
+static volatile uint32_t g_bk_len;   /* TRUE-621: the loop in baked blocks, chosen at the stop (0 = derive at promotion) */
 static uint8_t           g_bnc_p16m_prev;   /* the target's next-record mode before the arm */
 static uint8_t           g_arm_gsh_prev;    /* the target's print gain before ANY arm (cancel restores) */
 #define BNC_GSH 2u   /* BNC2-604: a print is stored 12 dB down -- room for four
@@ -4289,6 +4307,37 @@ static void __attribute__((noinline)) bnc_arm_prep(int i)
 	}
 }
 
+/* TRUE-621 (W300): a BAKE's stop lands on a whole BAKED block. The close
+ * machinery chose tgt in recorder units (a whole recorder block: what was
+ * played, the grid beat, the chop cycle or the bar); a bake stores
+ * tgt/spd of that, which is not a whole number of baked blocks, and 619
+ * rounded the LOOP to one -- the recorder's fade-out then fell outside the
+ * loop and every seam clicked (marc: "no longer a perfect loop"). Here the
+ * TARGET moves instead: N = the nearest whole baked block (never snapping
+ * back on an immediate stop, so the fade + pad always exist), and the
+ * recorder runs to exactly the frames the kernel needs for those N blocks
+ * (the last output's p0 + its 3-frame lookahead). Promotion uses this N when the loop is the
+ * recorded length (g_bk_len); a snapped-back loop keeps its own length.
+ * <= half a baked block from the musical length, like every loop here. */
+static uint32_t __attribute__((noinline)) bnc_bake_target(int i, uint32_t tgt, uint8_t sil)
+{
+	const uint32_t spd = g_bk_spd;
+	g_bk_len = 0u;
+	if (!spd) return tgt;
+	const uint32_t fpb = trk[i].p16m ? 248u : 140u;
+	const uint64_t per = (uint64_t)spd * fpb;
+	uint32_t n = (uint32_t)((((uint64_t)(tgt >> 1) << 16) + per / 2u) / per);
+	if (n < 1u) n = 1u;
+	uint64_t need = (((uint64_t)(n * fpb - 1u) * spd) >> 16) + 4u;   /* the last output's p0 + the lookahead */
+	if (sil && need * 2u < (uint64_t)trk[i].rec_count) {   /* in emissions: an immediate stop never snaps back */
+		n += 1u;
+		need = (((uint64_t)(n * fpb - 1u) * spd) >> 16) + 4u;
+	}
+	if (n > MAX_LOOP_BLOCKS) n = MAX_LOOP_BLOCKS;
+	if (trk[i].len_blocks * (fpb * 2u) == tgt) g_bk_len = n;   /* the loop IS the recorded length */
+	return (uint32_t)(need * 2u);
+}
+
 /* The cycle a bounce stopped under CHOP rounds to (BNC2-603), in track i's
  * blocks: the song base in fixed mode, the longest playing source otherwise;
  * 0 = no rounding (chop off, nothing to measure against, or too long). */
@@ -4367,6 +4416,10 @@ static void __attribute__((noinline)) bnc_postpass(int32_t *mL, int32_t *mR, con
 		trk[_rt].start_samps = sp;
 		trk[_rt].start_blk   = (sp + TSPBI(_rt) / 2u) / TSPBI(_rt);
 		trk[_rt].gsh = (uint8_t)BNC_GSH;
+		/* BAKE-619 (W298): the print bakes the speed it was punched at */
+		g_bk_spd = (g_cur_speed_q16 != BK_ONE) ? g_cur_speed_q16 : 0u;
+		g_bk_trk = (int8_t)_rt; g_bk_ph = 0u; g_bk_blocks = 0u; g_bk_len = 0u;   /* TRUE-621 */
+		if (g_bk_spd) g_bk_prints++;
 	}
 }
 
@@ -4938,7 +4991,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 						}
 					}
 				}
-				trk[i].rec_target     = tgt;
+				trk[i].rec_target     = bnc_bake_target(i, tgt, sil);   /* TRUE-621: a bake stops on a whole baked block */
 				/* end the live phrase. When padding (immediate stops), the
 				 * pad used to be hard zeros — a click baked into the seam;
 				 * fade the first 128 pad samples (~2.7 ms) down instead. */
@@ -7463,6 +7516,284 @@ static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
 }
 
 
+/* BAKE-619: Lanczos-3, 128 phases, Q14, every row sums to 16384 exactly
+ * (generated by the stage; the host proof compiles this same text). */
+static const int16_t s_bk_lz[128][6] = {
+	{      0,      0,  16384,      0,      0,      0 },
+	{     26,   -105,  16383,    107,    -27,      0 },
+	{     52,   -207,  16377,    216,    -54,      0 },
+	{     76,   -307,  16368,    328,    -82,      1 },
+	{    100,   -405,  16356,    442,   -111,      2 },
+	{    124,   -500,  16339,    558,   -140,      3 },
+	{    147,   -593,  16320,    676,   -170,      4 },
+	{    169,   -684,  16297,    797,   -201,      6 },
+	{    190,   -772,  16272,    919,   -232,      7 },
+	{    211,   -858,  16242,   1044,   -264,      9 },
+	{    230,   -941,  16208,   1171,   -296,     12 },
+	{    250,  -1023,  16172,   1300,   -329,     14 },
+	{    268,  -1101,  16131,   1432,   -363,     17 },
+	{    286,  -1178,  16088,   1565,   -397,     20 },
+	{    303,  -1252,  16041,   1700,   -431,     23 },
+	{    319,  -1323,  15991,   1837,   -466,     26 },
+	{    335,  -1393,  15936,   1977,   -501,     30 },
+	{    350,  -1459,  15878,   2118,   -537,     34 },
+	{    364,  -1524,  15818,   2261,   -573,     38 },
+	{    378,  -1586,  15753,   2406,   -610,     43 },
+	{    391,  -1646,  15686,   2553,   -647,     47 },
+	{    403,  -1703,  15616,   2701,   -685,     52 },
+	{    415,  -1758,  15541,   2852,   -723,     57 },
+	{    425,  -1811,  15464,   3004,   -761,     63 },
+	{    436,  -1862,  15384,   3157,   -799,     68 },
+	{    445,  -1910,  15301,   3312,   -838,     74 },
+	{    454,  -1956,  15214,   3469,   -877,     80 },
+	{    462,  -1999,  15122,   3628,   -916,     87 },
+	{    470,  -2040,  15029,   3787,   -955,     93 },
+	{    476,  -2080,  14934,   3949,   -995,    100 },
+	{    483,  -2116,  14833,   4111,  -1034,    107 },
+	{    488,  -2151,  14732,   4275,  -1074,    114 },
+	{    493,  -2184,  14628,   4440,  -1114,    121 },
+	{    498,  -2214,  14519,   4607,  -1154,    128 },
+	{    502,  -2242,  14408,   4774,  -1194,    136 },
+	{    505,  -2268,  14294,   4943,  -1234,    144 },
+	{    507,  -2292,  14179,   5112,  -1274,    152 },
+	{    510,  -2314,  14058,   5283,  -1313,    160 },
+	{    511,  -2334,  13938,   5454,  -1353,    168 },
+	{    512,  -2351,  13812,   5627,  -1393,    177 },
+	{    513,  -2367,  13685,   5800,  -1432,    185 },
+	{    513,  -2381,  13555,   5974,  -1471,    194 },
+	{    512,  -2393,  13425,   6148,  -1510,    202 },
+	{    511,  -2403,  13290,   6324,  -1549,    211 },
+	{    510,  -2411,  13153,   6499,  -1587,    220 },
+	{    508,  -2417,  13014,   6675,  -1625,    229 },
+	{    505,  -2421,  12872,   6852,  -1662,    238 },
+	{    502,  -2424,  12728,   7029,  -1699,    248 },
+	{    499,  -2425,  12583,   7206,  -1736,    257 },
+	{    495,  -2424,  12436,   7383,  -1772,    266 },
+	{    491,  -2421,  12286,   7561,  -1808,    275 },
+	{    487,  -2417,  12134,   7738,  -1843,    285 },
+	{    482,  -2411,  11980,   7916,  -1877,    294 },
+	{    477,  -2403,  11825,   8093,  -1911,    303 },
+	{    471,  -2394,  11669,   8270,  -1944,    312 },
+	{    465,  -2384,  11510,   8447,  -1976,    322 },
+	{    459,  -2372,  11349,   8624,  -2007,    331 },
+	{    453,  -2358,  11187,   8800,  -2038,    340 },
+	{    446,  -2343,  11024,   8976,  -2068,    349 },
+	{    439,  -2327,  10860,   9151,  -2097,    358 },
+	{    432,  -2309,  10693,   9326,  -2125,    367 },
+	{    424,  -2290,  10527,   9500,  -2152,    375 },
+	{    417,  -2270,  10357,   9673,  -2177,    384 },
+	{    409,  -2249,  10188,   9846,  -2202,    392 },
+	{    401,  -2226,  10017,  10017,  -2226,    401 },
+	{    392,  -2202,   9846,  10188,  -2249,    409 },
+	{    384,  -2177,   9672,  10358,  -2270,    417 },
+	{    375,  -2152,   9501,  10526,  -2290,    424 },
+	{    367,  -2125,   9326,  10693,  -2309,    432 },
+	{    358,  -2097,   9152,  10859,  -2327,    439 },
+	{    349,  -2068,   8976,  11024,  -2343,    446 },
+	{    340,  -2038,   8800,  11187,  -2358,    453 },
+	{    331,  -2007,   8624,  11349,  -2372,    459 },
+	{    322,  -1976,   8448,  11509,  -2384,    465 },
+	{    312,  -1944,   8271,  11668,  -2394,    471 },
+	{    303,  -1911,   8093,  11825,  -2403,    477 },
+	{    294,  -1877,   7916,  11980,  -2411,    482 },
+	{    285,  -1843,   7738,  12134,  -2417,    487 },
+	{    275,  -1808,   7561,  12286,  -2421,    491 },
+	{    266,  -1772,   7384,  12435,  -2424,    495 },
+	{    257,  -1736,   7206,  12583,  -2425,    499 },
+	{    248,  -1699,   7028,  12729,  -2424,    502 },
+	{    238,  -1662,   6852,  12872,  -2421,    505 },
+	{    229,  -1625,   6675,  13014,  -2417,    508 },
+	{    220,  -1587,   6499,  13153,  -2411,    510 },
+	{    211,  -1549,   6325,  13289,  -2403,    511 },
+	{    202,  -1510,   6149,  13424,  -2393,    512 },
+	{    194,  -1471,   5973,  13556,  -2381,    513 },
+	{    185,  -1432,   5799,  13686,  -2367,    513 },
+	{    177,  -1393,   5626,  13813,  -2351,    512 },
+	{    168,  -1353,   5455,  13937,  -2334,    511 },
+	{    160,  -1313,   5282,  14059,  -2314,    510 },
+	{    152,  -1274,   5113,  14178,  -2292,    507 },
+	{    144,  -1234,   4942,  14295,  -2268,    505 },
+	{    136,  -1194,   4774,  14408,  -2242,    502 },
+	{    128,  -1154,   4607,  14519,  -2214,    498 },
+	{    121,  -1114,   4441,  14627,  -2184,    493 },
+	{    114,  -1074,   4275,  14732,  -2151,    488 },
+	{    107,  -1034,   4110,  14834,  -2116,    483 },
+	{    100,   -995,   3949,  14934,  -2080,    476 },
+	{     93,   -955,   3786,  15030,  -2040,    470 },
+	{     87,   -916,   3627,  15123,  -1999,    462 },
+	{     80,   -877,   3470,  15213,  -1956,    454 },
+	{     74,   -838,   3313,  15300,  -1910,    445 },
+	{     68,   -799,   3158,  15383,  -1862,    436 },
+	{     63,   -761,   3004,  15464,  -1811,    425 },
+	{     57,   -723,   2852,  15541,  -1758,    415 },
+	{     52,   -685,   2702,  15615,  -1703,    403 },
+	{     47,   -647,   2553,  15686,  -1646,    391 },
+	{     43,   -610,   2405,  15754,  -1586,    378 },
+	{     38,   -573,   2261,  15818,  -1524,    364 },
+	{     34,   -537,   2118,  15878,  -1459,    350 },
+	{     30,   -501,   1977,  15936,  -1393,    335 },
+	{     26,   -466,   1838,  15990,  -1323,    319 },
+	{     23,   -431,   1701,  16040,  -1252,    303 },
+	{     20,   -397,   1565,  16088,  -1178,    286 },
+	{     17,   -363,   1432,  16131,  -1101,    268 },
+	{     14,   -329,   1300,  16172,  -1023,    250 },
+	{     12,   -296,   1171,  16208,   -941,    230 },
+	{      9,   -264,   1044,  16242,   -858,    211 },
+	{      7,   -232,    919,  16272,   -772,    190 },
+	{      6,   -201,    796,  16298,   -684,    169 },
+	{      4,   -170,    675,  16321,   -593,    147 },
+	{      3,   -140,    557,  16340,   -500,    124 },
+	{      2,   -111,    442,  16356,   -405,    100 },
+	{      1,    -82,    328,  16368,   -307,     76 },
+	{      0,    -54,    216,  16377,   -207,     52 },
+	{      0,    -27,    108,  16382,   -105,     26 },
+};
+
+/* ===== BAKE-619 (W298): THE SPEED-BAKE KERNEL (flush side) =====
+ * A bounce armed at tape speed s records the bus through the recorder's
+ * tape tick, so the take holds 24k*s stored frames per second of what was
+ * heard, and at 1x it plays the sources back at 1x again -- the speed is
+ * undone, not printed (marc, 09-05). The bake resamples the rec ring by s
+ * as the streamer packs it: the print becomes a 1x recording of what was
+ * heard, and the tape speed applies to it like to any other track.
+ *   input  : g_rring frames from p0 = r_r>>1, the recorder's 24k*s stream
+ *   output : fpb frames per baked block; Lanczos-3 (6 taps, 128 phases,
+ *            Q14, unity gain per phase), exact Q16 phase accumulation
+ *   1.0x   : g_bk_spd stays 0 and the flush is the unchanged 616 code
+ * Host-measured (sine SNR vs the ideal 24k signal): 1.37x 8 kHz 35 dB /
+ * 10 kHz 33 dB; 0.73x 5 kHz 42 dB -- Catmull-Rom was 22 / 15 / 17, and
+ * the player's own 2-tap read is worse still. The close machinery is
+ * untouched (recorder units); promotion converts len/content to baked
+ * blocks (nearest). Seam residual <= half a baked block, the class of
+ * today's immediate-stop pad. Stage = batchbuf's tail (blocks 30-31; the
+ * live flush never packs more than 16). ~60 instructions per baked frame
+ * on the streamer, during a bounce at != 1.0x only. */
+static inline uint32_t bk_fpb(const struct looptrk *t) { return t->p16m ? 248u : 140u; }
+
+/* Is this track's flush a bake? The print's gain shift is set at the same
+ * anchor that captures the speed, so a stale speed can never reach a
+ * normal take (a cancel restores gsh; every new take arms with gsh 0). */
+static inline bool bk_flush_on(const struct looptrk *t, int i)
+{
+	return g_bk_spd != 0u && g_bk_trk == (int8_t)i && t->gsh == (uint8_t)BNC_GSH;
+}
+
+/* Whole baked blocks the input on hand can produce from the current phase:
+ * block k's last output sits at p0-relative frame (ph + (k*fpb-1)*spd)>>16
+ * and the kernel reads three frames past it. TS_DONE with a remainder: one
+ * tail block, end-clamped. Capped at the region. */
+static uint32_t bk_navail(const struct looptrk *t)
+{
+	uint32_t in = (t->r_w - t->r_r) >> 1;
+	uint32_t fpb = bk_fpb(t), spd = g_bk_spd, k = 0u;
+	if (in >= 4u) {
+		uint64_t room = ((uint64_t)(in - 3u) << 16);   /* need ph + (k*fpb-1)*spd < room */
+		if (room > g_bk_ph) {
+			uint64_t q = (room - g_bk_ph - 1u) / spd;   /* max k*fpb-1 */
+			k = (uint32_t)((q + 1u) / fpb);
+		}
+	}
+	if (k == 0u && t->state == TS_DONE && in >= 1u) k = 1u;   /* the tail */
+	if (g_bk_blocks + k > MAX_LOOP_BLOCKS) {
+		k = MAX_LOOP_BLOCKS - g_bk_blocks;
+		if (t->state == TS_DONE) g_bk_capped = 1u;
+	}
+	return k;
+}
+
+/* The flush's unit of work, in whichever units this take is in. */
+static inline uint32_t bk_flush_navail(const struct looptrk *t, int i)
+{
+	return bk_flush_on(t, i) ? bk_navail(t) : (t->r_w - t->r_r) / TSPB(t);
+}
+
+/* One baked block: fpb stereo frames into dst, from phase ph with p0 at
+ * absolute input frame p0a and `in` frames on hand. Taps p0-2..p0+3 around
+ * the interval; the two frames before p0 are still in the ring (the writer
+ * is < 8191 ahead) except at the take's start, where they clamp to frame 0;
+ * the end clamps to the last frame (the tail block only). Returns the phase
+ * after the block; *cons = input frames consumed (all of them at the tail). */
+static uint32_t __attribute__((optimize("O2"), noinline))
+bk_resample_block(const struct looptrk *t, int16_t *dst, uint32_t ph, uint32_t p0a, uint32_t in, uint32_t *cons)
+{
+	const uint32_t fpb = bk_fpb(t), spd = g_bk_spd;
+	const uint32_t last = in ? in - 1u : 0u;
+	const int16_t *ring = g_rring;
+	for (uint32_t j = 0; j < fpb; j++) {
+		const uint32_t k = ph >> 16;
+		const int16_t *w = s_bk_lz[(ph & 0xFFFFu) >> 9];
+		int32_t yl = 8192, yr = 8192;
+		const uint32_t f0 = (p0a + k - 2u) & RRING_MASK;   /* ring index of tap 0 (p0-2) */
+		if (k >= 2u && k + 3u <= last && f0 + 5u < RRING_SAMPLES) {
+			/* INTERIOR (all but a few frames per print): six consecutive
+			 * ring frames, no clamp, no wrap -- straight-line MACs. */
+			const int16_t *p = ring + f0 * 2u;
+			yl += (int32_t)w[0] * p[0]  + (int32_t)w[1] * p[2]  + (int32_t)w[2] * p[4]
+			    + (int32_t)w[3] * p[6]  + (int32_t)w[4] * p[8]  + (int32_t)w[5] * p[10];
+			yr += (int32_t)w[0] * p[1]  + (int32_t)w[1] * p[3]  + (int32_t)w[2] * p[5]
+			    + (int32_t)w[3] * p[7]  + (int32_t)w[4] * p[9]  + (int32_t)w[5] * p[11];
+		} else {
+			for (uint32_t tp = 0; tp < 6u; tp++) {
+				uint32_t i;
+				if (k + tp >= 2u) { i = k + tp - 2u; if (i > last) i = last; }
+				else i = (p0a + k + tp >= 2u) ? (uint32_t)(k + tp - 2u) : 0u;   /* before p0: back into the ring, or clamp at the take start */
+				const int16_t *p = ring + (((p0a + i) & RRING_MASK) * 2u);
+				yl += (int32_t)w[tp] * p[0];
+				yr += (int32_t)w[tp] * p[1];
+			}
+		}
+		yl >>= 14; yr >>= 14;
+		if (yl > 32767) yl = 32767; else if (yl < -32768) yl = -32768;
+		if (yr > 32767) yr = 32767; else if (yr < -32768) yr = -32768;
+		dst[2u * j] = (int16_t)yl; dst[2u * j + 1u] = (int16_t)yr;
+		ph += spd;
+	}
+	*cons = ph >> 16;
+	if (*cons > in) *cons = in;
+	if (t->state == TS_DONE && *cons + 3u >= in) *cons = in;   /* the tail: <=3 frames would be lookahead only */
+	return ph & 0xFFFFu;
+}
+
+/* Pack n baked blocks into out[] via the stage, WITHOUT committing: the
+ * commit (r_r, phase, count) follows a successful write, exactly where the
+ * plain path advances r_r. */
+static void __attribute__((noinline)) bk_pack_blocks(struct looptrk *t, uint8_t *out, uint32_t n, int16_t *stage)
+{
+	uint32_t ph = g_bk_ph, off = 0u;
+	const uint32_t p0a = t->r_r >> 1, in = (t->r_w - t->r_r) >> 1;
+	if (n > 28u) n = 28u;   /* the stage lives in blocks 30-31 of the same buffer */
+	for (uint32_t b = 0; b < n; b++) {
+		uint32_t cons = 0u;
+		ph = bk_resample_block(t, stage, ph, p0a + off, in - off, &cons);
+		takes_pack_blocks(t, stage, 0xFFFFFFFFu, 0u, out + b * EMMC_BLOCK_SIZE, 1u);
+		off += cons;
+	}
+	s_bk_ph_next = ph; s_bk_cons_next = off;
+}
+
+/* Promotion: the close machinery declared the loop in RECORDER blocks;
+ * the flash holds BAKED blocks. Nearest whole baked block; content never
+ * beyond what was written; the recorder's leftovers are not packable in
+ * their own units any more. Clears the bake. */
+static void __attribute__((noinline)) bk_promote(struct looptrk *t)
+{
+	const uint32_t spd = g_bk_spd;
+	uint32_t lb = g_bk_len ? g_bk_len   /* TRUE-621: the stop chose it */
+	            : (uint32_t)((((uint64_t)t->len_blocks << 16) + spd / 2u) / spd);
+	uint32_t cb = (uint32_t)((((uint64_t)t->content_blocks << 16) + spd / 2u) / spd);
+	if (lb < 1u) lb = 1u;
+	if (lb > MAX_LOOP_BLOCKS) lb = MAX_LOOP_BLOCKS;
+	if (cb < lb) cb = lb;                 /* TRUE-621: the loop's last block holds the fade, not silence */
+	if (cb > g_bk_blocks) cb = g_bk_blocks;
+	if (cb < 1u) cb = 1u;
+	t->len_blocks = lb; t->content_blocks = cb;
+	t->len_samps = lb * TSPB(t);
+	t->r_r = t->r_w;
+	g_bk_last_spd = spd; g_bk_last_len = lb;
+	g_bk_spd = 0u; g_bk_trk = -1;
+}
+/* ===== end BAKE-619 kernel ===== */
+
 /* ALN-525 (W143): PIN the streamer to a 2048-byte flash boundary.
  * The night of 2026-08-30 proved the max+stream corner regresses when
  * ANY upstream code growth shifts this function's address (0x25aac
@@ -7857,11 +8188,11 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				 * stored missing its last stretch). Serve ANY backlog:
 				 * the frames are real audio with fixed destinations;
 				 * a late flush self-heals on the next loop pass. */
-				while ((t->r_w - t->r_r) >= TSPB(t)) {
+				while (bk_flush_navail(t, i) > 0u) {   /* BAKE-619: in this take's units */
 					uint32_t fm = t->flush_mod ? t->flush_mod : MAX_LOOP_BLOCKS;
 					/* batch as many contiguous blocks as are ready, up to the
 					 * buffer size and the loop-wrap boundary, into one CMD25 write */
-					uint32_t navail = (t->r_w - t->r_r) / TSPB(t);
+					uint32_t navail = bk_flush_navail(t, i);   /* BAKE-619 */
 					uint32_t n = navail < FLUSH_BATCH ? navail : FLUSH_BATCH;
 					uint32_t to_wrap = fm - (t->flush_blk % fm);
 					if (n > to_wrap) n = to_wrap;
@@ -7956,6 +8287,9 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 						continue;
 					}
 					g_w4_pk++; g_w4_pb += n;   /* W4P */
+					if (bk_flush_on(t, i))   /* BAKE-619: resample by the bounce speed on the way to flash */
+						bk_pack_blocks(t, batchbuf, n, (int16_t *)(void *)(batchbuf + 30u * EMMC_BLOCK_SIZE));
+					else
 					takes_pack_blocks(t, g_rring, RRING_MASK, (t->r_r >> 1) & RRING_MASK,
 					           batchbuf, n);
 					static uint32_t wfail_start;   /* 0 = no failure streak */
@@ -8014,7 +8348,8 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					}
 					wfail_start = 0;
 					wfail_ready1 = 0;
-					t->r_r += n * TSPB(t);
+					if (bk_flush_on(t, i)) { t->r_r += 2u * s_bk_cons_next; g_bk_ph = s_bk_ph_next; g_bk_blocks += n; }   /* BAKE-619: commit */
+					else t->r_r += n * TSPB(t);
 					t->flush_blk += n;
 					work = true;
 					/* FB-529 (W137): PROACTIVE page pacing at high tape
@@ -8061,7 +8396,8 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				 * Order matters: request the meta save BEFORE publishing TS_PLAY,
 				 * or stop_and_flush() (power-off/DFU) can observe "idle" between
 				 * the two stores and sleep with the new recording unsaved. */
-				if (t->state == TS_DONE && (t->r_w - t->r_r) < TSPB(t)) {
+				if (t->state == TS_DONE && bk_flush_navail(t, i) == 0u) {   /* BAKE-619: in this take's units */
+					if (bk_flush_on(t, i)) bk_promote(t);   /* BAKE-619: recorder blocks -> baked blocks */
 					g_done_pending = 0;   /* M20: ring free again */
 					/* Start playback BLOCK-ALIGNED at the live playhead. p_w must be a
 					 * multiple of SAMP_PER_BLK or the streamer writes each eMMC block at
@@ -8979,6 +9315,60 @@ static void midi_thread(void *a, void *b, void *c)
 	}
 }
 
+/* GRIDSPD-622 (W301): THE TAPPED GRID FOLLOWS THE TAPE SPEED. Once per
+ * block, after the mixer (which owns the smoothed speed). A gridded song's
+ * clock lives in wall time; the rocker changed the music's tempo and left
+ * the clock alone (marc: "the grid metronome light doesnt speed up or slow
+ * down with the tape speed"), so the lights, the punch lines, the bar
+ * service, the MIDI clock and the trance gate all fell off the loops, and
+ * a take punched at 1.5x was rounded to beats 1.5x too long (the punch
+ * derives its beat as nf * speed). Now: any writer that redefines the grid
+ * (tap, snap/retune, song load) is adopted as the reference at the
+ * SETTING; when the smoothed speed differs, nf is re-derived from that
+ * fixed reference and the anchor moved so the beat index and the fraction
+ * inside the beat are preserved (no jump, the bar count stays); the bar
+ * line and the tick base follow; the saved tempo follows once settled.
+ * Stands aside while a tap's beatmatch resync is pending (the grid IS the
+ * external clock then); with the transport stopped the setting is the
+ * speed. At a constant speed this does nothing. */
+static void __attribute__((noinline)) grid_follow_tape(void)
+{
+	const uint32_t nf = g_grid_beat_frames;
+	if (!g_grid_active || !nf) return;
+	if (nf != g_grid_nf_shadow) {   /* someone redefined the grid: that is the new reference */
+		g_grid_ref_nf = nf; g_grid_ref_spd = g_play_speed_q16; g_grid_nf_shadow = nf; g_grid_saved_nf = nf;
+	}
+	if (g_grid_resync_at) {         /* a tap is retuning the tape to this grid: hands off */
+		g_grid_ref_nf = nf; g_grid_ref_spd = g_play_speed_q16;
+		return;
+	}
+	const uint32_t s = g_loop_active ? g_cur_speed_q16 : g_play_speed_q16;
+	if (!s || !g_grid_ref_spd) return;
+	uint32_t want = (uint32_t)(((uint64_t)g_grid_ref_nf * g_grid_ref_spd + s / 2u) / s);
+	if (want < 1u) want = 1u;
+	if (want != nf) {
+		const uint64_t ph = g_sample_clock - g_grid_anchor;
+		const uint64_t k = ph / nf;
+		const uint64_t f = ph % nf;
+		const uint64_t f2 = (f * want + nf / 2u) / nf;
+		g_grid_anchor = g_sample_clock - (k * want + f2);
+		g_grid_beat_frames = want;
+		g_grid_nf_shadow = want;
+		{	const uint64_t bar = (uint64_t)want * 4u;
+			const uint64_t ph2 = g_sample_clock - g_grid_anchor;
+			g_grid_next_bar = g_grid_anchor + ((ph2 / bar) + 1u) * bar; }
+		/* MIDI ticks: keep the next one where it is, space the rest at the new beat */
+		g_grid_tick_base = g_grid_next_tick; g_grid_tick_base_sync = g_grid_next_tick; g_grid_tick_idx = 0u;
+		g_grid_follow_n++;
+	}
+	/* settled at a new speed: the song's saved tempo follows, so a reload lands here */
+	if (g_cur_speed_q16 == g_play_speed_q16 && g_grid_beat_frames != g_grid_saved_nf && g_slot < NUM_SLOTS) {
+		g_grid_bpm_q8[g_slot] = (uint16_t)((48000ULL * 60u * 256u) / g_grid_beat_frames);
+		g_grid_save_req = 1;
+		g_grid_saved_nf = g_grid_beat_frames;
+	}
+}
+
 static void audio_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -9041,6 +9431,7 @@ static void audio_thread(void *a, void *b, void *c)
 		looper_audio_block(blk);
 		uint32_t _cus = (DWT->CYCCNT - _c0) / 64u;   /* 64 MHz -> us */
 		if (_cus > g_audio_us_max) g_audio_us_max = _cus;
+		grid_follow_tape();   /* GRIDSPD-622 (W301): the tapped grid follows the tape speed */
 		{	/* FXSTAT2-585: which ONE effect is up this block? Threshold 32
 			 * skips the pickup-law zone while a fader is still being swept. */
 			uint32_t _n = 0u, _c = 0u;
@@ -9547,6 +9938,11 @@ static void controls_diag(void)
 		       (unsigned)g_wbj, (unsigned)g_wbx,
 		       (unsigned)g_ec_mix, (unsigned)g_ec_div, (unsigned)g_ec_dly,
 		       (unsigned)(((uint32_t)g_ec_mix * 166u) >> 8), (unsigned)g_ec2_w);   /* ECHO2-610: fb q8, line index */
+		printk("GF,n=%u,nf=%u,ref=%u,%u\n",   /* GRIDSPD-622: rescales, beat frames now, reference nf/speed */
+		       (unsigned)g_grid_follow_n, (unsigned)g_grid_beat_frames, (unsigned)g_grid_ref_nf, (unsigned)g_grid_ref_spd);
+		printk("BK,p=%u,s=%u,l=%u,c=%u,b=%u,n=%u\n",   /* BAKE-619/TRUE-621: prints baked, last speed q16, last len (baked blocks), capped, blocks this print, loop chosen at the stop */
+		       (unsigned)g_bk_prints, (unsigned)g_bk_last_spd, (unsigned)g_bk_last_len,
+		       (unsigned)g_bk_capped, (unsigned)g_bk_blocks, (unsigned)g_bk_len);
 		printk("P16,m=%u%u%u%u,n=%u%u%u%u\n",
 		       (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
 		       (unsigned)trk[2].p16m, (unsigned)trk[3].p16m,
@@ -10722,7 +11118,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 6\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 0\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
