@@ -3072,14 +3072,24 @@ static inline int32_t tp_pink(int32_t *k0, int32_t *k1, int32_t *k2)
 	return *k0 + *k1 + *k2 + (((w * 6055) + 16384) >> 15);
 }
 
-/* ===== ECHO-572: page 2 fader 4, tapped out of the RECORD ring =====
- * Zero new buffers. g_rring already holds 341 ms of continuously-written
- * input history (the M20 pre-roll writes it whenever nothing is capturing,
- * the TS_REC writer writes it while a take runs, and the tree's own comment
- * says they are ONE sequential stream on an absolute pair grid). */
+/* ===== ECHO2-610 (E2): page 2 fader 4, a DEDICATED post-FX line with feedback =====
+ * E1 (568/572) tapped the RECORD ring, so it echoed the jack only and could
+ * not feed back -- the recorder owns that ring. E2 owns its own line: the
+ * whole post-FX bus goes in, the repeats recirculate, and a bounce prints
+ * them (the print IS the post-FX bus, BNC-597). 12 kHz mono int16, 384 ms:
+ * 1/16, dotted 1/16 and 1/8 all fit down to 80 BPM, 1/16 to 40 BPM; longer
+ * clamps to the line -- never silence (the 572 rule). Written as 4-frame
+ * L+R averages (a boxcar-4 nulls at exactly 12 and 24 kHz, so nothing
+ * aliases), read with linear interpolation (no held-sample images, W134).
+ * The repeats are dark, ~-5 dB at 4 kHz per pass: the tape-echo character,
+ * and what keeps feedback from building up harsh. Cleared on engage. */
 static volatile uint8_t  g_ec_mix;   /* 0 = dry, and the kernel is skipped */
 static volatile uint8_t  g_ec_div;   /* 0 = 1/16, 1 = dotted-1/16, 2 = 1/8 */
 static volatile uint32_t g_ec_dly;   /* the COMPUTED delay, engine frames */
+#define EC2_LINE 4608u               /* 12 kHz mono samples = 384 ms; 9,216 B */
+static int16_t  g_ec2_line[EC2_LINE];
+static uint32_t g_ec2_w;             /* line write index, 0..EC2_LINE-1 */
+static uint8_t  g_ec2_live;          /* the line holds CURRENT audio (cleared on engage) */
 
 /* FXRST-563: ONE gesture puts every effect back to neutral.
  * Deliberately does NOT touch page 8 (mono/stereo) -- that is a record
@@ -3650,17 +3660,12 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		 * bottom to ~1.2 kHz at the top. Low = growl, high = clangorous metal.
 		 * 2^32 / 48000 = 89478 phase units per Hz. */
 		const uint32_t rng_inc  = 3579139u + (uint32_t)g_rng_amt * 406000u;
-		/* ECHO-572 per-block constants. */
+		/* ECHO2-610 per-block constants: the delay in LINE samples, the wet and
+		 * feedback gains, and the engage edge. Decided once per block. */
 		const int32_t  ec_mix = (int32_t)g_ec_mix;
-		uint32_t ec_d = 0u, ec_max = 0u, ec_fr = 0u;
-		/* ECHO-572 (C): the taps are decided ONCE HERE. 568 recomputed
-		 * 'ec_d * _tp' and both bounds checks inside the per-frame loop --
-		 * 768 multiplies and 768 comparisons per block to reach the same
-		 * three answers. */
 		int ec_n = 0;
-		uint32_t ec_o0 = 0u, ec_o1 = 0u, ec_o2 = 0u;
-		/* ECHO-572 (A): the running tap sum, held across the frame pair. */
-		int32_t ec_wL = 0, ec_wR = 0;
+		uint32_t ec2_d = 0u;             /* delay, 12 kHz line samples */
+		int32_t  ec2_fb = 0, ec2_wet = 0;
 		if (ec_mix) {
 			/* the trance gate's clock, verbatim -- survives varispeed and
 			 * locks the repeats to the takes. */
@@ -3669,37 +3674,29 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			              : ((g_play_bpm > 0)
 			                 ? (48000u * 60u / (uint32_t)g_play_bpm) : 0u);
 			if (!_ebf) _ebf = 24000u;      /* ungridded: 500 ms 'beat' */
-			/* SIXTEENTHS, not quarters. The usable history is g_pre_valid,
-			 * which caps at PREROLL_MAX = 3/4 of the ring = 12,288 engine
-			 * frames = 256 ms -- NOT the 341 ms the ring spans. A 1/4 note at
-			 * 120 BPM is 24,000 frames, so with quarters every tap was dropped
-			 * and the echo made NO SOUND AT ALL. */
-			ec_d = (g_ec_div == 1u) ? ((_ebf * 3u) >> 3)   /* dotted 1/16 */
-			     : (g_ec_div >= 2u) ? (_ebf >> 1)          /* 1/8 */
-			                        : (_ebf >> 2);         /* 1/16 */
-			ec_max = g_pre_valid;   /* caps itself at PREROLL_MAX = 256 ms */
-			if (ec_max > (RRING_SAMPLES * 2u - 512u))
-				ec_max = (RRING_SAMPLES * 2u - 512u);
-			/* NO TEMPO MAY SILENCE THE EFFECT. At a slow enough tempo even ONE
-			 * tap can exceed the history; shorten the delay rather than drop to
-			 * silence. A control that does nothing at 90 BPM is a bug however
-			 * defensible the arithmetic is. */
-			if (ec_d > ec_max) ec_d = ec_max;
-			ec_fr = g_pre_w;   /* the SAME frontier the store index uses */
-			g_ec_dly = ec_d;   /* publish what was ACTUALLY computed */
-			/* the LAST tap spends the budget, not the first. Taps that would
-			 * reach past the valid history are DROPPED, not wrapped -- a wrap
-			 * reads the future and stutters. Identical rule to 568, evaluated
-			 * once instead of 768 times. */
-			if (ec_d != 0u && ec_d <= ec_max) {
-				ec_o0 = ec_d; ec_n = 1;
-				if ((ec_d * 2u) <= ec_max) {
-					ec_o1 = ec_d * 2u; ec_n = 2;
-					if ((ec_d * 3u) <= ec_max) {
-						ec_o2 = ec_d * 3u; ec_n = 3;
-					}
-				}
+			uint32_t _ed = (g_ec_div == 1u) ? ((_ebf * 3u) >> 3)   /* dotted 1/16 */
+			             : (g_ec_div >= 2u) ? (_ebf >> 1)          /* 1/8 */
+			                                : (_ebf >> 2);         /* 1/16 */
+			ec2_d = (_ed + 2u) >> 2;       /* engine frames -> line samples */
+			/* NO TEMPO MAY SILENCE THE EFFECT (572): shorten to the line
+			 * rather than drop out. 384 ms holds every division to 80 BPM. */
+			if (ec2_d < 1u) ec2_d = 1u;
+			if (ec2_d > EC2_LINE - 1u) ec2_d = EC2_LINE - 1u;
+			g_ec_dly = ec2_d << 2;         /* publish what was ACTUALLY used, engine frames */
+			/* one fader: wet tops out at -6 dB, feedback at 0.65 -- a sustained
+			 * tone can build to ~1.4x dry and no further; the bus is int32 and
+			 * the lean loop's limiter is downstream. */
+			ec2_wet = ec_mix >> 1;
+			ec2_fb  = (ec_mix * 166) >> 8;
+			if (!g_ec2_live) {
+				/* engage edge: an old tail must never play back */
+				memset(g_ec2_line, 0, sizeof(g_ec2_line));
+				g_ec2_w = 0u;
+				g_ec2_live = 1u;
 			}
+			ec_n = 1;
+		} else {
+			g_ec2_live = 0u;
 		}
 		/* TAPE-569 per-block constants. */
 		const int32_t tp_dr = 4096 + ((int32_t)g_tp_drive * 112);   /* 1.0x..7.97x */
@@ -4210,51 +4207,42 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			}
 		}
 		if (ec_n) {
-			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
-				int32_t xL = mix32[f];
-				int32_t xR = mix32R[f];
-				/* THREE TAPS, decaying. No feedback path exists -- the recorder
-				 * owns this ring and we may only READ it -- so the repeats are
-				 * three fixed taps instead of one recirculating one.
-				 * ECHO-572 (A) HALF-RATE REUSE, BIT-IDENTICAL: the index is
-				 * (_here - off) >> 1 and _here advances by exactly 1 per frame, so
-				 * CONSECUTIVE FRAME PAIRS READ THE SAME STORED SAMPLE. All three
-				 * taps share _here, so its parity alone says whether anything
-				 * moved. Skipping the odd frame removes half the index math and
-				 * half the loads and CANNOT change the output. f == 0 forces a
-				 * compute so frame 0 never inherits the previous block's sum. */
-				uint32_t _here = ec_fr - (BLK_FRAMES - f);
-				if (f == 0u || (_here & 1u) == 0u) {
-					/* ECHO-572 (B): ONE 32-bit load per tap. g_rring is interleaved
-					 * int16 L,R so the pair is adjacent; little-endian puts L in the
-					 * low half. __builtin_memcpy rather than a uint32_t* cast -- the
-					 * cast is a strict-aliasing violation and assumes an alignment
-					 * the array does not promise, while memcpy is defined and folds
-					 * to a single load (W478).
-					 * ECHO-572 (D): unrolled, so the gains are IMMEDIATE shifts. */
-					uint32_t _v; int32_t _aL, _aR;
-					uint32_t _i0 = ((_here - ec_o0) >> 1) & RRING_MASK;
-					__builtin_memcpy(&_v, &g_rring[_i0 * 2u], 4);
-					_aL = (int32_t)(int16_t)(_v & 0xFFFFu) >> 1;
-					_aR = (int32_t)(int16_t)(_v >> 16)     >> 1;
-					if (ec_n > 1) {
-						uint32_t _i1 = ((_here - ec_o1) >> 1) & RRING_MASK;
-						__builtin_memcpy(&_v, &g_rring[_i1 * 2u], 4);
-						_aL += (int32_t)(int16_t)(_v & 0xFFFFu) >> 2;
-						_aR += (int32_t)(int16_t)(_v >> 16)     >> 2;
-						if (ec_n > 2) {
-							uint32_t _i2 = ((_here - ec_o2) >> 1) & RRING_MASK;
-							__builtin_memcpy(&_v, &g_rring[_i2 * 2u], 4);
-							_aL += (int32_t)(int16_t)(_v & 0xFFFFu) >> 3;
-							_aR += (int32_t)(int16_t)(_v >> 16)     >> 3;
-						}
-					}
-					ec_wL = _aL; ec_wR = _aR;
-				}
-				xL += (ec_wL * ec_mix) >> 8;
-				xR += (ec_wR * ec_mix) >> 8;
-				mix32[f] = xL; mix32R[f] = xR;
+			/* ECHO2-610: 64 line samples per block. Each is the L+R average of
+			 * 4 bus frames; its repeat is read with linear interpolation across
+			 * the same 4 frames. Per group: read the delayed sample, write
+			 * in + fb * delayed (soft-limited -- the CHRSAT-592 lesson), then add
+			 * the repeat to both channels. The k+1 sample the interpolation
+			 * needs is always already written: the delay is >= 1. */
+			uint32_t _w  = g_ec2_w;
+			uint32_t _r  = (_w + EC2_LINE - ec2_d) % EC2_LINE;   /* read = write - delay */
+			uint32_t _r1 = (_r + 1u == EC2_LINE) ? 0u : _r + 1u;
+			int32_t  _da = g_ec2_line[_r];                       /* delayed sample k */
+			for (uint32_t k = 0u; k < BLK_FRAMES / 4u; k++) {
+				const uint32_t f0 = k * 4u;
+				int32_t _in = (mix32[f0]      + mix32R[f0]
+				             + mix32[f0 + 1u] + mix32R[f0 + 1u]
+				             + mix32[f0 + 2u] + mix32R[f0 + 2u]
+				             + mix32[f0 + 3u] + mix32R[f0 + 3u]) >> 3;
+				/* the store is SOFT-limited (knee at 0.8 FS): the bus is designed to
+				 * exceed int16 and a recirculating pad would otherwise hard-clip;
+				 * this is the tape-echo self-limiting instead -- repeats compress
+				 * gently and feedback can never run away. */
+				g_ec2_line[_w] = soft_limit(_in + ((_da * ec2_fb) >> 8));
+				int32_t _db = g_ec2_line[_r1];                   /* delayed sample k+1 */
+				int32_t _dd = _db - _da;
+				int32_t _e0 = (_da * ec2_wet) >> 8;
+				int32_t _e1 = ((_da + (_dd >> 2)) * ec2_wet) >> 8;
+				int32_t _e2 = ((_da + (_dd >> 1)) * ec2_wet) >> 8;
+				int32_t _e3 = ((_da + _dd - (_dd >> 2)) * ec2_wet) >> 8;
+				mix32[f0]      += _e0; mix32R[f0]      += _e0;
+				mix32[f0 + 1u] += _e1; mix32R[f0 + 1u] += _e1;
+				mix32[f0 + 2u] += _e2; mix32R[f0 + 2u] += _e2;
+				mix32[f0 + 3u] += _e3; mix32R[f0 + 3u] += _e3;
+				_da = _db;
+				_w  = (_w  + 1u == EC2_LINE) ? 0u : _w  + 1u;
+				_r1 = (_r1 + 1u == EC2_LINE) ? 0u : _r1 + 1u;
 			}
+			g_ec2_w = _w;
 		}
 		if (lfo_on) g_fx2_lfo = lfo_base + (uint32_t)BLK_FRAMES * FX2_LFO_INC;   /* PG8-560: advanced ONCE per frame, folded */
 		}
@@ -9135,7 +9123,9 @@ static void feedback_update(void)
 #define UAC2_IN_TERMINAL_ID  UAC2_ENTITY_ID(DT_NODELABEL(in_terminal))
 #define UAC2_MAX_PKT         ((48 + 1) * USB_FRAME_BYTES)
 K_MEM_SLAB_DEFINE_STATIC(uac2_rx_slab, ROUND_UP(UAC2_MAX_PKT, UDC_BUF_GRANULARITY),
-			 32, UDC_BUF_ALIGN);
+			 16, UDC_BUF_ALIGN);   /* R5-610 (553): was 32. Peak use measured 1 of 32
+			                       * (rxlo=31, nb=0) every packet at the corner; 16
+			                       * keeps 16x the observed peak. 3,136 B -> the echo line. */
 
 static const struct device *const uac2_dev =
 	DEVICE_DT_GET(DT_NODELABEL(uac2_speaker));
@@ -9466,7 +9456,7 @@ static void controls_diag(void)
 		       (unsigned)g_tp_hiss,  (unsigned)g_tp_wob,
 		       (unsigned)g_wbj, (unsigned)g_wbx,
 		       (unsigned)g_ec_mix, (unsigned)g_ec_div, (unsigned)g_ec_dly,
-		       (unsigned)g_pre_valid, (unsigned)g_pre_w);
+		       (unsigned)(((uint32_t)g_ec_mix * 166u) >> 8), (unsigned)g_ec2_w);   /* ECHO2-610: fb q8, line index */
 		printk("P16,m=%u%u%u%u,n=%u%u%u%u\n",
 		       (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
 		       (unsigned)trk[2].p16m, (unsigned)trk[3].p16m,
@@ -10641,7 +10631,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 2\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
