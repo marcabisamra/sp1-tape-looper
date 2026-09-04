@@ -1484,6 +1484,9 @@ struct looptrk {
 	                                      * so a loaded take's live geometry can
 	                                      * never flip under the streamer (the
 	                                      * half-plugged-guitar noise, W147). */
+	uint8_t  gsh;                        /* BNC2-604: PRINT GAIN shift. A bounce is stored
+	                                      * bus >> gsh and played back vol << gsh (folded
+	                                      * into PASS B's per-block hoist). 0 = a normal take. */
 	uint8_t  p16m;                       /* P16-522, VF-523: NOT volatile -- see W141.
 	                                      * Written only at take-create/load; a stale
 	                                      * read for one pass is harmless, and volatile
@@ -1700,19 +1703,8 @@ static volatile uint8_t  g_heads_mode;
  * empty); holding a LOADED track in heads mode makes IT the tape. */
 static volatile uint8_t  g_head_src;
 static uint8_t           g_head_mute_save;   /* song mutes across heads mode */
-/* M19b BOUNCE: print the heads performance into an empty track as an OFFLINE
- * RENDER — the heads mix repeats exactly once per audible cycle, so one
- * rendered cycle is a seamless loop by construction, phase-locked to its
- * source and speed-independent. Snapshotted at request (gains/mutes/
- * positions/directions/window); rendered by the streamer 4 blocks per round
- * while the heads keep playing; index written ONLY after every audio block
- * (torn-write doctrine: an abort or power cut leaves an empty track).
- * On completion: promote dst, restore the song's mutes, AUTO-EXIT heads —
- * you immediately hear what you printed, in phase (locked decision). */
-static volatile int8_t   g_bnc_req = -1;   /* dst track; -1 = idle */
-static volatile uint8_t  g_bnc_active;
-static volatile uint8_t  g_bnc_done;
-static volatile uint8_t  g_bnc_abort;
+/* R1-597: the M19b offline block-copy bounce is DELETED. A bounce is now a
+ * take fed from the bus (BNC-597), on every layer, heads included. */
 static volatile uint8_t  g_led_shrug;      /* track row "no" double-blink */
 static volatile uint8_t  g_fn_held;        /* LED-549: FUNCTION is down (LED routing) */
 static volatile uint8_t  g_vu;             /* LED-549: master VU, 0..255, decayed */
@@ -1728,14 +1720,9 @@ static volatile uint8_t  g_pg_open;        /* PG-533: a page is open (PF-545: st
 static volatile uint8_t  g_pg_id;          /* FXP-547: WHICH page -- 4 = MODE (T4), 2 = FX (T2) */
 static uint8_t           g_fx_pick[4];     /* FXP-547: fader owes a pickup cross on this page */
 static int               g_fx_lastq[4];    /* FXP-547: last raw read while un-picked */
-static uint8_t  bnc_src, bnc_dst;
-static uint8_t  bnc_pos[NTRK], bnc_rev[NTRK], bnc_mut[NTRK];
-static uint16_t bnc_vol[NTRK];
-static uint8_t  bnc_wfree, bnc_wrev;
-static uint32_t bnc_cyc, bnc_win, bnc_wbase, bnc_wper, bnc_start, bnc_content;
-static uint32_t bnc_done_blocks;
-static int32_t  bnc_acc[4u * 256u];        /* 4 KB chunk accumulator */
-static uint8_t  bnc_rdbuf[512];            /* one source block */
+static uint8_t  g_dmp_buf[512];            /* DMP-466's one-block read buffer
+                                            * (it borrowed the 4 KB bounce
+                                            * accumulator until R1-597) */
 #define head_active(i) (g_heads_mode && (i) != g_head_src && \
 			trk[g_head_src].state == TS_PLAY)
 /* M14 HEADS v2: each head's position on the loop is a live Q8 phase (0-255
@@ -1911,6 +1898,26 @@ static volatile uint32_t g_bt_pk;    /* PASS C tap peak, master gain removed */
 static volatile uint32_t g_bt_lat;   /* the same, latched for PASS A */
 static volatile uint32_t g_bt_acc;   /* PASS A's running mean of the tap */
 static volatile uint32_t g_bt_n;     /* blocks PASS A has consumed */
+
+/* ===== BNC-597 B2: PRINT TO A REAL TAKE =====
+ * A bounce is a take whose SOURCE is the bus instead of the jack. Same
+ * recorder, same ring, same flush, same codec, same stop. Two flags:
+ *   g_bnc_arm  main -> engine: the g_arm_req[] that follows is a bounce
+ *   g_bnc_on   engine: the take in flight reads the bus (PASS A checks
+ *              it together with g_rec_track, so it can never outlive
+ *              the take it belongs to) */
+static volatile int8_t   g_bnc_arm = -1;
+static volatile uint8_t  g_bnc_on;
+static volatile uint32_t g_bnc_prints;     /* diag: bounces armed since boot */
+static int16_t           g_bnc_live[BLK_FRAMES * 2u];   /* BNC3-605: the jack, saved for the monitor */
+#define BNC_PRE_HALF 4u   /* PRE-608: the pre-emphasis FIR's delay, bus samples */
+static int32_t           g_bnc_pre_hist[2][8];   /* PRE-608: the FIR's last 8 bus samples, L/R */
+static volatile uint8_t  g_bnc_anch;        /* the take's first REC block has been anchored */
+static uint8_t           g_bnc_p16m_prev;   /* the target's next-record mode before the arm */
+static uint8_t           g_arm_gsh_prev;    /* the target's print gain before ANY arm (cancel restores) */
+#define BNC_GSH 2u   /* BNC2-604: a print is stored 12 dB down -- room for four
+                      * full-scale tracks + the monitor before the limiter -- and
+                      * played back x4. Two bits of x3 flags; max 3. */
 
 /* ===== TAPE-569: page 4 (T4) -- drive / tone / hiss / wobble =====
  * Ported from charlesvestal's tape-page branch. Every one of these has a
@@ -4257,6 +4264,124 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
  * small enough for GCC to INLINE into audio_thread -- PASS A/B were then
  * re-generated inside a different function, the very thing 588 exists to
  * prevent. Keep it a function of its own, as it was in every bin up to 585. */
+/* ===== BNC3-606: THE BOUNCE'S BLOCK-LEVEL CODE, OUTSIDE THE MIXER (W291) =====
+ * -O2 allocates looper_audio_block as one unit; 604/605 showed that even
+ * straight-line bounce code inside it re-rolled PASS A/B's registers
+ * (426 -> 555 spills). noinline is the whole point, as with fx_chain_block. */
+static void __attribute__((noinline)) bnc_arm_prep(int i)
+{
+	/* The print's mode is its SOURCES' mode -- stereo if any playing source
+	 * is stereo, mono only if all are (BNC2-603). Restored on cancel. */
+	uint8_t _st = 0u;
+	for (int _k = 0; _k < NTRK; _k++)
+		if (_k != i && trk[_k].state == TS_PLAY && !trk[_k].p16m) _st = 1u;
+	g_bnc_p16m_prev = trk[i].p16m_next;
+	trk[i].p16m_next = _st ? 0u : 1u;
+	g_bnc_prints++;
+	g_bnc_anch = 0u;
+	memset(g_bnc_pre_hist, 0, sizeof(g_bnc_pre_hist));   /* PRE-608: fresh FIR state per print */
+	/* The pre-roll ring holds the JACK. With its valid count at 0 the M20
+	 * rescue can never reach back (it needs need <= _pre_val, and the arm is
+	 * always after the line it would reach to), and the M41 onset scan only
+	 * ever sees post-arm samples -- which are the bus. The echo's history
+	 * dips for <= 256 ms. */
+	g_pre_valid = 0u;
+	if (g_grid_punch_at) {
+		/* BLOCK-EXACT ANCHOR, decided here instead of tested per emit: move
+		 * the punch forward by up to one block of tape so (position at the
+		 * punch - one block of tape) is a multiple of TSPB -- start_blk is
+		 * exact and the print sits sample-exact on its sources. Exact at
+		 * 1.0x (one emit per frame); B4 owns the other speeds. */
+		uint64_t _dt = (g_grid_punch_at > g_sample_clock) ? (g_grid_punch_at - g_sample_clock) : 0u;
+		uint32_t _cpl = g_consume_pos + (uint32_t)((_dt * g_cur_speed_q16) >> 16);
+		uint32_t _lag = (uint32_t)(((uint64_t)(BLK_FRAMES + BNC_PRE_HALF) * g_cur_speed_q16) >> 16);   /* PRE-608: + the FIR delay */
+		uint32_t _need = (TSPBI(i) - ((_cpl - _lag) % TSPBI(i))) % TSPBI(i);
+		if (_need && g_cur_speed_q16)
+			g_grid_punch_at += (uint64_t)((((uint64_t)_need << 16) + g_cur_speed_q16 - 1u) / g_cur_speed_q16);
+	}
+}
+
+/* The cycle a bounce stopped under CHOP rounds to (BNC2-603), in track i's
+ * blocks: the song base in fixed mode, the longest playing source otherwise;
+ * 0 = no rounding (chop off, nothing to measure against, or too long). */
+static uint32_t __attribute__((noinline)) bnc_cycle_blocks(int i)
+{
+	uint32_t cyc = 0u;
+	if (!(g_bnc_on && (g_chop_div > 1u || g_win_free))) return 0u;
+	if (g_fixed_len && TLOOPB(i)) {
+		cyc = TLOOPB(i);
+	} else {
+		for (int _k = 0; _k < NTRK; _k++) {
+			if (_k == i || trk[_k].state != TS_PLAY || !trk[_k].len_blocks) continue;
+			uint32_t _bk = (uint32_t)(((uint64_t)trk[_k].len_blocks * TSPBI(_k)
+			                            + TSPBI(i) / 2u) / TSPBI(i));
+			if (_bk > cyc) cyc = _bk;
+		}
+	}
+	if (cyc > MAX_LOOP_BLOCKS) cyc = 0u;
+	return cyc;
+}
+
+/* Before PASS A on a bounce block: keep the jack, put the PRE-EMPHASISED,
+ * limited, 12 dB-down bus into the input buffer; PASS A records it with the
+ * code it always had.
+ * PRE-608 (W292): one trip through the 24 kHz store is cos^3(pi f/48k) --
+ * the record boxcar is cos, the playback midpoint upsample cos^2. The
+ * sources carry one trip already; the print would carry two. This 9-tap
+ * symmetric FIR (Q8, linear phase, 4-sample delay) is ~1/cos^3 to 10 kHz
+ * and a lowpass above 13 kHz (nothing for the boxcar to fold back), so the
+ * print comes back at the sources' brightness: within +/-0.7 dB to 10 kHz
+ * end-to-end, where 607 was -2.0 dB @6k / -3.6 @8k / -5.2 @10k. Worst-case
+ * gain 1.8x, inside the 12 dB print headroom. Bounce-only, outside the
+ * mixer. */
+static void __attribute__((noinline)) bnc_prepass(int16_t *tmp, const int32_t *mL, const int32_t *mR)
+{
+	int32_t l0 = g_bnc_pre_hist[0][0], l1 = g_bnc_pre_hist[0][1], l2 = g_bnc_pre_hist[0][2], l3 = g_bnc_pre_hist[0][3],
+	        l4 = g_bnc_pre_hist[0][4], l5 = g_bnc_pre_hist[0][5], l6 = g_bnc_pre_hist[0][6], l7 = g_bnc_pre_hist[0][7];
+	int32_t r0 = g_bnc_pre_hist[1][0], r1 = g_bnc_pre_hist[1][1], r2 = g_bnc_pre_hist[1][2], r3 = g_bnc_pre_hist[1][3],
+	        r4 = g_bnc_pre_hist[1][4], r5 = g_bnc_pre_hist[1][5], r6 = g_bnc_pre_hist[1][6], r7 = g_bnc_pre_hist[1][7];
+	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+		g_bnc_live[2u * f]      = tmp[2u * f];
+		g_bnc_live[2u * f + 1u] = tmp[2u * f + 1u];
+		const int32_t xl = mL[f], xr = mR[f];   /* newest = n; centre tap = n-4 */
+		const int32_t yl = (205 * l4 + 97 * (l3 + l5) - 58 * (l2 + l6) - 49 * (l1 + l7) + 35 * (l0 + xl)) >> 8;
+		const int32_t yr = (205 * r4 + 97 * (r3 + r5) - 58 * (r2 + r6) - 49 * (r1 + r7) + 35 * (r0 + xr)) >> 8;
+		tmp[2u * f]      = soft_limit(yl >> BNC_GSH);
+		tmp[2u * f + 1u] = soft_limit(yr >> BNC_GSH);
+		l0 = l1; l1 = l2; l2 = l3; l3 = l4; l4 = l5; l5 = l6; l6 = l7; l7 = xl;
+		r0 = r1; r1 = r2; r2 = r3; r3 = r4; r4 = r5; r5 = r6; r6 = r7; r7 = xr;
+	}
+	g_bnc_pre_hist[0][0] = l0; g_bnc_pre_hist[0][1] = l1; g_bnc_pre_hist[0][2] = l2; g_bnc_pre_hist[0][3] = l3;
+	g_bnc_pre_hist[0][4] = l4; g_bnc_pre_hist[0][5] = l5; g_bnc_pre_hist[0][6] = l6; g_bnc_pre_hist[0][7] = l7;
+	g_bnc_pre_hist[1][0] = r0; g_bnc_pre_hist[1][1] = r1; g_bnc_pre_hist[1][2] = r2; g_bnc_pre_hist[1][3] = r3;
+	g_bnc_pre_hist[1][4] = r4; g_bnc_pre_hist[1][5] = r5; g_bnc_pre_hist[1][6] = r6; g_bnc_pre_hist[1][7] = r7;
+}
+
+/* After PASS A on a bounce block: the monitor seed was the bus; make it the
+ * jack again, exactly (int32: what was added is what is subtracted). And on
+ * the take's FIRST recording block: anchor one block of tape earlier (sample
+ * 0 is the bus from one block ago) and set the print gain. Playback reads
+ * neither before promotion. */
+static void __attribute__((noinline)) bnc_postpass(int32_t *mL, int32_t *mR, const int16_t *tmp, uint32_t got_live)
+{
+	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+		int32_t lL = (f < got_live) ? (int32_t)g_bnc_live[2u * f]      : 0;
+		int32_t lR = (f < got_live) ? (int32_t)g_bnc_live[2u * f + 1u] : 0;
+		mL[f] += lL - (int32_t)tmp[2u * f];
+		mR[f] += lR - (int32_t)tmp[2u * f + 1u];
+	}
+	int _rt = g_rec_track;
+	if (!g_bnc_anch && _rt >= 0 && trk[_rt].state == TS_REC) {
+		g_bnc_anch = 1u;
+		uint32_t _lag = (uint32_t)(((uint64_t)(BLK_FRAMES + BNC_PRE_HALF) * g_cur_speed_q16) >> 16);   /* PRE-608: + the FIR delay */
+		uint32_t sp = trk[_rt].start_samps;
+		sp = (sp >= _lag) ? (sp - _lag) : 0u;
+		trk[_rt].start_samps = sp;
+		trk[_rt].start_blk   = (sp + TSPBI(_rt) / 2u) / TSPBI(_rt);
+		trk[_rt].gsh = (uint8_t)BNC_GSH;
+	}
+}
+
 /* O2FIX-591 (W282): the mixer carried __attribute__((optimize("O2"))) on the
  * line above its signature since cd416ba (2026-07-05). EFXM2-588 inserted
  * fx_chain_block() between that line and the signature, so from 588 to 590
@@ -4436,6 +4561,8 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				/* -> back to PLAY/EMPTY. */
 				trk[i].state = (g_slot < NUM_SLOTS && g_meta.slot[g_slot].present[i])
 					       ? TS_PLAY : TS_EMPTY;
+				trk[i].gsh = g_arm_gsh_prev;                          /* BNC3-605 */
+				if (g_bnc_on) trk[i].p16m_next = g_bnc_p16m_prev;   /* BNC3-605 */
 				g_rec_track = -1;
 				g_grid_punch_at = 0;   /* M8b: cancel the scheduled punch */
 				if (g_loop_len == 0u) {
@@ -4632,6 +4759,15 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 						g_meta_save_req = 1;
 					}
 				}
+				/* BNC2-603: a bounce stopped while the CHOP is on prints whole
+				 * cycles, so the chop cuts the print the way it cuts its sources
+				 * (a print shorter than the cycle is chopped relative to itself:
+				 * marc heard the last part of the loop repeating). Cycle = the
+				 * song base in fixed mode, the longest playing source otherwise,
+				 * in THIS track's blocks. 0 = no rounding (chop off, or nothing
+				 * to measure against). */
+				uint32_t _bnc_cyc = bnc_cycle_blocks(i);   /* BNC3-606 (BNC2-603): 0 unless a bounce under chop */
+				if (_bnc_cyc) { glen = 0; gbeats = 0; }   /* the cycle, not the beat, is the unit */
 				uint32_t len = content;
 				uint32_t tgt = content * TSPBI(i);   /* default: stop now */
 				uint8_t  sil = 1;                        /* pad the final sub-block */
@@ -4669,7 +4805,11 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 						tgt = glen * TSPBI(i);
 						sil = 0;
 					}
-				} else if (g_fixed_len && TLOOPB(i)) {
+				} else if (_bnc_cyc || (g_fixed_len && TLOOPB(i))) {
+					/* BNC3-607: a bounce under CHOP rounds to its chop cycle with
+					 * exactly this machinery (BNC2-603); everything else is the
+					 * fixed-mode bar rounding it always was. */
+					const uint32_t _rbase = _bnc_cyc ? _bnc_cyc : TLOOPB(i);
 					/* FIXED mode: round to the NEAREST whole multiple of
 					 * the base — ceil-only rounding gapped BOTH ways
 					 * (community: stop a hair early and the tail padded
@@ -4685,9 +4825,9 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 					 *  - stopped LATE (past the nearest bar): snap BACK to
 					 *    it — the overhang stays on flash but is never
 					 *    played (promotion fades the new seam). */
-					uint32_t mult = (content + TLOOPB(i) / 2u) / TLOOPB(i);
+					uint32_t mult = (content + _rbase / 2u) / _rbase;
 					if (mult < 1u) mult = 1u;
-					uint32_t nlen = mult * TLOOPB(i);
+					uint32_t nlen = mult * _rbase;
 					if (nlen <= MAX_LOOP_BLOCKS) {
 						len = nlen;
 						if (nlen * TSPBI(i) > trk[i].rec_count) {
@@ -4833,6 +4973,8 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 	for (int i = 0; i < NTRK; i++) {
 		if (!g_arm_req[i]) continue;
 		g_arm_req[i] = 0;
+		const int _bnc_i = (g_bnc_arm == (int8_t)i);   /* BNC-597: this arm is a bounce */
+		if (_bnc_i) g_bnc_arm = -1;
 		if (!g_emmc_ready) continue;
 		if (g_rec_track >= 0) continue;                       /* one at a time */
 		/* ONE take in flight, device-wide: refuse while ANY track is armed,
@@ -4856,6 +4998,12 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 			if (k != i && (trk[k].state != TS_EMPTY ||
 				       (g_slot < NUM_SLOTS && g_meta.slot[g_slot].present[k])))
 				others = 1;
+		if (_bnc_i && !others) {
+			/* BNC-597: a bounce needs something to bounce. main checks this
+			 * too; this is the engine's own word on it. */
+			g_led_shrug = 20;
+			continue;
+		}
 		if (!others) { g_loop_len = 0; g_loop_blocks = 0; g_loop_active = 0;
 			       g_grid_base_beats = 0; g_grid_base_blocks = 0; }
 
@@ -4917,8 +5065,12 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		 * first sound lands (TS_REC). Leaving them intact means a re-record that
 		 * is cancelled (released before any sound) returns the track to PLAY with
 		 * its ORIGINAL length, not a clobbered one. */
+		if (_bnc_i) bnc_arm_prep(i);   /* BNC3-606: mode, pre-roll, block-exact punch */
 		trk[i].state = TS_ARMED;
 		g_rec_track = i;
+		g_bnc_on = _bnc_i ? 1u : 0u;   /* BNC-597: every take start says what its source is */
+		g_arm_gsh_prev = trk[i].gsh;   /* BNC3-605: a NEW take has no print gain (a cancel puts it back) */
+		trk[i].gsh = 0u;
 	}
 
 	/* HOLD PLAY -> jump to the start of the song and play. Rewind the shared
@@ -4974,6 +5126,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 					trk[i].p16m_next = (uint8_t)(_rv & 1u);
 				if (!pres) {
 					trk[i].p16m = 0;   /* empty: no take, clean geometry */
+					trk[i].gsh  = 0;   /* BNC2-604 */
 					if (!(_rv & 0x80u)) trk[i].p16m_next = 0;
 				}
 			}
@@ -4983,6 +5136,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				trk[i].p16m = (g_x3_ok && g_x3.t[g_slot][i].codec_id
 				               == X3_CODEC_P16M) ? 1u : 0u;   /* P16-522:
 				               * BEFORE the TSPBI(i) length math below */
+				trk[i].gsh  = g_x3_ok ? (uint8_t)((g_x3.t[g_slot][i].flags >> 1) & 3u) : 0u;   /* BNC2-604 */
 				{	/* PS-535: per-song NEXT-mode preference. */
 					uint8_t _rv = (g_x3_ok && g_slot < NUM_SLOTS)
 					            ? g_x3.t[g_slot][i].rsv : 0u;
@@ -5072,7 +5226,14 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 	 * and the mixer (PREEMPT 0) outranks it, so it is constant
 	 * across the 256 frames -- the snapshot is bit-identical and drops ~1024 reloads. */
 	uint16_t vol_s[NTRK];
-	for (int i = 0; i < NTRK; i++) vol_s[i] = trk[i].vol_q8;
+	uint8_t  gs_s[NTRK];   /* BNC2-604: the print gain shift, per track, this block */
+	for (int i = 0; i < NTRK; i++) {
+		/* BNC2-604: the print gain rides the per-block volume hoist -- a
+		 * head plays its SOURCE take, so it takes the source's gain. */
+		const uint8_t _gs = head_active(i) ? trk[g_head_src].gsh : trk[i].gsh;
+		gs_s[i]  = _gs;
+		vol_s[i] = (uint16_t)((uint32_t)trk[i].vol_q8 << _gs);
+	}
 
 	M81_LAP(0);
 	/* ==== M90: PASS A ran on VOLATILES. Every reference was a forced
@@ -5102,6 +5263,9 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 	uint32_t _pre_val  = g_pre_valid;
 	uint32_t _cpos     = g_consume_pos;
 	const uint8_t _lactive = g_loop_active;
+	/* BNC-597: this block records the BUS, not the jack. Tied to g_rec_track
+	 * so a stale flag can never outlive its take. */
+	const int _bnc = (g_bnc_on && g_rec_track >= 0);
 	/* ==== PASS A: transport + record, stashing per-frame positions ====
 	 * The old single loop interleaved all four tracks' mixing into every
 	 * frame, paying loop + volatile-read overhead 4 x 48000 times a second
@@ -5118,6 +5282,13 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 	static uint16_t fracb[BLK_FRAMES];
 	static int32_t  mix32[BLK_FRAMES];   /* LEFT bus */
 	static int32_t  mix32R[BLK_FRAMES];  /* M63a RIGHT bus */
+	/* BNC3-605 THE SOURCE SWAP, OUTSIDE THE FRAME LOOP (W291). mix32/mix32R
+	 * still hold the previous block's post-FX bus (the lean loop only reads
+	 * them). On a bounce block: keep the jack, put the limited, 12 dB-down
+	 * bus into tmp[] and let PASS A record it with the code it always had.
+	 * The monitor gets the jack back right after PASS A (below). */
+	uint32_t got_live = got;   /* BNC3-606 */
+	if (_bnc) { bnc_prepass(tmp, mix32, mix32R); got = BLK_FRAMES; }
 	/* ===== TAPE-569 WOW/FLUTTER: one Q16 read offset per block =====
 	 * A read OFFSET, never a rate change: g_pphase's wraps also clock the
 	 * RECORD decimator, so wobbling the rate would print the wobble
@@ -5610,6 +5781,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 	g_frames_since = _fsince; g_pre_w = _pre_w;
 	g_pre_valid = _pre_val; g_consume_pos = _cpos;
 
+	if (_bnc) bnc_postpass(mix32, mix32R, tmp, got_live);   /* BNC3-606 */
 	/* ==== PASS B: accumulate each playing track over the whole block ==== */
 	for (int i = 0; i < NTRK; i++) {
 		if (trk[i].state != TS_PLAY && !head_active(i)) continue;
@@ -5636,7 +5808,13 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		 * (stv 59/67 in one session vs ~0 on the release). A 1-count step
 		 * is 0.03 dB — far below audibility and below any zipper — so
 		 * snap it instantly; only real movement (>=2 counts) ramps. */
-		if (vd == 1 || vd == -1) vd = 0;
+		{	/* BNC2-604: the deadband is ONE FADER COUNT, which is 1 << gsh
+			 * after the print gain -- otherwise a print's ADC jitter would
+			 * disqualify the fast path every block, the exact regression
+			 * the deadband was added for. */
+			const int32_t _dz = (int32_t)1 << gs_s[i];
+			if (vd >= -_dz && vd <= _dz) vd = 0;
+		}
 		if (vtar == 0 && vd == 0 && vprev == 0) continue;  /* silent and settled */
 		trk[i].vol_now = (uint16_t)vtar;
 		const int16_t *const pr = trk[i].pring;
@@ -7161,6 +7339,7 @@ static void p14s_mask_from_x3(uint32_t slot)
 				g_p14s_mask |= (uint8_t)(1u << xi);
 				trk[xi].p16m = (g_x3.t[slot][xi].codec_id
 				                == X3_CODEC_P16M) ? 1u : 0u;   /* P16-522 */
+				trk[xi].gsh  = (uint8_t)((g_x3.t[slot][xi].flags >> 1) & 3u);   /* BNC2-604 */
 				{	/* PS-535, as in the restore path */
 					uint8_t _rv = g_x3.t[slot][xi].rsv;
 					trk[xi].p16m_next = (_rv & 0x80u)
@@ -7411,11 +7590,10 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 		   * Streams track-1 blocks as hex so the host reference decoder
 		   * can rule on the actual card bytes. Runs only when: capture
 		   * connected (armed by main's DTR tick), nothing recording or
-		   * draining, playback stopped (consume frozen), and bounce idle
-		   * -- bnc_acc is borrowed as the 1-block read buffer under a
-		   * RUNTIME liveness gate (rule 9; same thread as bounce, so no
-		   * mid-round writer is possible). */
-		  if (g_dmp_arm && g_dmp_state < 2u && g_bnc_req < 0 && !g_bnc_active) {
+		   * draining, playback stopped (consume frozen). Reads into its
+		   * own g_dmp_buf (R1-597; it used to borrow the bounce
+		   * accumulator). */
+		  if (g_dmp_arm && g_dmp_state < 2u) {
 			bool _di = true;
 			for (int _dk = 0; _dk < NTRK; _dk++)
 				if (trk[_dk].state == TS_REC || trk[_dk].state == TS_DONE)
@@ -7423,7 +7601,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 			static uint32_t _dcp;
 			if (g_consume_pos != _dcp) { _dcp = g_consume_pos; _di = false; }
 			if (_di) {
-				uint8_t *_db = (uint8_t *)bnc_acc;
+				uint8_t *_db = g_dmp_buf;
 				if (!g_dmp_state) {
 					g_dmp_n = trk[0].len_blocks ? trk[0].len_blocks : 344u;
 					if (g_dmp_n > 344u) g_dmp_n = 344u;
@@ -7842,7 +8020,8 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 							_xe->content_blocks = t->content_blocks;
 							_xe->codec_id       = t->p16m ? X3_CODEC_P16M
 							                              : X3_CODEC_P14S;
-							_xe->flags          = (uint8_t)(g_cap_stereo ? 1u : 0u);
+							_xe->flags          = (uint8_t)((g_cap_stereo ? 1u : 0u) |
+							                      ((t->gsh & 3u) << 1));   /* BNC2-604: bits 1-2 */
 							_xe->pan            = 128u;
 							_xe->rsv            = (uint8_t)(0x80u |
 							                      (t->p16m_next & 1u));
@@ -8526,80 +8705,6 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 			}
 			if (_m71spr)
 				k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(5));
-		}
-		/* ==== M19b BOUNCE RENDER: one 4-block chunk per round, between
-		 * the passes — the same citizenship as the PASS-1 flush. Bounded
-		 * IO (<=16 single reads + one 4-block write), so the play rings
-		 * keep their cushions while the heads keep sounding. ==== */
-		/* M63b-1: the bounce mixer sums RAW FLASH BYTES as PCM, which is
-		 * wrong for coded blocks. Refuse the request (LED shrug) rather
-		 * than render noise; M63b-2 ports it to a7_decode_block. */
-		if (g_bnc_req >= 0 && !g_bnc_active) {
-			g_bnc_req = -1; g_bnc_abort = 0; g_led_shrug = 1;
-		}
-		if (0)
-			g_bnc_active = 1;
-		if (g_bnc_active) {
-			if (g_bnc_abort) {
-				g_bnc_active = 0; g_bnc_req = -1; g_bnc_abort = 0;
-			} else {
-				uint32_t bdst = trk_blk(g_slot, (uint32_t)bnc_dst);
-				uint32_t bsrc = trk_blk(g_slot, (uint32_t)bnc_src);
-				uint32_t nblk = bnc_cyc - bnc_done_blocks;
-				if (nblk > 1u) nblk = 1u;   /* M63b: bnc_acc holds ONE
-				                             * stereo A7 block (2,240 B of
-				                             * 4 KB); b-2 ports the mixer */
-				memset(bnc_acc, 0,
-				       sizeof(bnc_acc[0]) * nblk * SAMP_PER_BLK);
-				bool rok = true;
-				for (uint32_t hk = 0; hk < NTRK && rok; hk++) {
-					if (bnc_mut[hk] || bnc_vol[hk] == 0u) continue;
-					for (uint32_t b = 0; b < nblk && rok; b++) {
-						uint32_t c = bnc_done_blocks + b;
-						uint32_t ci = (c + (((uint32_t)bnc_pos[hk] *
-							bnc_cyc) >> 8)) % bnc_cyc;
-						uint32_t hr = (uint32_t)bnc_rev[hk] ^
-							(uint32_t)bnc_wrev;
-						if (hr) ci = (bnc_cyc - 1u) - ci;
-						uint32_t lb = (ci / bnc_win) * bnc_wper +
-							bnc_wbase + (ci % bnc_win);
-						if (lb >= bnc_content)
-							continue;   /* silence adds zero */
-						if (!emmc_read_blocks(bsrc + lb,
-								      bnc_rdbuf, 1)) {
-							rok = false; break;
-						}
-						const int16_t *sp2 =
-							(const int16_t *)bnc_rdbuf;
-						int32_t *ap = &bnc_acc[b * SAMP_PER_BLK];
-						int32_t gq = (int32_t)bnc_vol[hk];
-						if (!hr) {
-							for (uint32_t f = 0; f < SAMP_PER_BLK; f++)
-								ap[f] += ((int32_t)sp2[f] * gq) >> 8;
-						} else {
-							for (uint32_t f = 0; f < SAMP_PER_BLK; f++)
-								ap[f] += ((int32_t)
-								    sp2[SAMP_PER_BLK - 1u - f] * gq) >> 8;
-						}
-					}
-				}
-				if (rok) {
-					int16_t *op = (int16_t *)batchbuf;
-					for (uint32_t f = 0; f < nblk * SAMP_PER_BLK; f++)
-						op[f] = soft_limit(bnc_acc[f]);
-					if (emmc_write_blocks(bdst + bnc_done_blocks,
-							      batchbuf, nblk)) {
-						bnc_done_blocks += nblk;
-						if (bnc_done_blocks >= bnc_cyc) {
-							g_bnc_active = 0;
-							g_bnc_req = -1;
-							g_bnc_done = 1;
-						}
-					}
-				}
-				/* any failure: same chunk retries next round */
-				work = true;
-			}
 		}
 		if (!work) {
 			/* IDLE WINDOW: drain the card's write cache in the background.
@@ -9344,7 +9449,7 @@ static void controls_diag(void)
 
 
 
-		printk("PF,v=5,pg=%u,id=%u,flt=%u,dst=%u,chr=%u,gat=%u,rate=%u,pat=%u,step=%u,gg=%u,vu=%u,fn=%u,bcr=%u,rng=%u,awh=%u,phs=%u,swp=%u,trm=%u,awe=%d,btpk=%u,btacc=%u,btn=%u,tdr=%u,ttn=%u,ths=%u,twb=%u,wbj=%u,wbx=%u,ec=%u,ecdiv=%u,ecdly=%u,ecv=%u,ecw=%u\n",
+		printk("PF,v=5,pg=%u,id=%u,flt=%u,dst=%u,chr=%u,gat=%u,rate=%u,pat=%u,step=%u,gg=%u,vu=%u,fn=%u,bcr=%u,rng=%u,awh=%u,phs=%u,swp=%u,trm=%u,awe=%d,btpk=%u,btacc=%u,btn=%u,bnc=%u,bon=%u,tdr=%u,ttn=%u,ths=%u,twb=%u,wbj=%u,wbx=%u,ec=%u,ecdiv=%u,ecdly=%u,ecv=%u,ecw=%u\n",
 		       (unsigned)g_pg_open, (unsigned)g_pg_id, (unsigned)g_flt_pos,
 		       (unsigned)g_dst_amt, (unsigned)g_chr_mix, (unsigned)g_gat_amt,
 		       (unsigned)g_gat_amt, (unsigned)g_gat_pat, (unsigned)g_tg_idx,
@@ -9356,6 +9461,7 @@ static void controls_diag(void)
 		       (int)g_awh_env,
 		       (unsigned)g_bt_pk, (unsigned)g_bt_acc,
 		       (unsigned)g_bt_n,
+		       (unsigned)g_bnc_prints, (unsigned)g_bnc_on,
 		       (unsigned)g_tp_drive, (unsigned)g_tp_tone,
 		       (unsigned)g_tp_hiss,  (unsigned)g_tp_wob,
 		       (unsigned)g_wbj, (unsigned)g_wbx,
@@ -10282,13 +10388,6 @@ static void led_service(void)
 				if (i == NUM_TRACK_LEDS - 1) g_led_shrug--;
 				continue;
 			}
-			if ((g_bnc_active || g_bnc_req >= 0) && g_heads_mode &&
-			    i == (int)bnc_dst) {
-				/* M19b: printing — the destination fast-blinks */
-				(((k_uptime_get() >> 7) & 1) ? track_led_on(i)
-				                             : track_led_off(i));
-				continue;
-			}
 			if (st == TS_REC && trk[i].rec_target && !trk[i].rec_silence &&
 			    g_grid_active && g_grid_beat_frames) {
 				/* grid run-on ("finishing the beat"): double-blink so
@@ -10533,6 +10632,16 @@ static void stop_and_flush(void)
 /* ---------- power off ---------- */
 static void power_off(void)
 {
+	/* PAD-594 (W287): THE MIXER'S 32-BYTE LINE, WITHOUT aligned().
+	 * Zephyr links with --sort-section=alignment, so aligned(32) on the
+	 * mixer does not pad it in place -- it PULLS it to the front of flash
+	 * next to the other pinned function (593: mixer landed +544 B after
+	 * the unpack, the 574 shape). Within the normal 4-byte class the
+	 * order is GCC's emission order, and power_off is emitted just before
+	 * looper_audio_block. So: the build script measures the mixer's
+	 * address and sets this nop count so it lands on mod32 == 0. The nops
+	 * execute once, at power-off. 592 needs 0 of them. */
+	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -10666,8 +10775,6 @@ static void jump_to_slot(uint32_t ns)
 		}
 		g_grid_resync_at = 0;
 	}
-	if (g_bnc_active || g_bnc_req >= 0)
-		g_bnc_abort = 1;   /* M19b: a song switch abandons the print */
 	g_grid_fresh = 0;  /* M20 F1: a persisted grid's phase is provisional */
 	g_cnv_set = 0;     /* M22c: landmarks do not survive a song switch */
 	g_grid_base_beats = 0; g_grid_base_blocks = 0;   /* M20 F7 */
@@ -11177,8 +11284,6 @@ int main(void)
 						fnp_pend_snap = 0;
 						if (g_heads_mode) {
 							g_heads_mode = 0;
-							if (g_bnc_active || g_bnc_req >= 0)
-								g_bnc_abort = 1;   /* M19b */
 							for (int hm = 0; hm < NTRK; hm++)
 								trk[hm].muted = (uint8_t)
 								    ((g_head_mute_save >> hm) & 1u);
@@ -12021,7 +12126,13 @@ int main(void)
 			 * combo14_t and reboot to the bootloader mid-performance. */
 			static uint8_t combo_held;         /* M27: tracks seen during this gesture */
 			static int combo_cand, combo_cnt;  /* M27-r3: two-pass confirm */
-			if (ctl_flush) { combo14_t = -1; combo_held = 0; combo_cand = 0; combo_cnt = 0; }
+			/* BNC-597: PLAY + ONE TRACK = BOUNCE INTO THAT TRACK. */
+			static int     bch_cand = -1, bch_cnt;   /* two-pass confirm, as the combos */
+			static uint8_t bch_held;                 /* fired: swallow the release sweep */
+			static int     bch_fire = -1;            /* this pass: the chord landed on TN */
+			static uint8_t ep_play_spent;            /* PLAY was a modifier this episode */
+			if (ctl_flush) { combo14_t = -1; combo_held = 0; combo_cand = 0; combo_cnt = 0;
+			                 bch_cand = -1; bch_cnt = 0; bch_held = 0; bch_fire = -1; ep_play_spent = 0; }
 			/* ===== M27-r3 COMBO DECODE =====================================
 			 * Any set of track buttons pressed together makes its OWN code on this
 			 * ladder. All sixteen states measured on hardware, all separable
@@ -12062,7 +12173,42 @@ int main(void)
 			else if (trk_raw >= 1583 && trk_raw < 1650) combo_now = 0xD; /* 1+3+4 ~1618 */
 			else if (trk_raw >= 1650 && trk_raw < 1713) combo_now = 0xE; /* 2+3+4 ~1683 */
 			else if (trk_raw >= 1713 && trk_raw < 1773) combo_now = 0xF; /* ALL4  ~1743 */
-			if (combo_now) {
+			/* BNC-597: PLAY + TN, measured on 508 under load (spread <= 10):
+			 *   PLAY 1807 | +T1 1861 | +T2 1910 | +T3 2004 | +T4 2159 | +ALL4 2376
+			 * Bands at the midpoints, the T1 floor raised to 1840 (33 above PLAY's
+			 * ceiling). PLAY + two or more tracks is NOT a gesture (W115): every
+			 * reading above the T4 band is swallowed. A chord must hold for two
+			 * passes and fires ONCE; everything until the ladder is idle again is
+			 * its release sweep -- which passes through PLAY (1807) and, if PLAY
+			 * lifts first, through the bare track band, where a fresh press would
+			 * otherwise read as the STOP tap 48 ms later. */
+			int bchord = -1;
+			if      (trk_raw >= 1840 && trk_raw < 1886) bchord = 0;   /* PLAY+T1 ~1861 */
+			else if (trk_raw >= 1886 && trk_raw < 1957) bchord = 1;   /* PLAY+T2 ~1910 */
+			else if (trk_raw >= 1957 && trk_raw < 2081) bchord = 2;   /* PLAY+T3 ~2004 */
+			else if (trk_raw >= 2081 && trk_raw < 2267) bchord = 3;   /* PLAY+T4 ~2159 */
+			if (trk_raw >= 1840) {
+				raw = TRK_NONE;          /* never PLAY, never a track */
+				combo14_t = -1;
+				if (bchord >= 0) {
+					if (bchord == bch_cand) { if (bch_cnt < 3) bch_cnt++; }
+					else { bch_cand = bchord; bch_cnt = 1; }
+					/* BNC2-600: fires once per PRESS (the count passes 2 exactly
+					 * once; a lift resets it below), not once per hold of PLAY. */
+					if (bch_cnt == 2) { bch_held = 1; bch_fire = bchord; }
+				} else {
+					bch_cand = -1; bch_cnt = 0;
+				}
+			} else if (bch_held) {
+				/* the chord's release sweep: nothing in it is a gesture. The
+				 * track has lifted (PLAY may still be down): re-arm the chord so
+				 * the next PLAY+TN press fires again (BNC2-600). */
+				raw = TRK_NONE;
+				combo14_t = -1;
+				combo_cand = 0; combo_cnt = 0;
+				bch_cand = -1; bch_cnt = 0;
+				if (trk_raw >= 0 && trk_raw < 110) bch_held = 0;
+			} else if (combo_now) {
 				raw = TRK_NONE;          /* a combo must never reach the single decode */
 				if (combo_now == combo_cand) { if (combo_cnt < 3) combo_cnt++; }
 				else { combo_cand = combo_now; combo_cnt = 1; }
@@ -12166,7 +12312,7 @@ int main(void)
 				ctl_flush = 0;
 				committed = TRK_NONE; cand = TRK_NONE; cand_cnt = 0; cand_t0 = 0;
 				for (int k = TRK_1; k <= TRK_PLAY; k++) ep_time[k] = 0;
-				ep_open = 0; ep_play_held = 0;
+				ep_open = 0; ep_play_held = 0; ep_play_spent = 0;
 				play_t = -1; play_held = 0;
 				for (int k = 0; k < NTRK; k++) { tap_deadline[k] = 0; armed_press[k] = 0; }
 				stop_tap_trk = -1;
@@ -12230,6 +12376,7 @@ int main(void)
 				ep_since = tnow;
 				if (committed != TRK_NONE) {
 					ep_open = 1;
+					if (before == TRK_NONE) ep_play_spent = 0;   /* BNC-597: a fresh episode */
 					for (int k = TRK_1; k < (int)committed; k++)
 						ep_time[k] = 0;  /* below = up-sweep transit */
 					/* M44-r2 ARM MIGRATION: with instant empty arms, an
@@ -12263,6 +12410,54 @@ int main(void)
 					 * floor below outlasts any transit). */
 					press_from_above[ti] =
 						(before > committed && before <= TRK_PLAY) ? 1u : 0u;
+				}
+			}
+			/* BNC-597 THE BOUNCE, on the chord's second pass. Spend PLAY (its
+			 * release must neither toggle the transport nor restart it); the
+			 * track's release is swallowed with the sweep. A young instant arm the
+			 * chord's own finger caused on the way in is cancelled losslessly --
+			 * the engine processes the cancel before the arm in the same block.
+			 * Refusals shrug: not playing, nothing else playing, a take busy. */
+			if (bch_fire >= 0) {
+				int ti = bch_fire; bch_fire = -1;
+				int64_t tnow = k_uptime_get();
+				ep_play_spent = 1;
+				if (g_rec_track == ti &&
+				    (trk[ti].state == TS_ARMED || trk[ti].state == TS_REC)) {
+					/* BNC2-599: PLAY + the track that is taking = STOP it,
+					 * exactly what the bare tap does (marc). */
+					g_stop_req = 1;
+					tap_deadline[ti] = 0;
+				} else {
+				int freed = -1;
+				if (g_rec_track >= 0 && trk[g_rec_track].state == TS_ARMED &&
+				    arm_was_instant && tnow - arm_t <= 200) {
+					g_stop_req = 1;
+					armed_press[g_rec_track] = 0;
+					arm_was_instant = 0;
+					freed = g_rec_track;
+				}
+				int busy = 0, src = 0;
+				for (int k = 0; k < NTRK; k++) {
+					uint8_t st = trk[k].state;
+					if (st == TS_REC || st == TS_DONE) busy = 1;
+					if (st == TS_ARMED && !(freed >= 0 && k == freed)) busy = 1;
+					if (k != ti && st == TS_PLAY) src = 1;
+				}
+				if (g_playing && g_loop_active && g_loop_len != 0u &&
+				    (g_rec_track < 0 || freed >= 0) && !busy && src) {
+					/* NOT armed_press[ti]: the episode-end sweep guard cancels any
+					 * armed track that is not the episode's dominant button, and
+					 * PLAY is. The track needs no spending -- the whole release
+					 * sweep is swallowed above, so it can never commit. */
+					tap_deadline[ti] = 0;
+					press_from_above[ti] = 0;
+					g_bnc_arm = (int8_t)ti;
+					__DSB();                      /* the flag lands before the request */
+					g_arm_req[ti] = 1;
+				} else {
+					g_led_shrug = 20;             /* the four-LED 'no' */
+				}
 				}
 			}
 			if (ep_open && committed == TRK_NONE &&
@@ -12455,7 +12650,9 @@ int main(void)
 					 * the instant the hold-restart fired (a hold is not a
 					 * tap). Ignored while a take is in progress: stopping
 					 * would freeze the recording mid-take. */
-					if (ep_play_held) {
+					if (ep_play_spent) {
+						/* BNC-597: PLAY was the bounce modifier -- spent */
+					} else if (ep_play_held) {
 						/* BNC-570 B1a: the hold DISPATCHES here now. */
 						g_restart_req = 1;
 					} else if (g_rec_track < 0) {
@@ -12464,7 +12661,7 @@ int main(void)
 						else           g_midi_stop_pending  = 1;
 					}
 				}
-				ep_play_held = 0;
+				ep_play_held = 0; ep_play_spent = 0;
 			}
 			/* R1 STOP-ON-PRESS (perfect-loop): on the RECORDING track a
 			 * press can only mean STOP — no mute/delete/arm ambiguity —
@@ -12529,92 +12726,6 @@ int main(void)
 						g_head_blip[hk] = 3;
 						trk[hk].p_w = (g_consume_pos /
 							TSPBI(hk)) * TSPBI(hk);
-					}
-					armed_press[ti] = 1;   /* spend the press */
-					tap_deadline[ti] = 0;
-				}
-				if (g_heads_mode && !armed_press[ti] &&
-				    ti != stop_tap_trk && heads_engaged() &&
-				    trk[ti].state == TS_EMPTY &&
-				    !(g_slot < NUM_SLOTS && g_meta.slot[g_slot].present[ti]) &&
-				    g_bnc_req < 0 && !g_bnc_active && !g_bnc_done &&
-				    k_uptime_get() - press_t[ti] >= 400) {
-					/* M19b: in heads mode, HOLD an EMPTY track =
-					 * PRINT the tape into it ("record this into
-					 * here" — because it is). Everything audible is
-					 * snapshotted NOW; the streamer renders while
-					 * the heads keep playing; the dst fast-blinks.
-					 * All heads silent = the shrug (locked: a
-					 * silent bounce is never what anyone meant). */
-					int aud = 0;
-					for (int hk2 = 0; hk2 < NTRK; hk2++)
-						if (!trk[hk2].muted && trk[hk2].vol_q8 > 0)
-							aud = 1;
-					if (!aud) {
-						g_led_shrug = 20;
-					} else {
-						struct looptrk *bs = &trk[g_head_src];
-						uint32_t gb = bs->len_blocks ? bs->len_blocks
-							    : (g_loop_blocks ? g_loop_blocks : 1u);
-						uint32_t cdiv = g_chop_div ? g_chop_div : 1u;
-						uint32_t coff = g_chop_off;
-						uint32_t cyc, win, wbase, wper;
-						if (g_fixed_len && g_loop_blocks &&
-						    gb >= g_loop_blocks &&
-						    (gb % g_loop_blocks) == 0u) {
-							wper = g_loop_blocks;
-							win = wper / cdiv; if (!win) win = 1u;
-							wbase = (coff * wper) / cdiv;
-							if (wbase + win > wper) wbase = wper - win;
-							cyc = (gb / wper) * win;
-						} else {
-							wper = gb;
-							win = gb / cdiv; if (!win) win = 1u;
-							wbase = (coff * gb) / cdiv;
-							if (wbase + win > gb) wbase = gb - win;
-							cyc = win;
-						}
-						if (g_win_free) {
-							uint32_t ws = g_win_s8, we = g_win_e8;
-							if (we < ws) { uint32_t t2 = ws; ws = we; we = t2; }
-							win = ((we - ws + 1u) * wper) >> 8;
-							if (!win) win = 1u;
-							wbase = (ws * wper) >> 8;
-							if (wbase + win > wper) wbase = wper - win;
-							cyc = (gb / wper) * win;
-						}
-						bnc_src = g_head_src;
-						bnc_dst = (uint8_t)ti;
-						for (int hk2 = 0; hk2 < NTRK; hk2++) {
-							bnc_pos[hk2] = g_head_pos[hk2];
-							bnc_rev[hk2] = g_head_rev[hk2];
-							bnc_mut[hk2] = trk[hk2].muted;
-							bnc_vol[hk2] = trk[hk2].vol_q8;
-						}
-						bnc_wfree = g_win_free; bnc_wrev = g_win_rev;
-						bnc_cyc = cyc; bnc_win = win;
-						bnc_wbase = wbase; bnc_wper = wper;
-						bnc_start = bs->start_blk;
-						bnc_content = bs->content_blocks
-							    ? bs->content_blocks : gb;
-						bnc_done_blocks = 0;
-						{	/* GS-531: the bounce accumulator is 280-frame
-							 * geometry; a P16M source would overflow it
-							 * (496*3 > 1024). Refuse with the shrug until
-							 * the accumulator learns mixed geometry. */
-							uint8_t _p16s = 0;
-							for (int _j = 0; _j < NTRK; _j++)
-								if (trk[_j].p16m && trk[_j].state == TS_PLAY)
-									_p16s = 1;
-							if (_p16s) {
-								g_led_shrug = 1;   /* the M19b 'no' */
-								armed_press[ti] = 1;
-								tap_deadline[ti] = 0;
-							} else {
-								__DSB();   /* snapshot lands before the request */
-								g_bnc_req = (int8_t)ti;
-							}
-						}
 					}
 					armed_press[ti] = 1;   /* spend the press */
 					tap_deadline[ti] = 0;
@@ -12727,40 +12838,6 @@ int main(void)
 				play_t = -1;
 			}
 
-			if (g_bnc_done) {
-				/* M19b COMPLETION: every audio block is on flash —
-				 * NOW the index (torn-write doctrine), then the
-				 * locked auto-exit: mutes restored, the print plays
-				 * unmuted, in phase with the loop it came from. */
-				g_bnc_done = 0;
-				int bd = (int)bnc_dst;
-				trk[bd].len_blocks = bnc_cyc;
-				trk[bd].content_blocks = bnc_cyc;
-				trk[bd].start_blk = bnc_start;
-				trk[bd].len_samps = bnc_cyc * TSPBI(bd);   /* prints stay block loops */
-				trk[bd].start_samps = bnc_start * TSPBI(bd);
-				trk[bd].muted = 0;
-				trk[bd].p_w = (g_consume_pos / TSPBI(bd)) * TSPBI(bd);
-				trk[bd].state = TS_PLAY;
-				if (g_slot < NUM_SLOTS) {
-					g_meta.slot[g_slot].present[bd] = 1;
-					g_meta.slot[g_slot].trk_len[bd] = bnc_cyc;
-					g_meta.slot[g_slot].trk_start[bd] = bnc_start;
-					g_meta.trk_content[g_slot][bd] = bnc_cyc;
-					g_meta.song_mode[g_slot] &=
-						(uint8_t)~(uint8_t)(0x10u << bd);
-					g_meta_save_req = 1;
-				}
-				g_heads_mode = 0;
-				for (int hm = 0; hm < NTRK; hm++) {
-					if (hm == bd) continue;
-					trk[hm].muted = (uint8_t)
-						((g_head_mute_save >> hm) & 1u);
-					trk[hm].p_w = (g_consume_pos /
-						TSPBI(hm)) * TSPBI(hm);
-				}
-				g_dip_req = 1;
-			}
 #if HP_TIM_TEST
 			/* HEADPHONE AUTO-MUTE: poll the codec jack-detect ~5x/s and mute the
 			 * speaker while headphones are in. Debounced (3 consecutive equal
