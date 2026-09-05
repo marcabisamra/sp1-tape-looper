@@ -1731,6 +1731,11 @@ static uint8_t  g_dmp_buf[512];            /* DMP-466's one-block read buffer
                                             * accumulator until R1-597) */
 #define head_active(i) (g_heads_mode && (i) != g_head_src && \
 			trk[g_head_src].state == TS_PLAY)
+/* HG-646 (W185): the geometry of the BYTES a ring plays -- its own track's,
+ * or the SOURCE's under a head. Every position<->block conversion for a ring
+ * goes through this, never TSPBI(i): a head whose codec differs from the
+ * source's otherwise strides its ring wrong ("half-plugged cable"). */
+#define TSPB_SRC(ix) TSPBI(head_active(ix) ? (int)g_head_src : (ix))
 /* M14 HEADS v2: each head's position on the loop is a live Q8 phase (0-255
  * of the audible cycle). Quarters at entry = the v1 sound; FUNCTION+fader
  * scrubs them (all four — track 1's own phase slides too, locked decision).
@@ -7398,15 +7403,21 @@ static void __attribute__((optimize("O2"))) p16m_dec_ring(const uint8_t *blk, in
  * the contention cliff WORSE. This is the minimal pin, one function.
  * If this build regresses, iterate the offset -- do not unpin. */
 static void __attribute__((aligned(32))) p14s_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
-			const uint8_t *flash, uint32_t nblk, int trk)
+			const uint8_t *flash, uint32_t nblk, int trk, uint32_t pad_spb)
 {
 	M73_T0();   /* UP-476 */
-	uint32_t s0 = start;   /* P16-522: stride = the TRACK's geometry */
+	uint32_t s0 = start;
 	for (uint32_t b = 0; b < nblk; b++) {
 		const uint8_t *blk = flash + b * EMMC_BLOCK_SIZE;
-		uint32_t _spb = p16m_trk_spb(trk);   /* P16-522: TRACK-driven -- the zeroed
-		                               * silence pad strides correctly too */
+		uint32_t _spb;
 		if (blk[11] == P14S_MARK) {
+			/* HG-646 (W185): the STRIDE comes from the block's own header,
+			 * exactly as the decoder choice already did -- never from the
+			 * ring's track. Under a head the ring's track is not the owner
+			 * of these bytes, and striding by ITS geometry left 216 stale
+			 * frames per block ("half-plugged cable"). trk stays the
+			 * continuity index: the heal is per destination ring. */
+			_spb = (blk[2] == 0x36u) ? 496u : SAMP_PER_BLK;
 			/* UNPK-616: decode straight into the ring; the heal and the
 			 * per-track continuity live inside the decoders now. */
 			if      (blk[2] == 0x36u) p16m_dec_ring(blk, ring, ring_mask, s0, trk);   /* P16-522 */
@@ -7424,17 +7435,20 @@ static void __attribute__((aligned(32))) p14s_unpack(int16_t *ring, uint32_t rin
 				ring[hp + 1u] = (int16_t)((int32_t)g_p14s_prev[trk][1] >> 1);
 				g_p14s_prev[trk][0] = 0; g_p14s_prev[trk][1] = 0;
 			}
-		} else if (_spb == 496u) {
-			/* P16-522: a non-P16M block under a P16M take = the SILENCE
-			 * PAD -- write true silence at the caller's stride. */
+		} else if (pad_spb == 496u) {
+			/* P16-522: a non-P16M block under a P16M OWNER = the SILENCE
+			 * PAD -- true silence at the owner's stride (HG-646: the
+			 * caller names the owner; under a head that is the source). */
+			_spb = 496u;
 			for (uint32_t f = 0; f < _spb; f++) {
 				uint32_t fi = ((s0 + f) & ring_mask) * 2u;
 				ring[fi] = 0; ring[fi + 1u] = 0;
 			}
 		} else {
+			_spb = SAMP_PER_BLK;
 			codec_unpack(ring, ring_mask, s0, blk, 1u);
 		}
-		s0 += _spb;   /* P16-522 */
+		s0 += _spb;
 	}
 	if (M73_CY_NOW()) g_pk_blk += nblk;   /* UP-476 */
 	M73_ADD(g_t_pk);   /* UP-476 */
@@ -7503,7 +7517,7 @@ static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 }
 
 static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
-			    const uint8_t *flash, uint32_t nblk, int trk)
+			    const uint8_t *flash, uint32_t nblk, int trk, uint32_t pad_spb)
 {
 	/* REV-638 (W308): a burst read as [lo .. hi] plays BACKWARD, so the ring
 	 * gets block hi first -- descending, as codec_unpack_rev always did. Each
@@ -7536,6 +7550,13 @@ static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
 			}
 			pl = p14s_scr[0]; pr = p14s_scr[1];   /* this block's first exact frame heals the next emitted block */
 			_s0 += _spb;
+		} else if (pad_spb == 496u) {
+			/* HG-646: the OWNER's silence pad, at the owner's stride */
+			for (uint32_t f = 0; f < 496u; f++) {
+				uint32_t fi = ((_s0 + f) & ring_mask) * 2u;
+				ring[fi] = 0; ring[fi + 1u] = 0;
+			}
+			_s0 += 496u;
 		} else {
 			codec_unpack_rev(ring, ring_mask, _s0, blk, 1u);
 			_s0 += SAMP_PER_BLK;
@@ -8802,7 +8823,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 						/* DECODE the prime burst (_n blocks) into the play ring. */
 						uint32_t _ntot = _n * TSPB(t);
 						p14s_unpack(t->pring, RING_MASK, _pw & RING_MASK,
-						             batchbuf, _n, i);
+						             batchbuf, _n, i, TSPB(t));   /* HG-646: own bytes, own pad */
 						_pw  += _ntot;
 						_got += _ntot;
 					}
@@ -8888,6 +8909,10 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				if (g_slot != slot) break;
 				struct looptrk *t = &trk[i];
 				if (t->state != TS_PLAY && !head_active(i)) continue;
+				/* HG-646 (W185): the geometry of the bytes this ring plays -- the
+				 * SOURCE's under a head. Every block<->position step below uses
+				 * it; TSPB(t) is the ring's own track, wrong for a head. */
+				const uint32_t _spb = TSPB_SRC(i);
 				/* ===== M29: do not read what nobody can hear =================
 				 * A muted track is still TS_PLAY, so its ring was filled at full
 				 * rate from flash and the mixer discarded every sample. During a
@@ -8910,7 +8935,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				 * the loop phase is untouched — the track simply rejoins
 				 * the transport where it is NOW, and every read from here
 				 * on buys audible audio. */
-				if (avail < -(int32_t)TSPB(t) ||
+				if (avail < -(int32_t)_spb ||
 				    avail > (int32_t)RING_SAMPLES) {
 					/* Test against the LIVE playhead, not the round's cpos
 					 * snapshot: a restart/slot-switch during an earlier
@@ -8924,16 +8949,16 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					 * it within one streamer pass. */
 					uint32_t cnow = g_consume_pos;
 					int32_t a2 = (int32_t)(t->p_w - cnow);
-					if (a2 < -(int32_t)TSPB(t) ||
+					if (a2 < -(int32_t)_spb ||
 					    a2 > (int32_t)RING_SAMPLES) {
-						uint32_t anchor = (cnow / TSPB(t)) * TSPB(t);
+						uint32_t anchor = (cnow / _spb) * _spb;
 						t->p_w = anchor;   /* audio thread sees starved either way */
 						a2 = (int32_t)(anchor - cnow);
 						g_p2snap[i]++;
 					}
 					avail = a2;
 				}
-				if (avail > (int32_t)(RING_SAMPLES - 8u * TSPB(t)))
+				if (avail > (int32_t)(RING_SAMPLES - 8u * _spb))
 					continue;          /* ring PINNED ~full (<=8 blocks of headroom):
 					                    * the cushion is real at stall onset instead of
 					                    * sawtoothing between half and full. 8 blocks
@@ -9063,7 +9088,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 #endif
 					/* phase-anchored loop position: (pw_block - start_blk)
 					 * mod gb, safe when pw_block < start_blk (restart). */
-					uint32_t pwb = pw / TSPB(t);
+					uint32_t pwb = pw / _spb;
 					/* phase-anchored position along the audible chop
 					 * cycle, tiled onto the region (variable mode:
 					 * wper=gb, cyc=win -> identical to M5). */
@@ -9080,13 +9105,13 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					if (hrev) c = (cyc - 1u) - c;
 					uint32_t loop_blk = (c / win) * wper + wbase + (c % win);
 					uint32_t n = budget;
-					if (n > (RING_SAMPLES / TSPB(t)) - 1u) n = (RING_SAMPLES / TSPB(t)) - 1u;
+					if (n > (RING_SAMPLES / _spb) - 1u) n = (RING_SAMPLES / _spb) - 1u;
 					/* VARIABLE TOP-UP: fill to ~full (keep a 1-block
 					 * producer/consumer gap) so rings park at ~100%. */
 					{
 						int32_t av = (int32_t)(pw - cpos);
-						int32_t _room = (int32_t)(RING_SAMPLES - TSPB(t)) - av;
-						uint32_t _rb = _room > 0 ? (uint32_t)_room / TSPB(t) : 0u;
+						int32_t _room = (int32_t)(RING_SAMPLES - _spb) - av;
+						uint32_t _rb = _room > 0 ? (uint32_t)_room / _spb : 0u;
 						if (n > _rb) n = _rb;
 					}
 					if (!n) break;
@@ -9199,11 +9224,11 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 						/* S2: ring already holds the shadow PCM */
 					} else if (hrev)
 						p14s_unpack_rev(t->pring, RING_MASK, pw & RING_MASK,
-						                 batchbuf, n, i);   /* REV-638: i = continuity only */
+						                 batchbuf, n, i, _spb);   /* REV-638: i = continuity only; HG-646: the owner's pad */
 					else
 						p14s_unpack(t->pring, RING_MASK, pw & RING_MASK,
-						             batchbuf, n, i);
-					t->p_w = pw + n * TSPB(t);
+						             batchbuf, n, i, _spb);   /* HG-646: the owner's pad */
+					t->p_w = pw + n * _spb;   /* HG-646: the source's stride */
 					g_p2blk[i] += n;
 					/* ==== S1 SHADOW BUILDER. The decoded span sits in
 					 * pring[pw..pw+n*280) as unconsumed PREFETCH (stable,
@@ -11164,7 +11189,7 @@ static void __attribute__((noinline)) rev_toggle(int ti)
 	g_head_rev[ti] = (uint8_t)!g_head_rev[ti];
 	if (trk[ti].state == TS_PLAY || head_active(ti)) {
 		g_head_blip[ti] = 3;
-		trk[ti].p_w = (g_consume_pos / TSPBI(ti)) * TSPBI(ti);
+		trk[ti].p_w = (g_consume_pos / TSPB_SRC(ti)) * TSPB_SRC(ti);   /* HG-646 */
 	}
 }
 
@@ -12069,7 +12094,7 @@ int main(void)
 						for (int hk = 0; hk < NTRK; hk++) {
 							if (hk == (int)g_head_src) continue;
 							trk[hk].p_w = (uint32_t)(g_consume_pos /
-								TSPBI(hk)) * TSPBI(hk);
+								TSPB_SRC(hk)) * TSPB_SRC(hk);   /* HG-646 */
 						}
 						for (int hk = 0; hk < NTRK; hk++)
 							g_head_pos[hk] = (uint8_t)(hk * 64);
@@ -12488,7 +12513,7 @@ int main(void)
 					hf_at[hf] = hnow;
 					g_head_blip[hf] = 3;
 					g_head_pos[hf] = (uint8_t)q;
-					trk[hf].p_w = (g_consume_pos / TSPBI(hf)) * TSPBI(hf);
+					trk[hf].p_w = (g_consume_pos / TSPB_SRC(hf)) * TSPB_SRC(hf);   /* HG-646 */
 				}
 			} else {
 				/* M16 WINDOW FADERS: FUNCTION held, heads NOT engaged —
@@ -13515,7 +13540,7 @@ int main(void)
 						if (hk == ti) continue;
 						g_head_blip[hk] = 3;
 						trk[hk].p_w = (g_consume_pos /
-							TSPBI(hk)) * TSPBI(hk);
+							TSPB_SRC(hk)) * TSPB_SRC(hk);   /* HG-646 */
 					}
 					armed_press[ti] = 1;   /* spend the press */
 					tap_deadline[ti] = 0;
