@@ -3063,8 +3063,8 @@ static volatile uint8_t  g_mode_pref;              /* M7c: global working prefer
 /* Tempo as an INTEGER BPM (rocker steps it 1 BPM per click for fine control).
  * Speed is derived exactly: speed = bpm * 65536 / LOOP_BPM_BASE, so 80 BPM is
  * exactly 1.0x — no detent/snap logic needed. Range 40..120 = 0.5x..1.5x. */
-#define BPM_MIN 40
-#define BPM_MAX 120
+#define BPM_MIN 20    /* RANGE-655: 0.25x (was 40 = 0.5x) */
+#define BPM_MAX 160   /* RANGE-655: 2.0x (was 120 = 1.5x) */
 static volatile int g_play_bpm = 80;
 /* auto-start thresholds (loop-sample domain @ LOOP_RATE) */
 #define SOUND_THRESHOLD  1000              /* int16 level (~ -30 dBFS) */
@@ -9240,7 +9240,7 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 	 * RUNS and the speed is inside the tape's range -- a pause ramps
 	 * g_cur_speed_q16 to 0 and 625 followed it to a 38-million-frame beat.
 	 * Stopped, the grid is the decks' clock at the setting, as in 616. */
-	const uint32_t s = (g_playing && g_loop_active && g_cur_speed_q16 >= 32768u)
+	const uint32_t s = (g_playing && g_loop_active && g_cur_speed_q16 >= 12288u)   /* RANGE-655: below the 0.25x floor */
 	                 ? g_cur_speed_q16 : g_play_speed_q16;
 	if (!s || !g_grid_ref_spd) return;
 	uint32_t want = (uint32_t)(((uint64_t)g_grid_ref_nf * g_grid_ref_spd + s / 2u) / s);
@@ -9674,13 +9674,15 @@ static void usb_audio_start(void)
  * nothing is listening. Throttled by the caller. */
 /* =====================================================================
  * SEMITONE grid for the tempo rocker's DOUBLE-CLICK: 2^(k/12) in Q16 for
- * k = -12..+12 (0.5x..2.0x; the BPM clamp bounds the usable range). A
+ * k = -24..+12 (0.25x..2.0x, RANGE-655; the BPM clamp bounds the usable range). A
  * double-click jumps the speed to the next exact equal-tempered semitone
  * relative to 1.0x (= 80 BPM) — one musical pitch step instead of forty
  * 1-BPM clicks — and a detuned speed SNAPS ONTO the grid rather than
  * drifting off it. Integer-only; the exact Q16 speed is what the song
  * saves, so semitone speeds survive power-off bit-exact. */
-static const uint32_t k_semi_q16[25] = {
+static const uint32_t k_semi_q16[37] = {   /* RANGE-655: k = -24..+12, 0.25x..2x */
+	16384u,  17358u,  18390u,  19484u,  20643u,  21870u,  23170u,
+	24548u,  26008u,  27554u,  29193u,  30929u,
 	32768u,  34716u,  36781u,  38968u,  41285u,  43740u,  46341u,
 	49097u,  52016u,  55109u,  58386u,  61858u,  65536u,  69433u,
 	73562u,  77936u,  82570u,  87480u,  92682u,  98193u,  104032u,
@@ -9692,12 +9694,12 @@ static uint32_t semitone_next(uint32_t sp, int dir)
 	/* within ~0.4% of a grid point counts as ON it (absorbs BPM-integer
 	 * rounding; far below the 5.9% semitone spacing) */
 	if (dir > 0) {
-		for (int k = 0; k < 25; k++)
+		for (int k = 0; k < 37; k++)
 			if (k_semi_q16[k] > sp + sp / 250u)
 				return k_semi_q16[k];
-		return k_semi_q16[24];
+		return k_semi_q16[36];
 	}
-	for (int k = 24; k >= 0; k--)
+	for (int k = 36; k >= 0; k--)
 		if (k_semi_q16[k] < sp - sp / 250u)
 			return k_semi_q16[k];
 	return k_semi_q16[0];
@@ -11562,8 +11564,9 @@ int main(void)
 	uint8_t fnr_pre = 0;             /* ISO2-643: the band the ladder came from: 1 idle, 2 PLAY, 3 one track, 4 other */
 	enum vol_btn cp_cand = VOL_NONE; /* FUNCTION+rocker/Vol chop: sticky candidate */
 	int cp_cnt = 0;                  /*   consecutive passes it has held */
-	int cp_dcl_band = -1;            /*   last committed rocker band (double-click) */
-	int64_t cp_dcl_t = 0;            /*   when it committed */
+	enum vol_btn fv_cand = VOL_NONE; /* MOD-654: FN+PLAY + Vol/rocker sticky candidate */
+	int fv_cnt = 0;                  /*   consecutive passes it has held (2 = commit, once) */
+	int fv_oct_from = 0;             /*   MOD-654: the BPM an octave DOWN left (0 = none) */
 	int cp_rep_at = 0;               /*   M10 glide: cp_cnt of the next auto-repeat */
 	int cp_rep_iv = 0;               /*   M10 glide: repeat interval, in ~25 ms passes */
 	uint8_t ctl_flush = 0;      /* looper decode state went stale (FUNCTION page / USB transfer owned the loop) */
@@ -11846,6 +11849,55 @@ int main(void)
 						fnr_cand = -1; fnr_cnt = 0; fnr_off = 0; fnr_mode = 0;
 					}
 				}
+				/* MOD-654 (§1.3): FN + PLAY held + the Vol/rocker ladder -- the
+				 * second modifier's own surface (this branch owns the pass, so
+				 * the chop block below never sees these presses):
+				 *   VOL-  = CHOP RESET    (whole loop, chop gone, direction kept)
+				 *   VOL+  = window HOME   (offset 0, chop size kept)
+				 *   FWD   = OCTAVE UP     (BPM x2, only if it fits BPM_MIN..BPM_MAX)
+				 *   RWD   = OCTAVE DOWN   (BPM /2, only if it fits; remembers
+				 *           the BPM it left so the next UP restores it exactly)
+				 * Two passes confirm, one action per press edge. The octave
+				 * glides through the engine's own 2 %/block speed ramp -- the
+				 * same slew as play/pause and the semitone double-click -- and
+				 * is locked while a take is in flight, like the rocker. Every
+				 * commit spends the PLAY press (no snap, no mode toggle, no
+				 * brightness). */
+				{
+					enum vol_btn fvb = decode_vol(ladder_read(&adc_ladder[LAD_VOL]));
+					if (fvb == VOL_NONE) { fv_cand = VOL_NONE; fv_cnt = 0; }
+					else if (fvb == fv_cand) { if (fv_cnt < 1000) fv_cnt++; }
+					else { fv_cand = fvb; fv_cnt = 1; }
+					if (fv_cnt == 2) {   /* the committed press edge */
+						combo_fired = 1; fnp_pend_snap = 0; combo_seen = 1;
+						if (fvb == VOL_UP || fvb == VOL_DOWN) {
+							uint32_t d = (fvb == VOL_DOWN) ? 1u : g_chop_div;   /* VOL-: reset, whole loop; VOL+: home, size kept */
+							g_win_free = 0;   /* the buttons reclaim the SHAPE; g_win_rev stays (M23-r11) */
+							g_chop_off = 0u;
+							g_chop_div = d;
+							if (g_slot < NUM_SLOTS) {
+								g_meta.chop[g_slot][0] = (uint8_t)d;
+								g_meta.chop[g_slot][1] = 0u;
+								g_meta_save_req = 1;
+							}
+							g_chop_req = 1;
+							g_dip_req = 1;
+						} else if (g_rec_track < 0) {   /* the octave; tempo locked mid-take */
+							int b = g_play_bpm, nb = b;
+							if (fvb == VOL_TEMPO_UP) {
+								nb = (fv_oct_from && b == fv_oct_from / 2) ? fv_oct_from : b * 2;
+								fv_oct_from = 0;
+							} else {
+								nb = b / 2;
+							}
+							if (nb >= BPM_MIN && nb <= BPM_MAX && nb != b) {
+								if (fvb == VOL_TEMPO_DOWN) fv_oct_from = b;
+								g_play_bpm = nb;
+								g_play_speed_q16 = (uint32_t)nb * 65536u / LOOP_BPM_BASE;
+							}
+						}
+					}
+				}
 				if (!combo_fired &&
 				    k_uptime_get() - combo_start >= 5000) {
 					/* v1.2.2: HOLD THROUGH 5 s = BRIGHTNESS toggle,
@@ -12035,7 +12087,8 @@ int main(void)
 			 * FUNCTION holds — becomes the chop surface:
 			 *   FWD  = window /2 (shorter)   RWD  = window x2 (longer)
 			 *   Vol+ = shift window right    Vol- = shift window left
-			 *   rocker DOUBLE-CLICK = reset to the full loop
+			 *   (MOD-654, row 77: the rocker double-click RESET is gone --
+			 *    every click steps; reset/home live on FN + PLAY + VOL)
 			 * Sticky 3-pass commit (transit-proof); every commit sets
 			 * combo_seen so the press can never become a power-off; bare
 			 * rocker/Vol behavior outside FUNCTION holds is untouched. */
@@ -12063,7 +12116,6 @@ int main(void)
 							}
 						}
 					} else if (cp_cnt == 3) {   /* committed press edge */
-						int64_t cnow = k_uptime_get();
 						combo_seen = 1;
 						/* M23-r11 (nervouskidz): the buttons reclaim
 						 * the window SHAPE from the faders — they do
@@ -12080,15 +12132,11 @@ int main(void)
 						g_win_free = 0;
 						uint32_t d = g_chop_div, o = g_chop_off;
 						if (vb == VOL_TEMPO_UP || vb == VOL_TEMPO_DOWN) {
-							if (cp_dcl_band == (int)vb &&
-							    cnow - cp_dcl_t <= 400) {
-								d = 1u; o = 0u;   /* double-click: RESET */
-							} else if (vb == VOL_TEMPO_UP) {
+							if (vb == VOL_TEMPO_UP) {
 								if (d < 64u) { d <<= 1; o <<= 1; }
 							} else {
 								if (d > 1u) { d >>= 1; o >>= 1; }
 							}
-							cp_dcl_band = (int)vb; cp_dcl_t = cnow;
 						} else if (vb == VOL_UP) {
 							o = (o + 1u) % d;
 						} else {                  /* VOL_DOWN */
@@ -12554,8 +12602,8 @@ int main(void)
 							 * bar line — tempo AND phase matched. */
 							uint64_t sp = ((uint64_t)bpmq8 << 16) /
 								      native_q8;
-							if (sp < 32768u) sp = 32768u;
-							else if (sp > 98304u) sp = 98304u;
+							if (sp < 16384u) sp = 16384u;          /* RANGE-655: 0.25x */
+							else if (sp > 131072u) sp = 131072u;   /* RANGE-655: 2.0x */
 							g_play_speed_q16 = (uint32_t)sp;
 							g_play_bpm = (int)((sp * 80u + 32768u) >> 16);
 							if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
@@ -12634,7 +12682,8 @@ int main(void)
 		fnr_cand = -1; fnr_cnt = 0; fnr_held = 0; fnr_off = 0; fnr_mode = 0; fnr_pre = 0;   /* REV2-641 / ISO2-643 */
 		pg_pend = -1;   /* PF-545: the momentary close is GONE (sticky) */
 		fnp_presses = 0;
-		cp_cand = VOL_NONE; cp_cnt = 0; cp_dcl_band = -1;
+		cp_cand = VOL_NONE; cp_cnt = 0;
+		fv_cand = VOL_NONE; fv_cnt = 0;   /* MOD-654 */
 
 		/* ---- looper controls + LEDs ---- */
 		{
