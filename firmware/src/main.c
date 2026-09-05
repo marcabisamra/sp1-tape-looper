@@ -8720,7 +8720,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					 * block belongs to the lap. */
 					bool _plain = (_cdiv == 1u && !g_win_free &&
 						       !g_win_rev &&
-						       !(heads_engaged() && g_head_rev[i]) &&   /* M50a: a reversed heads SOURCE must not take the express lane */
+						       !g_head_rev[i] &&   /* M50a / REV2-641: a reversed track must not take the express lane */
 						       !head_active(i) && t->len_samps &&
 						       _win == _wper && _wper == _gb);
 #else
@@ -9006,7 +9006,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					if (cdiv == 1u && !g_win_free && !head_active(i) &&
 					    t->len_samps && win == wper && wper == gb &&
 					    !g_win_rev &&
-					    !(heads_engaged() && g_head_rev[i])) {   /* M50a: reversed source -> head path */
+					    !g_head_rev[i]) {   /* M50a / REV2-641: reversed -> the block path */
 						uint32_t Ls  = t->len_samps;
 						uint32_t lp  = ((pw % Ls) + Ls -
 						              (t->start_samps % Ls)) % Ls;
@@ -9075,7 +9075,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					 * blocks then walk the source BACKWARD, and each
 					 * block's samples are flipped after decode below:
 					 * together a continuous time-reversed stream. */
-					bool hrev = (bool)(heads_engaged() && g_head_rev[i]) ^
+					bool hrev = (bool)g_head_rev[i] ^   /* REV2-641: per-track direction in ANY mode (W308) */
 						    (bool)g_win_rev;
 					if (hrev) c = (cyc - 1u) - c;
 					uint32_t loop_blk = (c / win) * wper + wbase + (c % win);
@@ -11118,7 +11118,7 @@ static void led_service(void)
 						       (hs2->start_blk % cyc2) + ho2) % cyc2;
 					{
 						int rv2 = g_win_rev ? 1 : 0;
-						if (heads_engaged() && g_head_rev[i]) rv2 ^= 1;
+						if (g_head_rev[i]) rv2 ^= 1;   /* REV2-641 */
 						if (rv2)
 							c2 = (cyc2 - 1u) - c2;   /* chase walks back */
 					}
@@ -11150,6 +11150,50 @@ static void led_service(void)
  * holding through 5 s becomes the brightness toggle instead). M7c two-layer
  * semantics + the LED confirm, verbatim from the old in-hold body. */
 static void feed_wdt(void);
+/* REV2-641 (W308): flip track ti's playback direction, in any mode -- the
+ * heads double-tap's mechanics minus the mute toggle. The block path reads
+ * hrev = g_head_rev[i] ^ g_win_rev; the 3-block dip masks the splice and the
+ * ring is re-anchored to the playhead so the streamer refills it in the new
+ * direction on its next pass (the audio thread sees a short starve behind
+ * the dip, exactly as the heads scrub does). An empty track has no
+ * direction; a track that is taking keeps the flag for the playback that
+ * follows (the recorder writes forward by construction, row 59). */
+static void __attribute__((noinline)) rev_toggle(int ti)
+{
+	if (ti < 0 || ti >= NTRK || (trk[ti].state == TS_EMPTY && !head_active(ti))) return;   /* ISO2-643: a head counts */
+	g_head_rev[ti] = (uint8_t)!g_head_rev[ti];
+	if (trk[ti].state == TS_PLAY || head_active(ti)) {
+		g_head_blip[ti] = 3;
+		trk[ti].p_w = (g_consume_pos / TSPBI(ti)) * TSPBI(ti);
+	}
+}
+
+/* ISO2-643 (§1.3): momentary ISOLATE. Only track ti audible while the chord is
+ * held; the four mute flags are snapshotted at engage and restored at release.
+ * Session state: the persisted mute bits (g_meta.song_mode) are never touched,
+ * so a song comes back exactly as it was saved. Only tracks the mixer would
+ * serve are muted (state == TS_PLAY || head_active -- its own predicate); the
+ * snapshot covers all four so one that starts playing during the hold is
+ * restored to what it was. */
+static uint8_t g_iso_on, g_iso_mask;
+static void __attribute__((noinline)) iso_engage(int ti)
+{
+	if (g_iso_on || ti < 0 || ti >= NTRK || (trk[ti].state == TS_EMPTY && !head_active(ti))) return;
+	g_iso_mask = 0;
+	for (int k = 0; k < NTRK; k++) {
+		if (trk[k].muted) g_iso_mask |= (uint8_t)(1u << k);
+		if (k == ti) trk[k].muted = 0;
+		else if (trk[k].state == TS_PLAY || head_active(k)) trk[k].muted = 1;
+	}
+	g_iso_on = 1;
+}
+static void __attribute__((noinline)) iso_release(void)
+{
+	if (!g_iso_on) return;
+	for (int k = 0; k < NTRK; k++) trk[k].muted = (uint8_t)((g_iso_mask >> k) & 1u);
+	g_iso_on = 0;
+}
+
 static void fnp_mode_toggle(void)
 {
 	g_fixed_len ^= 1u;
@@ -11313,7 +11357,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 14\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -11452,6 +11496,7 @@ static void jump_to_slot(uint32_t ns)
 	g_grid_base_beats = 0; g_grid_base_blocks = 0;   /* M20 F7 */
 	g_win_free = 0;     /* M16: the free window is session performance state */
 	g_win_rev = 0;
+	for (int _r = 0; _r < NTRK; _r++) g_head_rev[_r] = 0;   /* REV2-641: so are the directions */
 	g_heads_mode = 0;   /* M13: heads are per-song doctrine like speed/mutes/
 	                     * chop — a new song always opens playing normally;
 	                     * triple-tap re-enters (session-only, never stored) */
@@ -11785,6 +11830,11 @@ int main(void)
 	int fnp_chain = 0;               /* M13: consecutive PLAY taps (2 = 1.0x snap, 3 = heads) */
 	int fnp_pend_snap = 0;           /* M15-r3: snap DEFERRED past the triple window */
 	int fnp_presses = 0;             /* M15-r4: PLAY press edges this FUNCTION hold */
+	int fnr_cand = -1, fnr_cnt = 0;  /* REV2-641: FN+PLAY+track two-pass confirm */
+	uint8_t fnr_held = 0;            /* the chord confirmed; its release sweep is owned until idle */
+	int     fnr_trk = -1, fnr_off = 0;   /* ISO2-643: the chord's track; off-band passes seen */
+	uint8_t fnr_mode = 0;            /* ISO2-643: 1 = ISOLATE (PLAY landed first), 2 = REVERSE (the track did) */
+	uint8_t fnr_pre = 0;             /* ISO2-643: the band the ladder came from: 1 idle, 2 PLAY, 3 one track, 4 other */
 	enum vol_btn cp_cand = VOL_NONE; /* FUNCTION+rocker/Vol chop: sticky candidate */
 	int cp_cnt = 0;                  /*   consecutive passes it has held */
 	int cp_dcl_band = -1;            /*   last committed rocker band (double-click) */
@@ -11912,6 +11962,15 @@ int main(void)
 				g_play_bpm = 80;
 			}
 			int fraw = ladder_read(&adc_ladder[LAD_TRACKS]);
+			/* ISO2-643: remember which band the ladder came FROM, so a PLAY+TN
+			 * chord knows whether PLAY or the track landed first (the split).
+			 * Single-track bands = the bank-jump decoder's (M31-r2). */
+			if (fraw < 110)                          fnr_pre = 1;
+			else if (fraw >= 1840 && fraw < 2267)   { /* the chord itself: keep */ }
+			else if (fraw > 1773)                    fnr_pre = 2;   /* bare PLAY, or PLAY + several tracks */
+			else if ((fraw >= 110  && fraw <  308) || (fraw >= 308  && fraw <  488) ||
+			         (fraw >= 650  && fraw <  795) || (fraw >= 1099 && fraw < 1256)) fnr_pre = 3;
+			else                                     fnr_pre = 4;
 			/* M31: 1600 -> 1773. M27 made multi-track combos reachable codes on
 			 * this ladder (2+3+4 = 1683, ALL4 = 1743), and anything over the old
 			 * 1600 counted as a PLAY press under FN - three phantom taps inside
@@ -11922,6 +11981,13 @@ int main(void)
 				combo_seen = 1;
 				if (combo_start < 0) {           /* fresh PLAY press edge */
 					int64_t fnp_now = k_uptime_get();
+					if (fraw >= 1840) {
+						/* ISO2-643: PLAY landed on a held track (or with it): a
+						 * chord, never a PLAY tap -- no snap chain, no heads
+						 * triple, no mode toggle on release. */
+						combo_start = fnp_now;
+						combo_fired = 1;
+					} else {
 					fnp_presses++;
 					/* FUNCTION + PLAY DOUBLE-TAP = snap to 1.0x. A
 					 * second PLAY press edge fires it and blocks the
@@ -12005,15 +12071,55 @@ int main(void)
 							trk[hk].p_w = (uint32_t)(g_consume_pos /
 								TSPBI(hk)) * TSPBI(hk);
 						}
-						for (int hk = 0; hk < NTRK; hk++) {
+						for (int hk = 0; hk < NTRK; hk++)
 							g_head_pos[hk] = (uint8_t)(hk * 64);
-							g_head_rev[hk] = 0;
-						}
+						/* REV2-641: directions are per-track state and survive
+						 * heads entry -- "reverse kept" (W308) */
 						g_dip_req = 1;
 						combo_fired = 1;
 					}
 					fnp_edge = fnp_now;
 					combo_start = fnp_now;
+					}   /* ISO2-643: a bare PLAY press */
+				}
+				/* ISO2-643 (§1.3, W310): FN + PLAY + track -- ONE chord, TWO gestures,
+				 * split by which finger landed second (no dwell, no blip):
+				 *   PLAY first, then a track = momentary ISOLATE: on at the press,
+				 *     off at release, hold as long as you like; another track
+				 *     under the same hold moves the solo.
+				 *   a track first, then PLAY = REVERSE that track, at the PLAY
+				 *     press; tap PLAY again under the same hold = flip back.
+				 * The bands are the bounce chord's, measured on 508 (PLAY 1807 |
+				 * +T1 1861 | +T2 1910 | +T3 2004 | +T4 2159); FUNCTION is a
+				 * separate GPIO. Two passes confirm. The FN+PLAY press is spent
+				 * (no mode toggle on release, no brightness at 5 s, no deferred
+				 * snap); the track's bank-jump / page candidates are spent (no
+				 * song switch, no page); the release sweep is owned until the
+				 * ladder is idle. PLAY + two or more tracks is not a gesture
+				 * (W115): it reads above the T4 band and ends the chord. */
+				{
+					int rch = -1;
+					if      (fraw >= 1840 && fraw < 1886) rch = 0;   /* PLAY+T1 ~1861 */
+					else if (fraw >= 1886 && fraw < 1957) rch = 1;   /* PLAY+T2 ~1910 */
+					else if (fraw >= 1957 && fraw < 2081) rch = 2;   /* PLAY+T3 ~2004 */
+					else if (fraw >= 2081 && fraw < 2267) rch = 3;   /* PLAY+T4 ~2159 */
+					if (rch >= 0) {
+						fnr_off = 0;
+						if (rch == fnr_cand) { if (fnr_cnt < 3) fnr_cnt++; }
+						else { fnr_cand = rch; fnr_cnt = 1; }
+						if (fnr_cnt == 2) {
+							fnr_trk = rch;
+							fnr_held = 1; combo_fired = 1; fnp_pend_snap = 0;
+							pg_pend = -1; bj_cand = TRK_NONE; bj_cnt = 0;   /* no song switch, no page */
+							if (fnr_pre == 3) { fnr_mode = 2; rev_toggle(rch); }   /* the track landed first */
+							else              { fnr_mode = 1; iso_engage(rch); }  /* PLAY did (or both at once) */
+						}
+					} else if (fnr_cnt >= 2 && ++fnr_off < 2) {
+						/* one off-band pass is noise; the end needs two */
+					} else {
+						if (fnr_cnt >= 2 && fnr_mode == 1) iso_release();   /* the track lifted under a held PLAY */
+						fnr_cand = -1; fnr_cnt = 0; fnr_off = 0; fnr_mode = 0;
+					}
 				}
 				if (!combo_fired &&
 				    k_uptime_get() - combo_start >= 5000) {
@@ -12029,6 +12135,26 @@ int main(void)
 				}
 				k_msleep(25);
 				continue;                /* combo owns the button */
+			}
+			if (fnr_held) {
+				/* REV2-641 / ISO2-643: PLAY lifted with the track still down. The
+				 * track sits in its bare band, which the BANK JUMP below would
+				 * commit 75 ms later -- nothing in this sweep is a gesture: own
+				 * the button until the ladder is idle (two passes, so a stray
+				 * dip mid-hold cannot mint a phantom PLAY edge). An isolate ends
+				 * here; a reverse chord just re-arms, so PLAY tapped again under
+				 * the held track flips it back (the combo branch above sees the
+				 * re-press; fnr_pre still says 'track'). */
+				if (fnr_cnt >= 2) {
+					if (++fnr_off < 2) { k_msleep(25); continue; }   /* one pass below the band is noise */
+					if (fnr_mode == 1) iso_release();
+					fnr_cand = -1; fnr_cnt = 0; fnr_off = 0; fnr_mode = 0;
+				}
+				if (!(fraw >= 0 && fraw < 110)) { fnp_low = 0; k_msleep(25); continue; }
+				if (++fnp_low < 2) { k_msleep(25); continue; }   /* two idle passes, as the tap release */
+				fnr_held = 0; fnp_low = 0; combo_start = -1;
+				k_msleep(25);
+				continue;
 			}
 			if (combo_start >= 0) {
 				/* v1.2.2-r4: DEBOUNCED release — the shared ladder can
@@ -12779,6 +12905,8 @@ int main(void)
 			g_play_bpm = 80;
 		}
 		bj_cand = TRK_NONE; bj_cnt = 0; bj_fired = -1; fnp_edge = -1; fnp_chain = 0;
+		if (fnr_mode == 1) iso_release();   /* ISO2-643: FN lifted first */
+		fnr_cand = -1; fnr_cnt = 0; fnr_held = 0; fnr_off = 0; fnr_mode = 0; fnr_pre = 0;   /* REV2-641 / ISO2-643 */
 		pg_pend = -1;   /* PF-545: the momentary close is GONE (sticky) */
 		fnp_presses = 0;
 		cp_cand = VOL_NONE; cp_cnt = 0; cp_dcl_band = -1;
@@ -12862,7 +12990,7 @@ int main(void)
 			if (trk_raw >= 1840) {
 				raw = TRK_NONE;          /* never PLAY, never a track */
 				combo14_t = -1;
-				if (bchord >= 0) {
+				if (bchord >= 0 && !suppress_play) {   /* REV2-641: FN lifted first out of FN+PLAY+TN is not a bounce */
 					if (bchord == bch_cand) { if (bch_cnt < 3) bch_cnt++; }
 					else { bch_cand = bchord; bch_cnt = 1; }
 					/* BNC2-600: fires once per PRESS (the count passes 2 exactly
@@ -13277,10 +13405,12 @@ int main(void)
 						 * delete window on a fresh take). */
 						g_stop_req = 1;
 						tap_deadline[ti] = 0;
-					} else if (tap_deadline[ti] > 0 && tnow <= tap_deadline[ti] &&
-						   !g_heads_mode) {
+					} else if (tap_deadline[ti] > 0 && tnow <= tap_deadline[ti]) {
 						/* (heads mode: taps only mute — never
-						 * delete or arm; the mode is playback) */
+						 * delete or arm; the mode is playback.
+						 * REV2-641: the heads double-tap REVERSE is
+						 * gone -- reverse is FN+PLAY+track in any
+						 * mode; a 2nd tap here is another mute) */
 						/* PG-533: the base-layer toggle is REMOVED -- marc's
 						 * rule: no gesture passes THROUGH mute. The toggle
 						 * lives on the FN+hold-T4 MODE PAGE. A quick 2nd
@@ -13288,18 +13418,6 @@ int main(void)
 						 * marc-approved) still owns the held 2nd tap. */
 						tap_deadline[ti] = 0;
 						trk[ti].muted = !trk[ti].muted;
-					} else if (tap_deadline[ti] > 0 && tnow <= tap_deadline[ti]) {
-						/* M15: heads mode double-tap = REVERSE that
-						 * head. The first tap toggled the mute — undo
-						 * it (and its persisted bit), flip direction,
-						 * re-anchor this ring behind a blip. */
-						tap_deadline[ti] = 0;
-						trk[ti].muted = !trk[ti].muted;
-						/* (no persistence — heads-only path, and
-						 * M19a-r4 makes all head mutes session) */
-						g_head_rev[ti] = !g_head_rev[ti];
-						g_head_blip[ti] = 3;
-						trk[ti].p_w = (g_consume_pos / TSPBI(ti)) * TSPBI(ti);
 					} else {
 						/* tap -> mute, INSTANT on gridded and
 						 * ungridded songs alike (v2.0.0: the M8c
@@ -13411,6 +13529,7 @@ int main(void)
 			    k_uptime_get() - press_t[ti] >= DTAP_DEL_HOLD_MS) {
 				tap_deadline[ti] = 0;
 				g_del_req[ti] = 1;
+				g_head_rev[ti] = 0;   /* REV2-641: an empty track has no direction */
 				trk[ti].muted = 0;
 				armed_press[ti] = 1;   /* spend the press: its release
 				                        * must not read as a mute */
