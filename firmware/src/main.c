@@ -7013,6 +7013,78 @@ static int64_t           g_crcc_w0;                        /* rate window start,
 static uint32_t          g_crcc_wn, g_crcc_rate;           /* blocks this window; blk/s */
 static volatile uint32_t g_m71_vf, g_m71_sk;               /* blocks checked / left unchecked */
 static volatile uint32_t g_m71_ca, g_m71_rq, g_m71_rd, g_m71_wu;
+/* RRT-630 (W306): THE REC-RING TRACE -- what the streamer was doing while the
+ * rec ring filled. A 24-event ring (R read / W write / P pass / S sleep, with
+ * wall us), recorded while a take is on the ring and frozen the first time
+ * the backlog crosses 3/4; per-boot totals; TKD = takes whose ring overran.
+ * Diag only: no behaviour change, no mixer text. */
+#define RRT_N 24u
+#define RRT_R 1u
+#define RRT_W 2u
+#define RRT_P 3u
+#define RRT_S 4u
+struct rrt_ev { uint8_t t, n; uint16_t us; };
+static struct rrt_ev g_rrt[RRT_N];
+static uint8_t  g_rrt_i, g_rrt_frz, g_rrt_on;
+static uint32_t g_rrt_frz_fill, g_rrt_frz_ms;
+static uint32_t g_rrt_p1, g_rrt_gap_us, g_rrt_gap_fill, g_rrt_p1_last;
+static uint32_t g_rrt_wr_n, g_rrt_wr_us, g_rrt_wr_max, g_rrt_rd_n, g_rrt_rd_us, g_rrt_sl_us;
+static uint32_t g_rrt_ovr0, g_tkd_n, g_tkd_ovr;
+static uint32_t g_p1spr_n, g_p1spr_cut;   /* SPRINT-P1-631: passes whose flush ran boosted; 150 ms bound hits */
+static struct rrt_ev g_rrt_hw[RRT_N];      /* RETRY-633: the ring as it was at the high-water moment */
+static uint8_t  g_rrt_hw_i;
+static uint32_t g_rrt_hw_fill, g_rrt_hw_ms, g_rrt_wretry;
+extern volatile uint32_t g_aw2_werr;        /* the write chain's CRC-status rejections (sp1_emmc.c) */
+/* the rec backlog in emissions, whichever track owns the ring (TS_REC or its tail flush) */
+static uint32_t rrt_fill(int *who)
+{
+	uint32_t fill = 0u; int w = -1;
+	for (int j = 0; j < NTRK; j++) {
+		uint8_t sj = trk[j].state;
+		if (sj != TS_REC && sj != TS_DONE) continue;
+		uint32_t f = trk[j].r_w - trk[j].r_r;
+		if (f >= fill) { fill = f; w = j; }
+	}
+	if (who) *who = w;
+	return fill;
+}
+static void rrt_ev(uint8_t t, uint32_t n, uint32_t us)
+{
+	if (!g_rrt_on) return;
+	if (t == RRT_R) { g_rrt_rd_n += n; g_rrt_rd_us += us; }
+	else if (t == RRT_W) { g_rrt_wr_n += n; g_rrt_wr_us += us; if (us > g_rrt_wr_max) g_rrt_wr_max = us; }
+	else if (t == RRT_S) g_rrt_sl_us += us;
+	struct rrt_ev *e = &g_rrt[g_rrt_i];
+	e->t = t; e->n = (uint8_t)(n > 255u ? 255u : n); e->us = (uint16_t)(us > 65535u ? 65535u : us);
+	g_rrt_i = (uint8_t)((g_rrt_i + 1u) % RRT_N);
+	uint32_t fill = rrt_fill(NULL);
+	if (!g_rrt_frz && fill >= (RRING_SAMPLES * 2u) / 4u * 3u) { g_rrt_frz = 1u; g_rrt_frz_fill = fill; g_rrt_frz_ms = k_uptime_get_32(); }
+	if (fill > g_rrt_hw_fill) {   /* RETRY-633: keep the ring as it stood at every new high-water mark */
+		g_rrt_hw_fill = fill; g_rrt_hw_ms = k_uptime_get_32(); g_rrt_hw_i = g_rrt_i;
+		for (uint32_t k = 0; k < RRT_N; k++) g_rrt_hw[k] = g_rrt[k];
+	}
+}
+/* once per streamer pass, at the top of PASS 1 */
+static void __attribute__((noinline)) rrt_pass1(void)
+{
+	int who = -1;
+	uint32_t fill = rrt_fill(&who);
+	uint32_t now = DWT->CYCCNT;
+	if (who >= 0 && !g_rrt_on) { g_rrt_ovr0 = g_rec_overruns; g_rrt_p1_last = now; }   /* a take just landed on the ring */
+	g_rrt_on = (who >= 0) ? 1u : 0u;
+	if (who < 0) return;
+	g_rrt_p1++;
+	uint32_t gap = (uint32_t)(now - g_rrt_p1_last) / 64u; g_rrt_p1_last = now;
+	if (gap > g_rrt_gap_us) { g_rrt_gap_us = gap; g_rrt_gap_fill = fill; }
+	rrt_ev(RRT_P, fill / TSPBI(who), gap / 1000u);   /* RETRY-633: P carries its gap in ms */
+}
+/* at a take's promotion: did its ring overrun while it was on the ring? */
+static void rrt_take_done(void)
+{
+	uint32_t d = g_rec_overruns - g_rrt_ovr0;
+	if (d) { g_tkd_n++; g_tkd_ovr = d; }
+	g_rrt_ovr0 = g_rec_overruns;
+}
 /* ==== PCM14S: the two-tier TAKE codec (design doc + script 459) ====
  * 24 kHz stereo 14-bit shaped. 512 B = 16 B hdr + 140 stored frames
  * x 3.5 B. ONE BLOCK = 280 ENGINE frames: the decoder upsamples 2:1
@@ -7493,6 +7565,7 @@ static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
 {
 	M73_T0();
 	int64_t _t0 = k_uptime_get();
+	uint32_t _rrt0 = DWT->CYCCNT;   /* RRT-630 */
 	g_m71_ca++; g_m71_rq += n;
 	{	/* CRCC-625: the read rate over ~half-second windows (one divide per window) */
 		g_crcc_wn += n;
@@ -7553,6 +7626,7 @@ static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
 		done += c;
 	}
 	g_m71_wu += (uint32_t)(k_uptime_get() - _t0);
+	rrt_ev(RRT_R, n, (uint32_t)(DWT->CYCCNT - _rrt0) / 64u);   /* RRT-630 */
 	M73_ADD(g_t_rd);
 	return true;
 }
@@ -8229,6 +8303,17 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 			}
 		}
 
+		rrt_pass1();   /* RRT-630: the trace's pass marker + the flush-gap meter */
+		/* SPRINT-P1-631 (W307): M87 raises g_emmc_sprint under rec-ring pressure so
+		 * the flush gets the storm immunity the play rings have -- but the boost was
+		 * only ever applied inside PASS 2's rounds; the pack and the page writes ran
+		 * at PREEMPT(5) under USB and main (630's trace: ~200 ms per pass at the
+		 * overdub corner). Sprint PASS 1 too, bounded to 150 ms per pass. */
+		int _p1spr = 0; uint32_t _p1t0 = 0u;
+		if (g_emmc_sprint) {
+			_p1spr = 1; _p1t0 = k_uptime_get_32(); g_p1spr_n++;
+			k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(1));
+		}
 		/* PASS 1 — WRITES FIRST. Flushing the rec ring always outranks play
 		 * read-ahead: a rec-ring overflow corrupts the take permanently, while a
 		 * play-ring underrun is only a brief, recoverable dropout. */
@@ -8245,7 +8330,12 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				 * stored missing its last stretch). Serve ANY backlog:
 				 * the frames are real audio with fixed destinations;
 				 * a late flush self-heals on the next loop pass. */
+				uint32_t _wretry = 0u;   /* RETRY-633: failed-write retries this pass */
 				while (bk_flush_navail(t, i) > 0u) {   /* BAKE-619: in this take's units */
+					if (_p1spr && (k_uptime_get_32() - _p1t0) > 150u) {   /* SPRINT-P1-631: the duty bound */
+						_p1spr = 0; g_p1spr_cut++;
+						k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(5));
+					}
 					uint32_t fm = t->flush_mod ? t->flush_mod : MAX_LOOP_BLOCKS;
 					/* batch as many contiguous blocks as are ready, up to the
 					 * buffer size and the loop-wrap boundary, into one CMD25 write */
@@ -8355,7 +8445,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					uint32_t _wkey = ((uint32_t)i << 28) ^ t->flush_blk;
 					uint32_t _tw = DWT->CYCCNT;
 					bool _wok = emmc_write_blocks(blkno, batchbuf, n);
-					{ uint32_t _dcx73 = (uint32_t)(DWT->CYCCNT - _tw); g_t_wr += _dcx73; if (M73_CX_NOW()) { g_t_wr_cx += _dcx73; g_t_wr_cxn++; } if (M73_CY_NOW()) { g_t_wr_cy += _dcx73; g_t_wr_cyn++; } }
+					{ uint32_t _dcx73 = (uint32_t)(DWT->CYCCNT - _tw); g_t_wr += _dcx73; rrt_ev(RRT_W, n, _dcx73 / 64u);   /* RRT-630 */ if (M73_CX_NOW()) { g_t_wr_cx += _dcx73; g_t_wr_cxn++; } if (M73_CY_NOW()) { g_t_wr_cy += _dcx73; g_t_wr_cyn++; } }
 					if (!_wok) {
 						/* write failed (bus CRC or busy timeout): data is
 						 * still in the ring — retry next pass. Give up and
@@ -8397,8 +8487,14 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 							 * immediate CMD25 retry is a zero-yield
 							 * spin that starves MIDI/main (the WDT
 							 * feeder). 2 ms costs nothing here. */
+							rrt_ev(RRT_S, 2u, 2000u);   /* RRT-630 */
 							k_msleep(2);
 							work = true;
+							/* RETRY-633 (W307): the same page again, at most twice, before
+							 * yielding to PASS 2 -- a yield costs a turn (~8-12 blocks of
+							 * input at 1.5x), a retry costs 2 ms + the write. The streak /
+							 * give-up logic above sees every attempt as before. */
+							if (++_wretry <= 2u) { g_rrt_wretry++; continue; }
 							break;
 						}
 						g_stored_glitch_cnt++;  /* audible as a REPEATING artifact */
@@ -8418,7 +8514,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					 * moment the backlog crosses half capacity, so data
 					 * safety is unchanged (the ring holds ~341 ms). */
 					if (g_cur_speed_q16 >= CX_SPEED_MIN &&
-					    (t->r_w - t->r_r) < RRING_SAMPLES)
+					    (t->r_w - t->r_r) < RRING_SAMPLES / 2u)   /* QUARTER-632 (W307): a quarter ring, not half */
 						break;
 					/* POST-STALL DRAIN ORDER: a big rec backlog must not
 					 * starve the playing rings at their emptiest moment.
@@ -8455,6 +8551,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				 * the two stores and sleep with the new recording unsaved. */
 				if (t->state == TS_DONE && bk_flush_navail(t, i) == 0u) {   /* BAKE-619: in this take's units */
 					if (bk_flush_on(t, i)) bk_promote(t);   /* BAKE-619: recorder blocks -> baked blocks */
+					rrt_take_done();   /* RRT-630: TKD if the ring overran during this take */
 					g_done_pending = 0;   /* M20: ring free again */
 					/* Start playback BLOCK-ALIGNED at the live playhead. p_w must be a
 					 * multiple of SAMP_PER_BLK or the streamer writes each eMMC block at
@@ -8703,6 +8800,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 			}
 		}
 
+		if (_p1spr) k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(5));   /* SPRINT-P1-631: PASS 2 decides its own */
 		/* PASS 2 — play read-ahead, only after all pending writes are flushed.
 		 * Skip refills entirely while a big rec backlog exists so the recorder
 		 * always wins the bus (the play rings hold ~1.2 s and can coast). */
@@ -8759,6 +8857,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				 * for 15 ms, then resume if still low (M46d shape). */
 				k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(5));
 				_m71spr = 0;
+				rrt_ev(RRT_S, 15u, 15000u);   /* RRT-630 */
 				k_msleep(15);
 				if (g_emmc_sprint) {
 					_m71spr = 1; _spr_t0 = k_uptime_get();
@@ -10138,6 +10237,21 @@ static void controls_diag(void)
 		       (unsigned)(g_m71_vf - _p_vf), (unsigned)(g_m71_sk - _p_sk), (unsigned)g_crcc_rate);
 		_p_as = g_m71_as; _p_rt = g_m71_rt; _p_fb = g_m71_fb; _p_vf = g_m71_vf; _p_sk = g_m71_sk;
 		_p_ca = g_m71_ca; _p_rq = g_m71_rq; _p_rd = g_m71_rd; _p_wu = g_m71_wu;
+		/* RRT-630: totals, the frozen trace (oldest first; the last event is the one
+		 * during which the backlog crossed 3/4), TKD */
+		printk("RRT,on=%u,p1=%u,gap=%u@%u,wr=%u/%u/%u,rd=%u/%u,sl=%u,frz=%u/%u/%u,tkd=%u/%u,p1s=%u/%u,werr=%u/%u,hw=%u/%u,ev=",
+		       (unsigned)g_rrt_on, (unsigned)g_rrt_p1, (unsigned)g_rrt_gap_us, (unsigned)g_rrt_gap_fill,
+		       (unsigned)g_rrt_wr_n, (unsigned)g_rrt_wr_us, (unsigned)g_rrt_wr_max,
+		       (unsigned)g_rrt_rd_n, (unsigned)g_rrt_rd_us, (unsigned)g_rrt_sl_us,
+		       (unsigned)g_rrt_frz, (unsigned)g_rrt_frz_fill, (unsigned)g_rrt_frz_ms,
+		       (unsigned)g_tkd_n, (unsigned)g_tkd_ovr, (unsigned)g_p1spr_n, (unsigned)g_p1spr_cut,
+		       (unsigned)g_aw2_werr, (unsigned)g_rrt_wretry, (unsigned)g_rrt_hw_fill, (unsigned)g_rrt_hw_ms);
+		for (uint32_t _k = 0; _k < RRT_N; _k++) {   /* RETRY-633: the high-water snapshot, oldest first */
+			const struct rrt_ev *_e = &g_rrt_hw[(g_rrt_hw_i + _k) % RRT_N];
+			if (!_e->t) continue;
+			printk("%c%u:%u ", "?RWPS"[_e->t], (unsigned)_e->n, (unsigned)_e->us);
+		}
+		printk("\n");
 	  }
 	}
 	/* Stream one status line over USB-serial, but ONLY when a host has opened
@@ -11182,7 +11296,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 6\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 14\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
