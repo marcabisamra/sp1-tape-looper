@@ -7503,29 +7503,46 @@ static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 }
 
 static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
-			    const uint8_t *flash, uint32_t nblk)
+			    const uint8_t *flash, uint32_t nblk, int trk)
 {
-	uint32_t _s0 = start;   /* P16-522: per-block stride, as in p14s_unpack */
-	for (uint32_t b = 0; b < nblk; b++) {
+	/* REV-638 (W308): a burst read as [lo .. hi] plays BACKWARD, so the ring
+	 * gets block hi first -- descending, as codec_unpack_rev always did. Each
+	 * block is emitted time-reversed; its FIRST ring frame is the healed edge:
+	 * the midpoint of this block's last exact frame and the previously emitted
+	 * block's first exact frame (the next block in source order), carried per
+	 * destination ring in g_p14s_prev exactly like the forward heal, same
+	 * rounding. Geometry comes from the block header; trk is continuity only. */
+	uint32_t _s0 = start;
+	int32_t pl = g_p14s_prev[trk][0], pr = g_p14s_prev[trk][1];
+	for (uint32_t b = nblk; b-- > 0u; ) {
 		const uint8_t *blk = flash + b * EMMC_BLOCK_SIZE;
-		uint32_t _spb = (blk[11] == P14S_MARK && blk[2] == 0x36u) ? 496u : SAMP_PER_BLK;
 		if (blk[11] == P14S_MARK) {
+			const uint32_t _spb = (blk[2] == 0x36u) ? 496u : SAMP_PER_BLK;
 			if      (blk[2] == 0x36u) p16m_dec_scr(blk);   /* P16-522 */
 			else if (blk[2] == 0x34u) p14s_dec_scr(blk);
 			else    /* GS-531 (W144): mark present but FOREIGN sig -- a
 			         * future codec or cross-version content. SILENCE,
 			         * never garbage. */
 				memset(p14s_scr, 0, (size_t)_spb * 4u);
-			for (uint32_t f = 0; f < _spb; f++) {
+			{	/* frame 0 of the reversed block = the healed edge */
+				uint32_t fi = (_s0 & ring_mask) * 2u;
+				ring[fi]      = (int16_t)(((int32_t)p14s_scr[(_spb - 2u) * 2u]      + pl) >> 1);
+				ring[fi + 1u] = (int16_t)(((int32_t)p14s_scr[(_spb - 2u) * 2u + 1u] + pr) >> 1);
+			}
+			for (uint32_t f = 1; f < _spb; f++) {   /* then frames spb-2 .. 0 */
 				uint32_t fi = ((_s0 + f) & ring_mask) * 2u;
 				ring[fi]      = p14s_scr[(_spb - 1u - f) * 2u];
 				ring[fi + 1u] = p14s_scr[(_spb - 1u - f) * 2u + 1u];
 			}
+			pl = p14s_scr[0]; pr = p14s_scr[1];   /* this block's first exact frame heals the next emitted block */
+			_s0 += _spb;
 		} else {
 			codec_unpack_rev(ring, ring_mask, _s0, blk, 1u);
+			_s0 += SAMP_PER_BLK;
 		}
-		_s0 += _spb;
 	}
+	g_p14s_prev[trk][0] = (int16_t)pl;
+	g_p14s_prev[trk][1] = (int16_t)pr;
 }
 
 /* SHWFIX-627 (W304): the mask alone, for a SONG SWITCH on the streamer --
@@ -9182,7 +9199,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 						/* S2: ring already holds the shadow PCM */
 					} else if (hrev)
 						p14s_unpack_rev(t->pring, RING_MASK, pw & RING_MASK,
-						                 batchbuf, n);
+						                 batchbuf, n, i);   /* REV-638: i = continuity only */
 					else
 						p14s_unpack(t->pring, RING_MASK, pw & RING_MASK,
 						             batchbuf, n, i);
