@@ -7001,6 +7001,17 @@ extern uint8_t m54_tails[32][2];
 extern void emmc_m54_crc_init(void);
 extern uint16_t emmc_m54_crc16(const uint8_t *d, uint32_t n);
 static volatile uint32_t g_m71_as, g_m71_rt, g_m71_fb;
+/* CRCC-625 (W302): THE CRC CANARY. Every block is checked at <= CRCC_RATE_FULL
+ * blk/s (4 tracks x 1x = 686) and for CRCC_FULL_BLOCKS blocks after boot or any
+ * mismatch; above the rate, one block per read call at a rotating position.
+ * A systemic fault re-arms full checking by itself and shows as rt>0. */
+#define CRCC_RATE_FULL   720u
+#define CRCC_FULL_BLOCKS 4096u
+static uint32_t          g_crcc_full = CRCC_FULL_BLOCKS;   /* blocks still to check fully */
+static uint32_t          g_crcc_pick;                      /* rotating sampled position */
+static int64_t           g_crcc_w0;                        /* rate window start, ms */
+static uint32_t          g_crcc_wn, g_crcc_rate;           /* blocks this window; blk/s */
+static volatile uint32_t g_m71_vf, g_m71_sk;               /* blocks checked / left unchecked */
 static volatile uint32_t g_m71_ca, g_m71_rq, g_m71_rd, g_m71_wu;
 /* ==== PCM14S: the two-tier TAKE codec (design doc + script 459) ====
  * 24 kHz stereo 14-bit shaped. 512 B = 16 B hdr + 140 stored frames
@@ -7445,6 +7456,19 @@ static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
 	}
 }
 
+/* SHWFIX-627 (W304): the mask alone, for a SONG SWITCH on the streamer --
+ * no per-track writes (the control thread's restore path owns those). */
+static uint8_t p14s_mask_of(uint32_t slot)
+{
+	uint8_t m = 0u;
+	if (g_x3_ok && slot < NUM_SLOTS)
+		for (int xi = 0; xi < NTRK; xi++)
+			if (g_x3.t[slot][xi].codec_id == X3_CODEC_P14S ||
+			    g_x3.t[slot][xi].codec_id == X3_CODEC_P16M)
+				m |= (uint8_t)(1u << xi);
+	return m;
+}
+
 static void p14s_mask_from_x3(uint32_t slot)
 {
 	g_p14s_mask = 0;
@@ -7470,6 +7494,14 @@ static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
 	M73_T0();
 	int64_t _t0 = k_uptime_get();
 	g_m71_ca++; g_m71_rq += n;
+	{	/* CRCC-625: the read rate over ~half-second windows (one divide per window) */
+		g_crcc_wn += n;
+		int64_t _dtw = _t0 - g_crcc_w0;
+		if (_dtw >= 512) {
+			g_crcc_rate = (_dtw < 60000) ? (uint32_t)(((uint64_t)g_crcc_wn * 1000u) / (uint64_t)_dtw) : 0u;
+			g_crcc_wn = 0u; g_crcc_w0 = _t0;
+		}
+	}
 	static uint8_t m71_init;   /* 0 = not yet, 1 = ok */
 	if (!m71_init) {
 		emmc_m50_setup();
@@ -7492,11 +7524,21 @@ static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
 			r = emmc_m50_wait(300);
 			if (r != 1) continue;
 			bad = -1;
-			for (uint32_t bi = 0; bi < c; bi++) {
-				uint16_t cc = emmc_m54_crc16(dst + bi * 512u, 512u);
-				uint16_t tb = (uint16_t)((m54_tails[bi][0] << 8) |
-							  m54_tails[bi][1]);
-				if (cc != tb) { bad = (int)bi; break; }
+			{	/* CRCC-625 (W302): the canary -- every block below the rate or while
+				 * re-armed, else one rotating block per call; a mismatch retries the
+				 * turn fully checked (the attempt loop) and re-arms full checking */
+				const bool _full = (g_crcc_full != 0u) || (g_crcc_rate <= CRCC_RATE_FULL);
+				const uint32_t _pick = g_crcc_pick++ % c;
+				for (uint32_t bi = 0; bi < c; bi++) {
+					if (!_full && bi != _pick) { g_m71_sk++; continue; }
+					uint16_t cc = emmc_m54_crc16(dst + bi * 512u, 512u);
+					uint16_t tb = (uint16_t)((m54_tails[bi][0] << 8) |
+								  m54_tails[bi][1]);
+					if (cc != tb) { bad = (int)bi; break; }
+					g_m71_vf++;
+				}
+				if (bad >= 0) g_crcc_full = CRCC_FULL_BLOCKS;
+				else if (g_crcc_full) g_crcc_full = (g_crcc_full > c) ? (g_crcc_full - c) : 0u;
 			}
 			if (bad < 0) good = 1;
 		}
@@ -7978,6 +8020,12 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 			}
 			if (_had) g_shw_inv++;
 			g_shw_slot = slot;
+			/* SHWFIX-627 (W304): the P14S mask follows the SONG. It was
+			 * computed once at boot for the boot song, so a switch to a
+			 * song with more takes left their bits clear and the builder
+			 * A7-decoded P14S blocks into a garbage shadow -- marc's
+			 * loud white-noise track after song-to-song browsing. */
+			g_p14s_mask = p14s_mask_of(slot);
 		  }
 		}
 		{ /* ==== DMP-466: ONE-SHOT TAKE-BLOCK DUMP (diagnostic; READS ONLY).
@@ -8066,7 +8114,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					if (_i3 == g_rec_track) continue;
 					/* P14S: raw tracks need no shadow -- and building one
 					 * would A7-decode raw blocks into garbage. */
-					if (g_p14s_mask & (1u << _i3)) continue;
+					if (g_p14s_mask & (1u << _i3)) { g_shw_skip++; continue; }   /* SHWFIX-627: counted */
 					struct looptrk *_tr = &trk[_i3];
 					uint32_t _len = _tr->len_samps;
 					uint32_t _wmf = g_shw_wm[_i3];
@@ -8079,6 +8127,15 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					if (_ab + _k > _gb3) _k = _gb3 - _ab;
 					if (!emmc_read_blocks_fast(trk_blk(slot, (uint32_t)_i3) + _ab,
 					                           batchbuf, _k)) break;
+					if (batchbuf[0] == 0x50u && batchbuf[1] == 0x31u &&
+					    (batchbuf[2] == 0x34u || batchbuf[2] == 0x36u)) {
+						/* SHWFIX-627 (W304): a P14S/P16M block. NEVER A7-decode it --
+						 * that is the white-noise shadow. Set the bit and move on. */
+						g_p14s_mask |= (uint8_t)(1u << _i3);
+						g_shw_skip++;
+						s3_rr = (uint8_t)(_i3 + 1);
+						break;
+					}
 					int16_t *_dr = (int16_t *)(batchbuf + 4096u);
 					uint8_t *_sb3 = (uint8_t *)(batchbuf + 8192u);
 					/* S8Q gather: 250 stereo frames = 1000 B in the free
@@ -9342,7 +9399,12 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 		g_grid_ref_nf = nf; g_grid_ref_spd = g_play_speed_q16;
 		return;
 	}
-	const uint32_t s = g_loop_active ? g_cur_speed_q16 : g_play_speed_q16;
+	/* GRIDFIX-626 (W303): follow the smoothed speed only while the transport
+	 * RUNS and the speed is inside the tape's range -- a pause ramps
+	 * g_cur_speed_q16 to 0 and 625 followed it to a 38-million-frame beat.
+	 * Stopped, the grid is the decks' clock at the setting, as in 616. */
+	const uint32_t s = (g_playing && g_loop_active && g_cur_speed_q16 >= 32768u)
+	                 ? g_cur_speed_q16 : g_play_speed_q16;
 	if (!s || !g_grid_ref_spd) return;
 	uint32_t want = (uint32_t)(((uint64_t)g_grid_ref_nf * g_grid_ref_spd + s / 2u) / s);
 	if (want < 1u) want = 1u;
@@ -9449,7 +9511,8 @@ static void audio_thread(void *a, void *b, void *c)
 			uint32_t _s = g_starve_cnt[0] + g_starve_cnt[1] + g_starve_cnt[2] + g_starve_cnt[3];
 			g_fxs_blk[_k]++;
 			g_fxs_stv[_k] += _s - g_fxs_prev;  g_fxs_prev = _s;
-			g_fxs_dry[_k] += (uint32_t)trk[0].starved + trk[1].starved + trk[2].starved + trk[3].starved;
+			if (g_playing)   /* GRIDFIX-626 (W303): a starved flag parked across a STOP is not a dropout */
+				g_fxs_dry[_k] += (uint32_t)trk[0].starved + trk[1].starved + trk[2].starved + trk[3].starved;
 		}
 
 		int wrc = i2s_write(i2s_dev, blk, BLK_BYTES);
@@ -10060,19 +10123,20 @@ static void controls_diag(void)
 		       (unsigned)trk[0].len_samps, (unsigned)trk[0].start_samps);
 	}
 	{ /* M71: async-read health, once per diag cycle (deltas) */
-	  static uint32_t _p_as, _p_rt, _p_fb; uint32_t _d = 0;
+	  static uint32_t _p_as, _p_rt, _p_fb, _p_vf, _p_sk; uint32_t _d = 0;
 	  (void)uart_line_ctrl_get(cdc, UART_LINE_CTRL_DTR, &_d);
 	  if (_d) {
 		static uint32_t _p_ca, _p_rq, _p_rd, _p_wu;
-		printk("M71,as=%u,rt=%u,fb=%u,ca=%u,rq=%u,rd=%u,wu=%u,ovf=%u\n",
+		printk("M71,as=%u,rt=%u,fb=%u,ca=%u,rq=%u,rd=%u,wu=%u,ovf=%u,vf=%u,sk=%u,cr=%u\n",   /* CRCC-625: checked, unchecked, read rate */
 		       (unsigned)(g_m71_as - _p_as),
 		       (unsigned)(g_m71_rt - _p_rt),
 		       (unsigned)(g_m71_fb - _p_fb),
 		       (unsigned)(g_m71_ca - _p_ca),
 		       (unsigned)(g_m71_rq - _p_rq),
 		       (unsigned)(g_m71_rd - _p_rd),
-		       (unsigned)(g_m71_wu - _p_wu), (unsigned)g_prime_ovf);
-		_p_as = g_m71_as; _p_rt = g_m71_rt; _p_fb = g_m71_fb;
+		       (unsigned)(g_m71_wu - _p_wu), (unsigned)g_prime_ovf,
+		       (unsigned)(g_m71_vf - _p_vf), (unsigned)(g_m71_sk - _p_sk), (unsigned)g_crcc_rate);
+		_p_as = g_m71_as; _p_rt = g_m71_rt; _p_fb = g_m71_fb; _p_vf = g_m71_vf; _p_sk = g_m71_sk;
 		_p_ca = g_m71_ca; _p_rq = g_m71_rq; _p_rd = g_m71_rd; _p_wu = g_m71_wu;
 	  }
 	}
@@ -11118,7 +11182,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 0\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 6\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and

@@ -284,26 +284,28 @@ static void crc16_tab_init(void)
 __attribute__((optimize("O2")))
 static uint16_t crc16(const uint8_t *data, uint32_t len)
 {
-	uint16_t crc = 0;
+	/* CRC4-625 (W302): four 4-byte steps per loop and a 32-bit running
+	 * value. The four table entries are 16-bit, so their XOR never exceeds
+	 * 16 bits and (crc << 16) needs no mask -- the per-step uxth is gone
+	 * with three of every four compare+branch pairs. Bit-identical to the
+	 * slice-by-4 loop it replaces (proven on the host in the build). */
+	uint32_t crc = 0;
 	uint32_t i = 0;
-	/* Four bytes per pass. The block is MSB-first on the wire, so the
-	 * 32-bit load is byte-swapped before it folds in. The Cortex-M4
-	 * handles the unaligned case in hardware. __builtin_memcpy keeps
-	 * this strictly conforming and still compiles to one LDR. The tail
-	 * loop is the original code and covers any length. */
-	while (len - i >= 4u) {
-		uint32_t w;
-		__builtin_memcpy(&w, data + i, 4);
-		uint32_t t = ((uint32_t)crc << 16) ^ __builtin_bswap32(w);
-		crc = (uint16_t)(s_crc16_t3[(t >> 24) & 0xFFu] ^
-				 s_crc16_t2[(t >> 16) & 0xFFu] ^
-				 s_crc16_t1[(t >>  8) & 0xFFu] ^
-				 s_crc16_tab[t & 0xFFu]);
-		i += 4u;
+#define CRC16_S4(off) do { \
+		uint32_t _w; __builtin_memcpy(&_w, data + i + (off), 4); \
+		uint32_t _t = (crc << 16) ^ __builtin_bswap32(_w); \
+		crc = (uint32_t)s_crc16_t3[(_t >> 24) & 0xFFu] ^ (uint32_t)s_crc16_t2[(_t >> 16) & 0xFFu] ^ \
+		      (uint32_t)s_crc16_t1[(_t >>  8) & 0xFFu] ^ (uint32_t)s_crc16_tab[_t & 0xFFu]; \
+	} while (0)
+	while (len - i >= 16u) {
+		CRC16_S4(0u); CRC16_S4(4u); CRC16_S4(8u); CRC16_S4(12u);
+		i += 16u;
 	}
+	while (len - i >= 4u) { CRC16_S4(0u); i += 4u; }
+#undef CRC16_S4
 	for (; i < len; i++)
-		crc = (uint16_t)((crc << 8) ^ s_crc16_tab[(crc >> 8) ^ data[i]]);
-	return crc;
+		crc = (uint32_t)(uint16_t)((crc << 8) ^ s_crc16_tab[((crc >> 8) ^ data[i]) & 0xFFu]);
+	return (uint16_t)crc;
 }
 
 static bool send_command(uint8_t cmd_index, uint32_t arg, uint8_t *r1_out)
