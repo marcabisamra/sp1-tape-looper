@@ -1580,8 +1580,50 @@ static volatile int      g_restart_req;            /* main -> engine: hold PLAY 
  * the streamer's fill math only: recorded audio, loop lengths, beat grid and
  * MIDI clock are untouched; div=1/off=0 is bit-identical to the original
  * math. Persisted per song since M7a (index chop[] bytes). */
-static volatile uint32_t g_chop_div = 1;           /* 1,2,4,... 64 (1 = full loop) */
+static volatile uint32_t g_chop_div = 1;           /* 1,2,4,... CHOP_DIV_MAX (1 = full loop) */
 static volatile uint32_t g_chop_off = 0;           /* window index: 0..div-1 */
+/* CHOPCAP-690 (row 132): the window may now shrink all the way to ONE
+ * block. Card bytes chop[slot][0..1] stay uint8: a value < 0x80 in [0]
+ * is the legacy literal div (1..64) with [1] the offset, unchanged for
+ * every card written so far and for older firmware reading a song that
+ * never went past 64. Past 64 the byte is 0x80 | log2(div) (bits 0-3)
+ * with offset bits 8-10 in bits 4-6 and the low 8 in [1]. Older
+ * firmware sees > 64 and falls back to div 1, nothing worse. */
+#define CHOP_DIV_MAX 1024u
+static void chop_meta_decode(const uint8_t *c, uint32_t *d, uint32_t *o)
+{
+	uint32_t cd, co;
+	if (c[0] & 0x80u) {
+		cd = 1u << (c[0] & 0x0Fu);
+		co = (((uint32_t)(c[0] >> 4) & 7u) << 8) | c[1];
+	} else {
+		cd = c[0]; co = c[1];
+	}
+	if (cd < 1u || cd > CHOP_DIV_MAX) cd = 1u;
+	if (co >= cd) co = 0u;
+	*d = cd; *o = co;
+}
+static void chop_meta_encode(uint8_t *c, uint32_t d, uint32_t o)
+{
+	if (d <= 64u && o <= 255u) { c[0] = (uint8_t)d; c[1] = (uint8_t)o; return; }
+	uint32_t l = 0u;
+	while ((1u << l) < d) l++;
+	c[0] = (uint8_t)(0x80u | (l & 0x0Fu) | (((o >> 8) & 7u) << 4));
+	c[1] = (uint8_t)o;
+}
+/* Largest useful div: the window can't be finer than one block, so stop
+ * doubling once the grid (or, gridless, the longest track) is exhausted.
+ * Never below the old 64 so nothing that worked before is refused. */
+static uint32_t chop_div_cap(void)
+{
+	uint32_t ref = g_loop_blocks;
+	if (!ref)
+		for (int i = 0; i < NTRK; i++)
+			if (trk[i].len_blocks > ref) ref = trk[i].len_blocks;
+	uint32_t cap = 64u;
+	while (cap < CHOP_DIV_MAX && (cap << 1) <= ref) cap <<= 1;
+	return cap;
+}
 static volatile int      g_chop_req;               /* main -> engine: window changed, snap rings */
 static volatile uint8_t  g_chop_defer;             /* M24: a CONTINUOUS window gesture is in
                                                     * progress — accumulate the edits and pay
@@ -2922,7 +2964,7 @@ static volatile uint32_t g_wbj, g_wbx;
  *   stv = starve EVENTS (entries into silence)
  *   dry = track-blocks spent SILENT (what the ear hears -- W274)
  *   blk = mixer blocks in this class            17 x 3 x 4 B = 204 B */
-#define FXS_N 18u   /* 0 none, 1-16 one effect (16 = reverb, REVERB-676), 17 = more than one */
+#define FXS_N 19u   /* 0 none, 1-17 one effect (16 = reverb, REVERB-676; 17 = eq, EQ-691), 18 = more than one */
 static uint32_t g_fxs_stv[FXS_N], g_fxs_dry[FXS_N], g_fxs_blk[FXS_N];
 static uint32_t g_fxs_aus[FXS_N];   /* WOBCLAMP-681 FXA: worst looper_audio_block us per class */
 static uint32_t g_fxs_prev;
@@ -3037,6 +3079,54 @@ static int16_t  g_ec2_line[EC2_LINE];
 static uint32_t g_ec2_w;             /* line write index, 0..EC2_LINE-1 */
 static uint8_t  g_ec2_live;          /* the line holds CURRENT audio (cleared on engage) */
 static volatile uint8_t g_rv_mix;    /* REVERB-676: page 3 fader 4: 0 = dry and the kernel is skipped */
+/* EQ-691: PAGE 5, the global EQ. g_eq_g[b] = fader (128 = flat, A1 deadband);
+ * g_eq_k[b] = the running gain (Q8, 0 = flat) the chain ramps toward the fader;
+ * g_eq_live = the wrapper must run the page-5 group (set by the controls thread
+ * on any write, cleared by the chain once every band has landed flat). */
+static volatile uint8_t g_eq_g[4] = { 128u, 128u, 128u, 128u };
+static volatile uint8_t g_eq_live;
+static int32_t g_eq_k[4];
+static int32_t g_eq_lo[4][2], g_eq_bp[4][2];   /* SVF state per band, L/R */
+static const int32_t eq_f_q30[4] = { 213 << 16, 750 << 16, 3406 << 16, 6680 << 16 };   /* EQ2-692: Q30 = Q14 << 16; shelves 1 - exp(-2 pi fc / 48k) at 100 / 4000 Hz, peaks 2 sin(pi fc / 48k) at 350 / 1600 Hz */
+static inline __attribute__((always_inline)) int32_t eq_k_from(uint32_t v)
+{
+	if (v >= 120u && v <= 136u) return 0;
+	int32_t d = (int32_t)v - 128;
+	return (d > 0) ? d * 4 : (d * 3) / 2;   /* +508 (+9.5 dB) .. -192 (-12 dB), Q8 */
+}
+/* EQ2-692: (a * b) >> 32 is ONE smmul on the M4; the operand << 2 restores the
+ * Q14 step exactly (d < 2^22 on the bus, no overflow). Always inlined (W-677). */
+#define EQ_STEP(fq30, d) ((int32_t)(((int64_t)(fq30) * ((int32_t)(d) << 2)) >> 32))
+/* the SHELF pair on one channel: band 0 (low, one pole lp) + band 3 (high, one pole hp) */
+static inline __attribute__((always_inline)) void eq_shelf_pair(int32_t *m, int32_t *st0, int32_t *st3, int32_t k0, int32_t k3)
+{
+	const int32_t f0 = eq_f_q30[0], f3 = eq_f_q30[3];
+	int32_t lo0 = *st0, lo3 = *st3;
+	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+		const int32_t x = m[f];
+		lo0 += EQ_STEP(f0, x - lo0);
+		const int32_t x1 = x + (((lo0 >> 2) * k0) >> 6);   /* cascade, as 691 */
+		lo3 += EQ_STEP(f3, x1 - lo3);
+		m[f] = x1 + ((((x1 - lo3) >> 2) * k3) >> 6);
+	}
+	*st0 = lo0; *st3 = lo3;
+}
+/* the PEAK pair on one channel: bands 1 + 2, the M63a Chamberlin SVF, bandpass out */
+static inline __attribute__((always_inline)) void eq_peak_pair(int32_t *m, int32_t *lo1p, int32_t *bp1p, int32_t *lo2p, int32_t *bp2p, int32_t k1, int32_t k2)
+{
+	const int32_t f1 = eq_f_q30[1], f2 = eq_f_q30[2];
+	int32_t lo1 = *lo1p, bp1 = *bp1p, lo2 = *lo2p, bp2 = *bp2p;
+	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+		const int32_t x = m[f];
+		lo1 += EQ_STEP(f1, bp1);
+		bp1 += EQ_STEP(f1, x - lo1 - bp1);
+		const int32_t x1 = x + (((bp1 >> 2) * k1) >> 6);   /* cascade, as 691 */
+		lo2 += EQ_STEP(f2, bp2);
+		bp2 += EQ_STEP(f2, x1 - lo2 - bp2);
+		m[f] = x1 + (((bp2 >> 2) * k2) >> 6);
+	}
+	*lo1p = lo1; *bp1p = bp1; *lo2p = lo2; *bp2p = bp2;
+}
 
 /* FXRST-563: ONE gesture puts every effect back to neutral.
  * Deliberately does NOT touch page 8 (mono/stereo) -- that is a record
@@ -3054,6 +3144,8 @@ static void fx_reset_all(void)
         /* RSTFIX-582 (W271): the reset predates the echo (568) and the tape page
          * (569); marc: "FN + T1 + T4 is resetting all the FX except page 4". */
         g_ec_mix = 0u;  g_ec_div = 0u;  g_rv_mix = 0u;   /* REVERB-676 */
+        for (int _b = 0; _b < 4; _b++) g_eq_g[_b] = 128u;   /* EQ-691: flat; the chain ramps down */
+        g_eq_live = 1u;
         g_tp_drive = 0u;  g_tp_tone = 128u;  g_tp_hiss = 0u;  g_tp_wob = 0u;
         /* STACKA-664: the reset also clears every tapped rate, division and type */
         for (int _l = 0; _l < 7; _l++) g_lane_per[_l] = 0u;   /* WOBTAP-675: 7 lanes */
@@ -3599,6 +3691,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 	 * ramps step once per BLOCK whatever the number of calls. */
 	const int rp1 = (pm & 1u) ? 1 : 0, rp2 = (pm & 2u) ? 1 : 0;
 	const int rp3 = (pm & 4u) ? 1 : 0, rp4 = (pm & 8u) ? 1 : 0;
+	const int rp5 = (pm & 16u) ? 1 : 0;   /* EQ-691: the wrapper's BOTH call only */
 	static uint32_t _infx_clk = 0xFFFFFFFFu;
 	const int _first = (_infx_clk != (uint32_t)g_sample_clock);
 	_infx_clk = (uint32_t)g_sample_clock;
@@ -3712,6 +3805,21 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		const int32_t rv_mix = (!rp3 || (g_ec_mix != 0u && g_ec_div < 3u)) ? 0 : (int32_t)g_rv_mix;
 		int rv_n = 0;
 		int32_t rv_krt = 0, rv_wet = 0;
+		/* EQ-691 per-block: ramp each band's gain toward its fader (16 Q8 steps a
+		 * block, a full throw in ~170 ms); the group runs while any band is off flat
+		 * or still landing, and hands the wrapper's gate back once all four are 0. */
+		int eq_n = 0;
+		if (rp5) {
+			for (int _b = 0; _b < 4; _b++) {
+				const int32_t _t = eq_k_from(g_eq_g[_b]);
+				int32_t _k = g_eq_k[_b];
+				if (_k < _t) { _k += 16; if (_k > _t) _k = _t; }
+				else if (_k > _t) { _k -= 16; if (_k < _t) _k = _t; }
+				g_eq_k[_b] = _k;
+				if (_k != 0 || _t != 0) eq_n = 1;
+			}
+			if (!eq_n) g_eq_live = 0u;
+		}
 		if (rv_mix) {
 			rv_krt = 128 + ((rv_mix * 122) >> 8);   /* 0.5 (a room) .. 0.98 (a hall that barely dies) */
 			rv_wet = rv_mix >> 1;                    /* wet tops out at -6 dB, like the echo */
@@ -3867,7 +3975,8 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		                || (fx2_lfo_on != 0)
 		                || (rng_d != 0)    || (awh_d != 0)
 		                || (phs_d != 0)    || (tp_any != 0)    || (ec_n != 0)
-		                || (rv_n != 0);   /* RVFIX-678: the reverb runs on its own */
+		                || (rv_n != 0)    /* RVFIX-678: the reverb runs on its own */
+		                || (eq_n != 0);   /* EQ-691 (W323: a gated stage adds its term) */
 		/* ==== EFXM-586: EFFECT-MAJOR PASS C (W279) ====
 		 * 585's sweep: every PASS C effect cost the same ~50% of track-time
 		 * silent at the corner -- gate (4 cyc of math) = distortion (45) --
@@ -4335,6 +4444,16 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			}
 			g_rv_pl = _pL; g_rv_pr = _pR;
 		}
+		if (eq_n) {   /* EQ-691: page 5, last in the chain -- a master control; EQ2-692: pair loops */
+			if (g_eq_k[0] | g_eq_k[3]) {
+				eq_shelf_pair(mix32,  &g_eq_lo[0][0], &g_eq_lo[3][0], g_eq_k[0], g_eq_k[3]);
+				eq_shelf_pair(mix32R, &g_eq_lo[0][1], &g_eq_lo[3][1], g_eq_k[0], g_eq_k[3]);
+			}
+			if (g_eq_k[1] | g_eq_k[2]) {
+				eq_peak_pair(mix32,  &g_eq_lo[1][0], &g_eq_bp[1][0], &g_eq_lo[2][0], &g_eq_bp[2][0], g_eq_k[1], g_eq_k[2]);
+				eq_peak_pair(mix32R, &g_eq_lo[1][1], &g_eq_bp[1][1], &g_eq_lo[2][1], &g_eq_bp[2][1], g_eq_k[1], g_eq_k[2]);
+			}
+		}
 		if (swp_d) g_lfo_ph[1] += (uint32_t)BLK_FRAMES * swp_inc;   /* A3 */
 		if (trm_d) g_lfo_ph[2] += (uint32_t)BLK_FRAMES * trm_inc;   /* A3 */
 		(void)lfo_base; (void)lfo_on;   /* A3: the shared phase is the chorus's now */
@@ -4466,6 +4585,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		fx_chain_run(mix32, mix32R, pm_trk);
 		for (uint32_t f = 0; f < lg; f++) { mix32[f] += lv[2u * f]; mix32R[f] += lv[2u * f + 1u]; }
 	}
+	if (g_eq_live) pm_both |= 16u;   /* EQ-691: page 5 is always on the MIX */
 	if (pm_both) fx_chain_run(mix32, mix32R, pm_both);
 	/* monitor mute (pages mode): a gain on the live pair only, ramped over
 	 * ~4 blocks so the toggle never clicks; the recorder never sees it */
@@ -6463,9 +6583,8 @@ static void xfer_commit(void)
 			memcpy(g_meta.chop, keep_chop, sizeof(keep_chop));
 			memcpy(g_meta.song_mode, keep_mode, sizeof(keep_mode));
 			if (g_slot < NUM_SLOTS) {   /* reload effective for current song */
-				uint32_t cd = g_meta.chop[g_slot][0];
-				if (cd < 1u || cd > 64u) cd = 1u;
-				uint32_t co = g_meta.chop[g_slot][1]; if (co >= cd) co = 0u;
+				uint32_t cd, co;
+				chop_meta_decode(g_meta.chop[g_slot], &cd, &co);   /* CHOPCAP-690 */
 				g_chop_div = cd; g_chop_off = co;
 				g_fixed_len = (g_meta.song_mode[g_slot] & 0x0Fu)
 					    ? ((g_meta.song_mode[g_slot] & 0x0Fu) == 2u ? 1u : 0u)
@@ -9641,8 +9760,10 @@ static void audio_thread(void *a, void *b, void *c)
 			_FXS(g_tp_drive >= 32u, 12u); _FXS(g_tp_tone >= 160u || g_tp_tone <= 96u, 13u);
 			_FXS(g_tp_hiss  >= 32u, 14u); _FXS(g_tp_wob >= 32u, 15u);
 			_FXS(g_rv_mix   >= 32u, 16u);   /* REVERB-676 */
+			_FXS(g_eq_g[0] >= 160u || g_eq_g[0] <= 96u || g_eq_g[1] >= 160u || g_eq_g[1] <= 96u ||
+			     g_eq_g[2] >= 160u || g_eq_g[2] <= 96u || g_eq_g[3] >= 160u || g_eq_g[3] <= 96u, 17u);   /* EQ-691 */
 			#undef _FXS
-			uint32_t _k = (_n == 0u) ? 0u : (_n == 1u) ? _c : 17u;
+			uint32_t _k = (_n == 0u) ? 0u : (_n == 1u) ? _c : 18u;
 			uint32_t _s = g_starve_cnt[0] + g_starve_cnt[1] + g_starve_cnt[2] + g_starve_cnt[3];
 			g_fxs_blk[_k]++;
 			if (_cus > g_fxs_aus[_k]) g_fxs_aus[_k] = _cus;   /* FXA */
@@ -10154,7 +10275,7 @@ static void controls_diag(void)
 		       (unsigned)g_stv_lo, (unsigned)g_stv_up,
 		       (unsigned)g_stv_cx, (unsigned)g_stv_pf, (unsigned)g_stv_re,
 		       (unsigned)g_rw_hw);
-		/* FXSTAT2-585: 18 x starves/dry/blocks, one class per field (676: 16 = reverb, 17 = MULTI) */
+		/* FXSTAT2-585: 19 x starves/dry/blocks, one class per field (676: 16 = reverb; 691: 17 = eq, 18 = MULTI) */
 		printk("FXS2");
 		for (uint32_t _k = 0; _k < FXS_N; _k++)
 			printk(",%u/%u/%u", (unsigned)g_fxs_stv[_k], (unsigned)g_fxs_dry[_k], (unsigned)g_fxs_blk[_k]);
@@ -11025,8 +11146,8 @@ static void led_service(void)
 	for (int i = 0; i < NTRK; i++)
 		if (trk[i].state != TS_EMPTY) active = 1;
 
-	if (!(g_pg_open && g_pg_id >= 1u && g_pg_id <= 4u) || g_pg_sweep || g_pg_exit)
-		track_level_rest();   /* STACKA-664 A6: only the four FX pages set levels */
+	if (!(g_pg_open && g_pg_id >= 1u && g_pg_id <= 5u) || g_pg_sweep || g_pg_exit)
+		track_level_rest();   /* STACKA-664 A6: only the FX pages set levels (EQ-691: and page 5) */
 	if (g_pg_sweep) {
 		show_page_sweep();   /* LED-549 r9: the activation sweep owns the
 		                      * track row until it lands on the page's own
@@ -11057,8 +11178,12 @@ static void led_service(void)
 		/* A6: depth; tone (A1) is bipolar with a 120..136 deadband; the hiss is 655's */
 		const uint32_t _lv[4] = { g_tp_drive, bipolar_depth(g_tp_tone), g_tp_hiss, g_tp_wob };
 		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
-	} else if (g_pg_open && g_pg_id >= 5u && g_pg_id <= 7u) {
-		/* PG8-560: pages 4-7 are RESERVED (tape / EQ / place / take+timing)
+	} else if (g_pg_open && g_pg_id == 5u) {
+		/* EQ-691: PAGE 5 VIEW -- four bands, LED = |gain| (bipolar, A1's deadband). */
+		const uint32_t _lv[4] = { bipolar_depth(g_eq_g[0]), bipolar_depth(g_eq_g[1]), bipolar_depth(g_eq_g[2]), bipolar_depth(g_eq_g[3]) };
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
+	} else if (g_pg_open && g_pg_id >= 6u && g_pg_id <= 7u) {
+		/* PG8-560: pages 6-7 are RESERVED (place / take+timing; 5 = EQ since 691)
 		 * and are not built yet. A reserved page shows a DARK row and
 		 * swallows track taps. Until this stage it showed the MODE page and
 		 * a tap silently rewrote a track's next-record codec (W212) -- the
@@ -11451,7 +11576,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 14\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 4\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -11607,8 +11732,8 @@ static void jump_to_slot(uint32_t ns)
 	if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
 	if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
 	{	/* M7: restore the target song's persisted chop + effective mode */
-		uint32_t cd = g_meta.chop[ns][0]; if (cd < 1u || cd > 64u) cd = 1u;
-		uint32_t co = g_meta.chop[ns][1]; if (co >= cd) co = 0u;
+		uint32_t cd, co;
+		chop_meta_decode(g_meta.chop[ns], &cd, &co);   /* CHOPCAP-690 */
 		g_chop_div = cd; g_chop_off = co;
 		g_fixed_len = (g_meta.song_mode[ns] & 0x0Fu)
 			    ? ((g_meta.song_mode[ns] & 0x0Fu) == 2u ? 1u : 0u) : g_mode_pref;
@@ -11926,8 +12051,8 @@ int main(void)
 		g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u;   /* restore brightness mode */
 		g_instant_rec = (uint8_t)(((g_meta.led_full >> 1) & 1u) ? 0u : 1u);   /* M41-r5: bit 1 SET = classic */
 		{	/* M7: current song's persisted chop + effective mode */
-			uint32_t cd = g_meta.chop[g_slot][0]; if (cd < 1u || cd > 64u) cd = 1u;
-			uint32_t co = g_meta.chop[g_slot][1]; if (co >= cd) co = 0u;
+			uint32_t cd, co;
+			chop_meta_decode(g_meta.chop[g_slot], &cd, &co);   /* CHOPCAP-690 */
 			g_chop_div = cd; g_chop_off = co;
 			g_fixed_len = (g_meta.song_mode[g_slot] & 0x0Fu)
 				    ? ((g_meta.song_mode[g_slot] & 0x0Fu) == 2u ? 1u : 0u)
@@ -12289,8 +12414,7 @@ int main(void)
 							g_chop_off = 0u;
 							g_chop_div = d;
 							if (g_slot < NUM_SLOTS) {
-								g_meta.chop[g_slot][0] = (uint8_t)d;
-								g_meta.chop[g_slot][1] = 0u;
+								chop_meta_encode(g_meta.chop[g_slot], d, 0u);   /* CHOPCAP-690 */
 								g_meta_save_req = 1;
 							}
 							g_chop_req = 1;
@@ -12561,7 +12685,7 @@ int main(void)
 						uint32_t d = g_chop_div, o = g_chop_off;
 						if (vb == VOL_TEMPO_UP || vb == VOL_TEMPO_DOWN) {
 							if (vb == VOL_TEMPO_UP) {
-								if (d < 64u) { d <<= 1; o <<= 1; }
+								if (d < chop_div_cap()) { d <<= 1; o <<= 1; }   /* CHOPCAP-690 */
 							} else {
 								if (d > 1u) { d >>= 1; o >>= 1; }
 							}
@@ -12573,8 +12697,7 @@ int main(void)
 						g_chop_off = (d > 1u) ? (o % d) : 0u;
 						g_chop_div = d;
 						if (g_slot < NUM_SLOTS) { /* M7a: persist per song */
-							g_meta.chop[g_slot][0] = (uint8_t)d;
-							g_meta.chop[g_slot][1] = (uint8_t)g_chop_off;
+							chop_meta_encode(g_meta.chop[g_slot], d, g_chop_off);   /* CHOPCAP-690 */
 							g_meta_save_req = 1;
 						}
 						g_chop_req = 1;           /* engine: snap to it */
@@ -12597,7 +12720,7 @@ int main(void)
 						                    : (o2 + d2 - 1u) % d2;
 						g_chop_off = o2;
 						if (g_slot < NUM_SLOTS) {
-							g_meta.chop[g_slot][1] = (uint8_t)o2;
+							chop_meta_encode(g_meta.chop[g_slot], d2, o2);   /* CHOPCAP-690 */
 							g_meta_save_req = 1;  /* writer coalesces */
 						}
 						g_chop_defer = 1;   /* M24: glide is continuous */
@@ -12618,7 +12741,7 @@ int main(void)
 						 * EDGES, so repeats can never fake it. */
 						uint32_t d2 = g_chop_div, o2 = g_chop_off;
 						if (vb == VOL_TEMPO_UP) {
-							if (d2 < 64u) { d2 <<= 1; o2 <<= 1; }
+							if (d2 < chop_div_cap()) { d2 <<= 1; o2 <<= 1; }   /* CHOPCAP-690 */
 						} else {
 							if (d2 > 1u)  { d2 >>= 1; o2 >>= 1; }
 						}
@@ -12626,8 +12749,7 @@ int main(void)
 							g_chop_off = (d2 > 1u) ? (o2 % d2) : 0u;
 							g_chop_div = d2;
 							if (g_slot < NUM_SLOTS) {
-								g_meta.chop[g_slot][0] = (uint8_t)d2;
-								g_meta.chop[g_slot][1] = (uint8_t)g_chop_off;
+								chop_meta_encode(g_meta.chop[g_slot], d2, g_chop_off);   /* CHOPCAP-690 */
 								g_meta_save_req = 1;
 							}
 							g_chop_defer = 1;   /* M24 */
@@ -13605,7 +13727,14 @@ int main(void)
 						if (ti == 3) { g_tp_wob = 0u; g_lane_per[6] = 0u; }   /* WOBTAP-675: the kill also frees the wow (page 3's rule) */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
-					} else if (g_pg_open && g_pg_id >= 5u && g_pg_id <= 7u &&
+					} else if (g_pg_open && g_pg_id == 5u && g_rec_track < 0 &&
+					    !armed_press[ti]) {
+						/* EQ-691: a tap on page 5 = that band FLAT (the kill), the
+						 * pickup re-armed like every other page. */
+						g_eq_g[ti] = 128u; g_eq_live = 1u;
+						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
+						tap_deadline[ti] = 0;
+					} else if (g_pg_open && g_pg_id >= 6u && g_pg_id <= 7u &&
 					    g_rec_track < 0 && !armed_press[ti]) {
 						/* PG8-560: reserved page -- SWALLOW. Without this the
 						 * tap falls through to stop / mute / delete. */
@@ -13964,6 +14093,19 @@ int main(void)
 							g_flt_pos = (uint8_t)_q8;   /* ONE filter,
 							 * two handles: FN+fader-4 and this page fader
 							 * drive the SAME state (the map's decision) */
+					} else if (g_pg_open && g_pg_id == 5u) {
+						/* EQ-691: page 5 owns the faders, the same pickup law (W155). */
+						uint8_t _pv = g_eq_g[fi];
+						int _q8 = (int)((q > 255u) ? 255u : q);
+						if (g_fx_pick[fi]) {
+							int _d = _q8 - (int)_pv;
+							int _p = g_fx_lastq[fi];
+							g_fx_lastq[fi] = _q8;
+							if ((_d >= -6 && _d <= 6) ||
+							    (_p >= 0 && ((_p - (int)_pv > 0) != (_d > 0))))
+								g_fx_pick[fi] = 0;
+						}
+						if (!g_fx_pick[fi]) { g_eq_g[fi] = (uint8_t)_q8; g_eq_live = 1u; }
 					} else if (g_pg_open && g_pg_id == 4u) {
 						uint8_t _pv = (fi == 0) ? g_tp_drive
 						            : (fi == 1) ? g_tp_tone
