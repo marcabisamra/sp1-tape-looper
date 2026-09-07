@@ -807,7 +807,7 @@ static void codec_unpack(int16_t *ring, uint32_t ring_mask, uint32_t start,
 /* TUNE2-576 (W264): frames of HISTORY the streamer must leave behind the
  * read position, so the wobble's backward offset never wraps into the
  * future. Must exceed WOB_BASE_SAMP + WOB_WOW_PEAK + WOB_FLT_PEAK. */
-#define WOB_RING_RSV     768u   /* TUNE3-577: reach 672 < history 1048 */
+#define WOB_RING_RSV     0u     /* WOBBUS-673: the wobble left the ring; the streamer fills to the brim again */
 /* RA-491: how full a STARVED track's ring must get before it is
  * audible again. Was RING_SAMPLES/2 = 4096 frames = 14.6 blocks =
  * ~85 ms of SILENCE on that track for a ring that ran dry by TWO
@@ -973,7 +973,7 @@ static uint16_t x3_sum(const struct x3_tab *tb)
 	for (i = 0; i < n; i++) s = (uint16_t)(s + p[i]);
 	return s;
 }
-static int x3_valid(const struct x3_tab *tb)
+static inline __attribute__((always_inline)) int x3_valid(const struct x3_tab *tb)   /* X3RELOAD-677: 2 callers, both inline */
 {
 	return tb->magic == X3_MAGIC && tb->ver == X3_VER &&
 	       tb->sum == x3_sum(tb);
@@ -1772,7 +1772,7 @@ static uint32_t g_fx2_lfo;                 /* shared LFO phase, 32-bit wrap (A3:
 /* STACKA-664 A3/A4/A5: per-lane clocks and types (runtime only, cleared by the FX reset). */
 static uint32_t          g_lfo_ph[3];              /* A3: phaser / sweep / tremolo phase */
 static volatile uint8_t  g_lfo_div[3] = { 0u, 0u, 2u };   /* A3: 0 = beat, 1 = half, 2 = quarter */
-static volatile uint32_t g_lane_per[6];            /* A4: tapped period in engine frames; 0 = the grid. 0 gate 1 echo 2 phs 3 swp 4 trm 5 chorus */
+static volatile uint32_t g_lane_per[7];            /* A4: tapped period in engine frames; 0 = the grid. 0 gate 1 echo 2 phs 3 swp 4 trm 5 chorus 6 wobble (WOBTAP-675) */
 static volatile uint64_t g_lane_anc;               /* A4: the gate's tapped downbeat (sample clock) */
 static volatile uint8_t  g_dst_typ;                /* A5: 0 = soft (cubic), 1 = hard, 2 = fold, 3 = OFF */
 static int32_t  g_bcr_hL, g_bcr_hR;        /* sample-and-hold state */
@@ -1816,9 +1816,31 @@ static volatile uint32_t g_bt_n;     /* blocks PASS A has consumed */
  *              it together with g_rec_track, so it can never outlive
  *              the take it belongs to) */
 static volatile int8_t   g_bnc_arm = -1;
+static int64_t           g_bnc_arm_t;   /* TAPECOPY-684: uptime of the chord that armed (controls thread) */
+static int8_t            g_bk_trk_ctl = -1;   /* HOLDSTOP-686: the bounce's track, as the controls thread armed it */
+static int8_t            g_bk_hold_trk = -1;  /* HOLDSTOP-686: >= 0 while a HELD bounce waits for TN to come up */
+static volatile uint32_t g_bk_stop_pos;       /* SMPSTART-687: the transport position when the held bounce stopped */
 static volatile uint8_t  g_bnc_on;
 static volatile uint32_t g_bnc_prints;     /* diag: bounces armed since boot */
 static int16_t           g_bnc_live[BLK_FRAMES * 2u];   /* BNC3-605: the jack, saved for the monitor */
+/* ===== INFX-672: THE INPUT PATH (STACK D) ===== */
+#define RT_BOTH 0u
+#define RT_IN   1u
+#define RT_TRK  2u
+static volatile uint8_t  g_pg_route[9];              /* per page (1..4 used): RT_BOTH / RT_IN / RT_TRK */
+static int16_t           g_live_blk[BLK_FRAMES * 2u]; /* the jack, this block (was the mixer's tmp[]) */
+static volatile uint32_t g_live_got;                  /* frames of it that are real (the rest read as 0) */
+static volatile uint8_t  g_in_on;                     /* the input slot has work (controls thread) */
+static volatile uint8_t  g_mon_mute;                  /* pages mode: the live monitor out of the mix */
+static int32_t           g_mon_g_s = 256;             /* the mute's ramped gain, Q8 */
+static volatile uint8_t  g_rt_flash;                  /* status-row flashes pending (routing feedback) */
+static uint32_t          g_rt_tick;
+#define INW_N 768u                                    /* delay line, frames: > WOB_BASE_SAMP + peaks (672) */
+static int16_t           g_inw_line[INW_N * 2u];      /* 3,072 B: the monitor's wobble */
+static uint32_t          g_inw_w;
+static volatile uint32_t g_inw_blk, g_in_blk;        /* diag: blocks wobbled / blocks through the slot */
+static int32_t           mix32[BLK_FRAMES];           /* the LEFT bus (was the mixer's static local) */
+static int32_t           mix32R[BLK_FRAMES];          /* M63a: the RIGHT bus */
 #define BNC_PRE_HALF 4u   /* PRE-608: the pre-emphasis FIR's delay, bus samples */
 static int32_t           g_bnc_pre_hist[2][8];   /* PRE-608: the FIR's last 8 bus samples, L/R */
 static volatile uint8_t  g_bnc_anch;        /* the take's first REC block has been anchored */
@@ -1834,6 +1856,8 @@ static volatile uint32_t g_bk_blocks;     /* baked blocks committed this print *
 static uint32_t          s_bk_ph_next, s_bk_cons_next;   /* pack -> commit handoff */
 static volatile uint32_t g_bk_prints, g_bk_last_spd, g_bk_last_len, g_bk_capped;   /* diag */
 static volatile uint32_t g_bk_len;   /* TRUE-621: the loop in baked blocks, chosen at the stop (0 = derive at promotion) */
+static volatile uint8_t  g_bk_mode;  /* TAPECOPY-684: 0 undecided, 1 TAPE COPY (no bake), 2 SAMPLER (bake) */
+#define BK_DECIDE_MS 180             /* TAPECOPY-684: TN still down this long after the chord = sampler */
 static uint8_t           g_bnc_p16m_prev;   /* the target's next-record mode before the arm */
 static uint8_t           g_arm_gsh_prev;    /* the target's print gain before ANY arm (cancel restores) */
 #define BNC_GSH 2u   /* BNC2-604: a print is stored 12 dB down -- room for four
@@ -2898,8 +2922,9 @@ static volatile uint32_t g_wbj, g_wbx;
  *   stv = starve EVENTS (entries into silence)
  *   dry = track-blocks spent SILENT (what the ear hears -- W274)
  *   blk = mixer blocks in this class            17 x 3 x 4 B = 204 B */
-#define FXS_N 17u   /* 0 none, 1-15 one effect, 16 = more than one */
+#define FXS_N 18u   /* 0 none, 1-16 one effect (16 = reverb, REVERB-676), 17 = more than one */
 static uint32_t g_fxs_stv[FXS_N], g_fxs_dry[FXS_N], g_fxs_blk[FXS_N];
+static uint32_t g_fxs_aus[FXS_N];   /* WOBCLAMP-681 FXA: worst looper_audio_block us per class */
 static uint32_t g_fxs_prev;
 static uint32_t g_wb_lastpos;
 static uint32_t g_tp_rng   = 0x89abcdefu;
@@ -3011,6 +3036,7 @@ static volatile uint32_t g_ec_dly;   /* the COMPUTED delay, engine frames */
 static int16_t  g_ec2_line[EC2_LINE];
 static uint32_t g_ec2_w;             /* line write index, 0..EC2_LINE-1 */
 static uint8_t  g_ec2_live;          /* the line holds CURRENT audio (cleared on engage) */
+static volatile uint8_t g_rv_mix;    /* REVERB-676: page 3 fader 4: 0 = dry and the kernel is skipped */
 
 /* FXRST-563: ONE gesture puts every effect back to neutral.
  * Deliberately does NOT touch page 8 (mono/stereo) -- that is a record
@@ -3027,12 +3053,14 @@ static void fx_reset_all(void)
         g_phs_amt = 0u;  g_swp_amt = 0u;  g_trm_amt = 0u;
         /* RSTFIX-582 (W271): the reset predates the echo (568) and the tape page
          * (569); marc: "FN + T1 + T4 is resetting all the FX except page 4". */
-        g_ec_mix = 0u;  g_ec_div = 0u;
+        g_ec_mix = 0u;  g_ec_div = 0u;  g_rv_mix = 0u;   /* REVERB-676 */
         g_tp_drive = 0u;  g_tp_tone = 128u;  g_tp_hiss = 0u;  g_tp_wob = 0u;
         /* STACKA-664: the reset also clears every tapped rate, division and type */
-        for (int _l = 0; _l < 6; _l++) g_lane_per[_l] = 0u;
+        for (int _l = 0; _l < 7; _l++) g_lane_per[_l] = 0u;   /* WOBTAP-675: 7 lanes */
         g_lfo_div[0] = 0u; g_lfo_div[1] = 0u; g_lfo_div[2] = 2u;
         g_dst_typ = 0u;
+        for (int _r = 0; _r < 9; _r++) g_pg_route[_r] = RT_BOTH;   /* INFX-672 */
+        g_mon_mute = 0u;
         for (int _f = 0; _f < 4; _f++) {
                 g_fx_pick[_f]  = 1;
                 g_fx_lastq[_f] = -1;
@@ -3528,8 +3556,52 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
  * belongs to an effect: the per-block constants, the ramps, the trance
  * gate clock, the echo taps, and the 14 effect-major passes (EFXM-586,
  * bit-identical by harness). Pure code motion from the mixer. */
-static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mix32, int32_t *mix32R)
+static void __attribute__((noinline)) wob_tick_block(void);                                 /* WOBBUS-673 */
+/* ===== REVERB-676 (E1): the Clouds reverb, 12 kHz, IN THE SAME LINE (echo or reverb) =====
+ * Ten sub-lines end to end: 4 input diffusers, then per loop damping + 2 allpasses + a
+ * delay. Lengths are Clouds' at 32 kHz scaled to 12 kHz and then x0.57 to fit 4,608. */
+#define RV_N 10u
+static const uint16_t g_rv_len[RV_N]  = { 28u, 41u, 60u, 100u, 414u, 510u, 855u, 480u, 418u, 1182u };   /* RV2-680: sum 4088 <= 4096 */
+static const uint16_t g_rv_base[RV_N] = { 0u, 28u, 69u, 129u, 229u, 643u, 1153u, 2008u, 2488u, 2906u };
+#define RV_MASK 4095u                 /* RV2-680: one window of the line, one pointer (Clouds' FxEngine) */
+static uint32_t g_rv_w;              /* the shared write pointer, decrements per step */
+static int32_t  g_rv_lp1, g_rv_lp2;  /* the two loops' damping states */
+static int32_t  g_rv_pl, g_rv_pr;    /* last group's wet L/R (the interpolation's start) */
+static uint8_t  g_rv_live;           /* the line holds the REVERB (cleared on engage) */
+static inline __attribute__((always_inline)) int32_t rv_rd(uint32_t k) { return g_ec2_line[(g_rv_w + g_rv_base[k] + g_rv_len[k] - 1u) & RV_MASK]; }
+static inline __attribute__((always_inline)) void rv_wr(uint32_t k, int32_t v)
 {
+	g_ec2_line[(g_rv_w + g_rv_base[k]) & RV_MASK] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));   /* RV2-680: clamp, not the knee */
+}
+/* one 12 kHz step of the Clouds network: in = the mono sum, krt = loop feedback q8 */
+static inline __attribute__((always_inline)) void rv_step(int32_t in, int32_t krt, int32_t *oL, int32_t *oR)
+{
+	const int32_t kap = 160, klp = 179;   /* 0.625, 0.7 */
+	int32_t acc = in >> 2, t;   /* RV2-680: -12 dB into the network (x4 out) */
+#define RV_AP(k, s) t = rv_rd(k); acc += ((s) * kap * t) >> 8; rv_wr(k, acc); acc = (((-(s)) * kap * acc) >> 8) + t;
+	RV_AP(0u, 1) RV_AP(1u, 1) RV_AP(2u, 1) RV_AP(3u, 1)
+	const int32_t apout = acc;
+	acc = apout + ((krt * rv_rd(9u)) >> 8);
+	g_rv_lp1 += ((acc - g_rv_lp1) * klp) >> 8; acc = g_rv_lp1;
+	RV_AP(4u, -1) RV_AP(5u, 1)
+	rv_wr(6u, acc); *oL = acc;
+	acc = apout + ((krt * rv_rd(6u)) >> 8);
+	g_rv_lp2 += ((acc - g_rv_lp2) * klp) >> 8; acc = g_rv_lp2;
+	RV_AP(7u, 1) RV_AP(8u, -1)
+	rv_wr(9u, acc); *oR = acc;
+	g_rv_w = (g_rv_w - 1u) & RV_MASK;   /* RV2-680 */
+#undef RV_AP
+}
+static void __attribute__((optimize("O2"), noinline)) in_wobble_block(int32_t *bL, int32_t *bR);
+static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix32, int32_t *mix32R, uint32_t pm)
+{
+	/* INFX-672: pm = the pages this call runs (bit p-1 = page p). Per-block
+	 * ramps step once per BLOCK whatever the number of calls. */
+	const int rp1 = (pm & 1u) ? 1 : 0, rp2 = (pm & 2u) ? 1 : 0;
+	const int rp3 = (pm & 4u) ? 1 : 0, rp4 = (pm & 8u) ? 1 : 0;
+	static uint32_t _infx_clk = 0xFFFFFFFFu;
+	const int _first = (_infx_clk != (uint32_t)g_sample_clock);
+	_infx_clk = (uint32_t)g_sample_clock;
 		/* M17 DJ FILTER: mode + target coefficient from the fader once
 		 * per block; the coefficient RAMPS toward its target (~40 ms
 		 * across a big jump) so sweeps are zipperless. On a mode change
@@ -3559,7 +3631,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 				flt_lowL = (nm == 2u) ? 0 : mix32[0];
 				flt_lowR = (nm == 2u) ? 0 : mix32R[0];
 				flt_bandL = 0; flt_bandR = 0;
-			} else if (tf != flt_f) {
+			} else if (_first && tf != flt_f) {
 				int32_t fd = (tf - flt_f) >> 3;
 				if (fd == 0) fd = (tf > flt_f) ? 1 : -1;
 				flt_f += fd;
@@ -3570,7 +3642,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		 * full drive is ~8x in, with the trim taking ~6 dB back out. */
 		/* FX2-558 per-block constants -- hoisted so the frame loop only
 		 * branches on an int, never recomputes a shift table. */
-		const uint32_t bcr_hold = g_bcr_amt
+		const uint32_t bcr_hold = (rp2 && g_bcr_amt)
 		                        ? (1u + (((uint32_t)g_bcr_amt * 15u) >> 8)) : 0u;
 		const int32_t  bcr_mask = (int32_t)(0xFFFFFFFFu <<
 		                          (((uint32_t)g_bcr_amt * 8u) >> 8));
@@ -3581,20 +3653,20 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		                       : ((g_play_bpm > 0) ? (48000u * 60u / (uint32_t)g_play_bpm) : 24000u);
 		const uint32_t lane_p0 = g_lane_per[0], lane_p1 = g_lane_per[1];
 		const uint32_t lane_p2 = g_lane_per[2], lane_p3 = g_lane_per[3], lane_p4 = g_lane_per[4], lane_p5 = g_lane_per[5];
-		const int32_t  swp_d    = (g_lfo_div[1] >= 3u) ? 0 : (int32_t)g_swp_amt;   /* 660: division 3 = OFF */
-		const int32_t  trm_d    = (g_lfo_div[2] >= 3u) ? 0 : (int32_t)g_trm_amt;
+		const int32_t  swp_d    = (!rp3 || g_lfo_div[1] >= 3u) ? 0 : (int32_t)g_swp_amt;   /* 660: division 3 = OFF */
+		const int32_t  trm_d    = (!rp3 || g_lfo_div[2] >= 3u) ? 0 : (int32_t)g_trm_amt;
 		const int      fx2_lfo_on = (swp_d || trm_d) ? 1 : 0;
 		/* PG8-560 FX3 per-block constants. */
-		const int32_t  rng_d    = (int32_t)g_rng_amt;
-		const int32_t  awh_d    = (int32_t)g_awh_amt;
-		const int32_t  phs_d    = (g_lfo_div[0] >= 3u) ? 0 : (int32_t)g_phs_amt;   /* 660: division 3 = OFF */
+		const int32_t  rng_d    = rp2 ? (int32_t)g_rng_amt : 0;
+		const int32_t  awh_d    = rp2 ? (int32_t)g_awh_amt : 0;
+		const int32_t  phs_d    = (!rp3 || g_lfo_div[0] >= 3u) ? 0 : (int32_t)g_phs_amt;   /* 660: division 3 = OFF */
 		/* Ring carrier: ONE fader sets depth and pitch together, 40 Hz at the
 		 * bottom to ~1.2 kHz at the top. Low = growl, high = clangorous metal.
 		 * 2^32 / 48000 = 89478 phase units per Hz. */
 		const uint32_t rng_inc  = 3579139u + (uint32_t)g_rng_amt * 406000u;
 		/* ECHO2-610 per-block constants: the delay in LINE samples, the wet and
 		 * feedback gains, and the engage edge. Decided once per block. */
-		const int32_t  ec_mix = (g_ec_div >= 3u) ? 0 : (int32_t)g_ec_mix;   /* 660: the 4th tap state is OFF */
+		const int32_t  ec_mix = (!rp2 || g_ec_div >= 3u) ? 0 : (int32_t)g_ec_mix;   /* 660: the 4th tap state is OFF */
 		int ec_n = 0;
 		uint32_t ec2_d = 0u;             /* delay, 12 kHz line samples */
 		int32_t  ec2_fb = 0, ec2_wet = 0;
@@ -3629,10 +3701,30 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 				memset(g_ec2_line, 0, sizeof(g_ec2_line));
 				g_ec2_w = 0u;
 				g_ec2_live = 1u;
+				g_rv_live = 0u;   /* REVERB-676: the line is the echo's now */
 			}
 			ec_n = 1;
-		} else {
-			g_ec2_live = 0u;
+		} else if (rp2) {
+			g_ec2_live = 0u;   /* INFX-672: only the pass that owns the echo may disengage it */
+		}
+		/* REVERB-676 per-block constants: the echo (page 2 fader 4, not OFF) owns the line in
+		 * WHICHEVER pass it runs, so the gate reads the global, not this pass's ec_mix. */
+		const int32_t rv_mix = (!rp3 || (g_ec_mix != 0u && g_ec_div < 3u)) ? 0 : (int32_t)g_rv_mix;
+		int rv_n = 0;
+		int32_t rv_krt = 0, rv_wet = 0;
+		if (rv_mix) {
+			rv_krt = 128 + ((rv_mix * 122) >> 8);   /* 0.5 (a room) .. 0.98 (a hall that barely dies) */
+			rv_wet = rv_mix >> 1;                    /* wet tops out at -6 dB, like the echo */
+			if (!g_rv_live) {
+				memset(g_ec2_line, 0, sizeof(g_ec2_line));
+				g_rv_w = 0u;   /* RV2-680 */
+				g_rv_lp1 = 0; g_rv_lp2 = 0; g_rv_pl = 0; g_rv_pr = 0;
+				g_rv_live = 1u;
+				g_ec2_live = 0u;   /* the echo must clear when it comes back */
+			}
+			rv_n = 1;
+		} else if (rp3) {
+			g_rv_live = 0u;
 		}
 		/* TAPE-569 per-block constants. */
 		const int32_t tp_dr = 4096 + ((int32_t)g_tp_drive * 112);   /* 1.0x..7.97x */
@@ -3645,7 +3737,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		                                               * bat'. */
 		/* TUNE2-576: -12 dB. -38 dBFS at full was intrusive against quiet
 		 * loops; real tape hiss sits ~-50 dB below peak. */
-		const int32_t tp_hs = (int32_t)g_tp_hiss >> 3;   /* TUNE3-577: marc: between -- -6 dB from the original */
+		const int32_t tp_hs = rp4 ? ((int32_t)g_tp_hiss >> 3) : 0;   /* TUNE3-577: marc: between -- -6 dB from the original */
 		/* A1: the tone fader has a DEADBAND (120..136 = flat), so the LED that
 		 * lights on 'not 128' and the kernel that engages on 'not 128' agree with
 		 * the hand: a fader parked near the middle is flat and dark. */
@@ -3654,15 +3746,15 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		                                      : (256 + (128 - tp_tn));
 		const int32_t tp_ghi = (tp_tn >= 128) ? (256 + (tp_tn - 128) * 3)
 		                                      : (256 - (128 - tp_tn) * 2);
-		const int      tp_any = (g_tp_drive != 0u) || (g_tp_hiss != 0u)
-		                     || (tp_tn != 128);
+		const int      tp_any = rp4 && ((g_tp_drive != 0u) || (g_tp_hiss != 0u)
+		                     || (tp_tn != 128) || (g_tp_wob != 0u) || (g_wb_off != 0) || (g_wb_tgt != 0));   /* WOBBUS-673 */
 		/* ONE accumulator serves sweep, tremolo and the phaser. */
 		const int      lfo_on   = (swp_d || trm_d || phs_d) ? 1 : 0;
 		/* FX2-550: both new kernels are read ONCE per block into a local,
 		 * exactly like the filter and the distortion. Reading a volatile
 		 * inside the frame loop would re-load it 128 times and would also
 		 * let a fader move mid-block. */
-		const int32_t chr_mix = (int32_t)g_chr_mix;
+		const int32_t chr_mix = rp1 ? (int32_t)g_chr_mix : 0;
 		/* TG-551: the grid anchor, recomputed once per block.
 		 * g_grid_beat_frames is in OUTPUT frames -- the tape domain has its
 		 * own g_gridrec_beat_samps -- so this locks to WHAT YOU HEAR and
@@ -3675,7 +3767,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		const uint32_t tg_rate = g_gat_amt
 		                       ? (1u + (((uint32_t)g_gat_amt * 6u) >> 8)) : 0u;
 		uint32_t tg_sf = 0u;
-		if (tg_rate) {
+		if (tg_rate && rp1) {
 			uint32_t _bf = (g_grid_active && g_grid_beat_frames)
 			             ? g_grid_beat_frames
 			             : ((g_play_bpm > 0)
@@ -3697,7 +3789,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		/* r21: whenever the gate is not running -- fader down OR tapped to
 		 * OFF -- hand the gain back at UNITY. Without this a bypass taken
 		 * mid-close would leave the last partial gain applied forever. */
-		if (!tg_sf) g_gat_g = 4096;
+		if (!tg_sf && rp1) g_gat_g = 4096;   /* INFX-672: the other pass must not reset the gate's ramp */
 		static int32_t dst_g_s;
 		{
 			/* DST-548 r2 (marc: "make it more obvious"). Two faults.
@@ -3729,11 +3821,13 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 				uint32_t _b   = 8192u << _oct;   /* 2x .. 64x */
 				tg = (int32_t)(_b + ((_b * _fr) / 255u));
 			}
+			if (_first) {   /* INFX-672: once per block */
 			int32_t d = (tg - dst_g_s) >> 3;
 			if (d == 0) d = (tg > dst_g_s) ? 1 : ((tg < dst_g_s) ? -1 : 0);
 			dst_g_s += d;
+			}
 		}
-		const int32_t dst_g = ((g_dst_amt == 0u && dst_g_s < 4160) || g_dst_typ >= 3u) ? 0 : dst_g_s;   /* 660: type 3 = OFF */
+		const int32_t dst_g = (!rp1 || (g_dst_amt == 0u && dst_g_s < 4160) || g_dst_typ >= 3u) ? 0 : dst_g_s;   /* 660: type 3 = OFF */
 		/* DST-548 r2: the trim used to cancel the drive EXACTLY, which
 		 * kept the level honest but also removed the loudness cue that
 		 * makes distortion read as distortion. It now allows up to +6 dB
@@ -3768,11 +3862,12 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		 * flash and ~4%% idle. ⚠ NOTE: this is an OPTIMISATION, not a
 		 * regression fix -- W206 measured the same-bin corner spread at
 		 * 24%% / 2x, so nothing smaller than that was ever demonstrated. */
-		const int fx_any = (flt_mode != 0u) || (chr_mix != 0) || (dst_g != 0)
+		const int fx_any = (flt_mode != 0u && rp1) || (chr_mix != 0) || (dst_g != 0)
 		                || (tg_sf != 0u)   || (bcr_hold != 0u)
 		                || (fx2_lfo_on != 0)
 		                || (rng_d != 0)    || (awh_d != 0)
-		                || (phs_d != 0)    || (tp_any != 0)    || (ec_n != 0);
+		                || (phs_d != 0)    || (tp_any != 0)    || (ec_n != 0)
+		                || (rv_n != 0);   /* RVFIX-678: the reverb runs on its own */
 		/* ==== EFXM-586: EFFECT-MAJOR PASS C (W279) ====
 		 * 585's sweep: every PASS C effect cost the same ~50% of track-time
 		 * silent at the corner -- gate (4 cyc of math) = distortion (45) --
@@ -3799,6 +3894,10 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		/* A4 (660): the chorus LFO is tappable too; its default is the 0.68 Hz sweep it always had */
 		const uint32_t chr_inc = lane_p5 ? (0xFFFFFFFFu / (lane_p5 < 64u ? 64u : lane_p5) + 1u) : CHR_LFO_INC;
 		const uint32_t lfo_base = g_fx2_lfo;   /* (A3: no page-3 lane reads this any more; kept for the fold below) */
+		if (rp4) {   /* WOBBUS-673: the tape transport first, then the heads (hiss / drive / tone) */
+			wob_tick_block();
+			if (g_wb_off != 0 || g_wb_tgt != 0) in_wobble_block(mix32, mix32R);
+		}
 		if (tp_hs) {
 			uint32_t _h_g_tp_hsi = g_tp_hsi;
 			uint32_t _h_g_tp_rng = g_tp_rng;
@@ -3826,7 +3925,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			g_tp_hsi = (uint16_t)_h_g_tp_hsi;
 			g_tp_rng = _h_g_tp_rng;
 		}
-		if (tp_dr != 4096) {
+		if (rp4 && tp_dr != 4096) {
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				int32_t xL = mix32[f];
 				int32_t xR = mix32R[f];
@@ -3837,7 +3936,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 				mix32[f] = xL; mix32R[f] = xR;
 			}
 		}
-		if (tp_tn != 128) {
+		if (rp4 && tp_tn != 128) {
 			int32_t _h_g_tp_toneL = g_tp_toneL;
 			int32_t _h_g_tp_toneR = g_tp_toneR;
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
@@ -3855,7 +3954,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			g_tp_toneL = _h_g_tp_toneL;
 			g_tp_toneR = _h_g_tp_toneR;
 		}
-		if (flt_mode) {
+		if (flt_mode && rp1) {
 			int32_t _h_flt_lowL = flt_lowL;
 			int32_t _h_flt_bandL = flt_bandL;
 			int32_t _h_flt_lowR = flt_lowR;
@@ -4213,10 +4312,178 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			}
 			g_ec2_w = _w;
 		}
+		if (rv_n) {
+			/* REVERB-676: 64 steps per block on the L+R boxcar-4 sum; the wet pair is
+			 * interpolated across the 4 frames from the PREVIOUS step's value (one
+			 * group of latency on the tail, 83 us). */
+			int32_t _pL = g_rv_pl, _pR = g_rv_pr;
+			for (uint32_t k = 0u; k < BLK_FRAMES / 4u; k++) {
+				const uint32_t f0 = k * 4u;
+				int32_t _in = (mix32[f0]      + mix32R[f0]
+				             + mix32[f0 + 1u] + mix32R[f0 + 1u]
+				             + mix32[f0 + 2u] + mix32R[f0 + 2u]
+				             + mix32[f0 + 3u] + mix32R[f0 + 3u]) >> 3;
+				int32_t _oL, _oR;
+				rv_step(_in, rv_krt, &_oL, &_oR);
+				_oL = (_oL * rv_wet) >> 6; _oR = (_oR * rv_wet) >> 6;   /* RV2-680: x4 back out */
+				const int32_t _dL = _oL - _pL, _dR = _oR - _pR;
+				mix32[f0]      += _pL;                     mix32R[f0]      += _pR;
+				mix32[f0 + 1u] += _pL + (_dL >> 2);        mix32R[f0 + 1u] += _pR + (_dR >> 2);
+				mix32[f0 + 2u] += _pL + (_dL >> 1);        mix32R[f0 + 2u] += _pR + (_dR >> 1);
+				mix32[f0 + 3u] += _pL + _dL - (_dL >> 2);  mix32R[f0 + 3u] += _pR + _dR - (_dR >> 2);
+				_pL = _oL; _pR = _oR;
+			}
+			g_rv_pl = _pL; g_rv_pr = _pR;
+		}
 		if (swp_d) g_lfo_ph[1] += (uint32_t)BLK_FRAMES * swp_inc;   /* A3 */
 		if (trm_d) g_lfo_ph[2] += (uint32_t)BLK_FRAMES * trm_inc;   /* A3 */
 		(void)lfo_base; (void)lfo_on;   /* A3: the shared phase is the chorus's now */
 		}
+}
+
+/* ===== WOBBUS-673: THE TAPE WOBBLE LIVES ON THE BUS NOW =====
+ * Was: a per-frame read OFFSET inside PASS A (posb/fracb walked back up to 672
+ * frames into the play ring's history, which forced a 768-frame reserve on the
+ * streamer's fill, defeated PASS B's unity fast path on every track while the
+ * wobble was up, and added a branch per frame to the hot loop). Now: the same
+ * LFOs and ramp (this helper, ONE call per block from the chain's page-4 group)
+ * drive ONE modulated delay line on the mix bus (in_wobble_block), page 4's
+ * first stage. Nothing in the mixer reads g_wb_*; the ring reserve is 0 again. */
+static void __attribute__((noinline)) wob_tick_block(void)
+{
+	g_wb_off = g_wb_tgt;                 /* land the previous ramp */
+	{
+		/* WOBTAP-675: a tapped period (>= 4800 frames) sets the wow's rate; 0 = the free 0.8 Hz */
+		const uint32_t _lp = g_lane_per[6];
+		const uint32_t _wi = _lp ? (0xFFFFFFFFu / (_lp < 4800u ? 4800u : _lp) + 1u) : WOB_WOW_INC;
+		g_wb_wowph += _wi * BLK_FRAMES;
+	}
+	g_wb_fltph += WOB_FLT_INC * BLK_FRAMES;
+	g_wb_rng = g_wb_rng * 1664525u + 1013904223u;
+	int32_t _n1 = (int32_t)((int16_t)(g_wb_rng >> 16));
+	g_wb_rng = g_wb_rng * 1664525u + 1013904223u;
+	int32_t _n2 = (int32_t)((int16_t)(g_wb_rng >> 16));
+	g_wb_wnse += (_n1 - g_wb_wnse) >> 6;
+	g_wb_fnse += (_n2 - g_wb_fnse) >> 4;
+	int32_t _d = (int32_t)g_tp_wob, _tg;
+	if (_d == 0) {
+		/* idle target is ZERO, not the base tap. His rc2 hardware fix:
+		 * pinning idle at the base tap while a fast path read at offset 0
+		 * made crossing between them an instant 5 ms jump -- a click every
+		 * time the fader crossed zero. Ramping to 0 makes engage and
+		 * disengage the same glide. */
+		_tg = 0;
+	} else {
+		/* TUNE-575: LINEAR depth. The squared curve left the bottom three
+		 * quarters of the fader below 2 cents -- inaudible on a loop. */
+		int32_t _d2 = _d;
+		int32_t _ws = ((wob_sin(g_wb_wowph) * 7) >> 3) + (g_wb_wnse >> 3);
+		int32_t _fs = ((wob_sin(g_wb_fltph) * 7) >> 3) + (g_wb_fnse >> 3);
+		int32_t _w = (int32_t)(((int64_t)WOB_WOW_PEAK * _ws) >> 15);
+		int32_t _l = (int32_t)(((int64_t)WOB_FLT_PEAK * _fs) >> 15);
+		_tg = (int32_t)(WOB_BASE_SAMP << 16)
+		    + (int32_t)(((int64_t)(_w + _l) * _d2) >> 8);
+	}
+	int32_t _ms = (int32_t)(WOB_MAX_RATE_Q16 * BLK_FRAMES);
+	int32_t _dl = _tg - g_wb_off;
+	if (_dl >  _ms) _tg = g_wb_off + _ms;
+	if (_dl < -_ms) _tg = g_wb_off - _ms;
+	if (_d != 0 && _tg < (1 << 16)) _tg = (1 << 16);
+	g_wb_tgt = _tg;
+}
+/* ===== INFX-672: THE INPUT SLOT (STACK D) =====
+ * Runs on the LIVE PAIR before PASS A, in the mixer's scratch buses (mix32 /
+ * mix32R hold the previous block's post-FX bus, which nothing reads after the
+ * lean loop except a bounce's prepass -- and the slot is skipped on a bounce
+ * block). What comes out goes back into tmp[] as int16: the monitor hears it
+ * and PASS A's recorder stores it (D3). */
+static void __attribute__((optimize("O2"), noinline)) in_wobble_block(int32_t *bL, int32_t *bR)
+{
+	/* the SAME offset the tape wobble is ramping this block (PASS A lands
+	 * g_wb_off and publishes g_wb_tgt before the slot runs) */
+	int32_t _o = g_wb_off;
+	const int32_t _d = (g_wb_tgt - _o) / (int32_t)BLK_FRAMES;
+	uint32_t w = g_inw_w;
+	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+		int32_t xL = bL[f], xR = bR[f];
+		{	/* WOBCLAMP-681 (W324): -12 dB into the line, a clamp not the knee; x4 back out below */
+			int32_t sL = xL >> 2, sR = xR >> 2;
+			g_inw_line[2u * w]      = (int16_t)(sL > 32767 ? 32767 : (sL < -32768 ? -32768 : sL));
+			g_inw_line[2u * w + 1u] = (int16_t)(sR > 32767 ? 32767 : (sR < -32768 ? -32768 : sR));
+		}
+		_o += _d;
+		int32_t  oi = _o >> 16;                     /* whole frames behind */
+		uint32_t fr = (uint32_t)_o & 0xFFFFu;
+		if (oi < 0) { oi = 0; fr = 0u; }
+		if ((uint32_t)oi > INW_N - 2u) { oi = (int32_t)(INW_N - 2u); fr = 0u; }
+		uint32_t r0 = w + INW_N - (uint32_t)oi; if (r0 >= INW_N) r0 -= INW_N;   /* WOBCLAMP-681: no udiv (oi < INW_N) */
+		uint32_t r1 = (r0 == 0u) ? INW_N - 1u : r0 - 1u;    /* one frame further back */
+		int32_t aL = g_inw_line[2u * r0], aR = g_inw_line[2u * r0 + 1u];
+		int32_t cL = g_inw_line[2u * r1], cR = g_inw_line[2u * r1 + 1u];
+		bL[f] = (aL + (((cL - aL) * (int32_t)(fr >> 1)) >> 15)) << 2;   /* WOBCLAMP-681: x4 */
+		bR[f] = (aR + (((cR - aR) * (int32_t)(fr >> 1)) >> 15)) << 2;
+		w = (w + 1u == INW_N) ? 0u : w + 1u;
+	}
+	g_inw_w = w;
+	g_inw_blk++;
+}
+static void __attribute__((optimize("O2"), noinline)) in_slot_block(int16_t *tmp, uint32_t got, int32_t *bL, int32_t *bR)
+{
+	if (g_bnc_on && g_rec_track >= 0) return;   /* a bounce block: PASS A records the bus, the page runs there */
+	uint32_t pm = 0u;
+	for (uint32_t p = 1u; p <= 4u; p++)
+		if (g_pg_route[p] == RT_IN) pm |= 1u << (p - 1u);
+	if (!pm) return;
+	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+		bL[f] = (f < got) ? (int32_t)tmp[2u * f]      : 0;
+		bR[f] = (f < got) ? (int32_t)tmp[2u * f + 1u] : 0;
+	}
+	fx_chain_run(bL, bR, pm);
+	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+		tmp[2u * f]      = soft_limit(bL[f]);
+		tmp[2u * f + 1u] = soft_limit(bR[f]);
+	}
+	g_in_blk++;
+}
+/* The MIX slot: the mixer's call, unchanged in name and signature. With
+ * every page at BOTH this is exactly one fx_chain_run(pm = all) = 665. */
+static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mix32, int32_t *mix32R)
+{
+	const int _bnc = (g_bnc_on && g_rec_track >= 0);
+	uint32_t pm_trk = 0u, pm_both = 0u;
+	for (uint32_t p = 1u; p <= 4u; p++) {
+		uint8_t r = g_pg_route[p];
+		if (r == RT_IN && _bnc) r = RT_BOTH;        /* a bounce records the bus: the page runs there */
+		if (r == RT_TRK)       pm_trk  |= 1u << (p - 1u);
+		else if (r == RT_BOTH) pm_both |= 1u << (p - 1u);
+	}
+	const int16_t *lv = _bnc ? g_bnc_live : g_live_blk;
+	const uint32_t lg = g_live_got;
+	if (pm_trk) {
+		/* tracks only: take the monitor out (PASS A added exactly these
+		 * values), run the page, put it back -- int32, exact */
+		for (uint32_t f = 0; f < lg; f++) { mix32[f] -= lv[2u * f]; mix32R[f] -= lv[2u * f + 1u]; }
+		fx_chain_run(mix32, mix32R, pm_trk);
+		for (uint32_t f = 0; f < lg; f++) { mix32[f] += lv[2u * f]; mix32R[f] += lv[2u * f + 1u]; }
+	}
+	if (pm_both) fx_chain_run(mix32, mix32R, pm_both);
+	/* monitor mute (pages mode): a gain on the live pair only, ramped over
+	 * ~4 blocks so the toggle never clicks; the recorder never sees it */
+	{
+		const int32_t tg = (g_mon_mute && g_pg_open) ? 0 : 256;
+		int32_t g = g_mon_g_s;
+		if (g != tg || g != 256) {
+			const int32_t g0 = g;
+			if (g < tg) { g += 64; if (g > tg) g = tg; } else if (g > tg) { g -= 64; if (g < tg) g = tg; }
+			g_mon_g_s = g;
+			const int32_t gd = g - g0;
+			for (uint32_t f = 0; f < lg; f++) {
+				int32_t k = 256 - (g0 + ((gd * (int32_t)(f + 1u)) >> 8));   /* what to take away */
+				mix32[f]  -= ((int32_t)lv[2u * f]      * k) >> 8;
+				mix32R[f] -= ((int32_t)lv[2u * f + 1u] * k) >> 8;
+			}
+		}
+	}
 }
 
 /* NOINL-589 (W280): with the effect chain gone (EFXM2-588) the mixer became
@@ -4370,7 +4637,7 @@ static void __attribute__((noinline)) bnc_postpass(int32_t *mL, int32_t *mR, con
 		trk[_rt].start_blk   = (sp + TSPBI(_rt) / 2u) / TSPBI(_rt);
 		trk[_rt].gsh = (uint8_t)BNC_GSH;
 		/* BAKE-619 (W298): the print bakes the speed it was punched at */
-		g_bk_spd = (g_cur_speed_q16 != BK_ONE) ? g_cur_speed_q16 : 0u;
+		g_bk_spd = (g_bk_mode != 1u && g_cur_speed_q16 != BK_ONE) ? g_cur_speed_q16 : 0u;   /* TAPECOPY-684: a tape copy never bakes */
 		g_bk_trk = (int8_t)_rt; g_bk_ph = 0u; g_bk_blocks = 0u; g_bk_len = 0u;   /* TRUE-621 */
 		if (g_bk_spd) g_bk_prints++;
 	}
@@ -4383,7 +4650,7 @@ static void __attribute__((noinline)) bnc_postpass(int32_t *mL, int32_t *mR, con
  * signature, where no future insertion can orphan it. */
 static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t *s)
 {
-	static int16_t tmp[BLK_FRAMES * 2];
+	int16_t *const tmp = g_live_blk;   /* INFX-672: file scope, the MIX slot needs the jack */
 	if (g_xfer_mode) { memset(s, 0, BLK_BYTES); return; }   /* USB transfer: silence out */
 	uint32_t _lt81 = DWT->CYCCNT;   /* M81 phase clock */
 	/* M8X: one predicate per BLOCK, not per frame. Same gate as W4X. */
@@ -4444,9 +4711,11 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		if ((uint32_t)_uf < g_u3_ring_lo) g_u3_ring_lo = (uint32_t)_uf;
 	}
 	uint32_t bytes = primed ?
-		ring_buf_get(&usb_audio_ring, (uint8_t *)tmp, sizeof(tmp)) : 0;
+		ring_buf_get(&usb_audio_ring, (uint8_t *)tmp, sizeof(g_live_blk)) : 0;   /* INFX-672: the whole block (1,024 B), not sizeof(pointer) */
 	k_sched_unlock();
 	uint32_t got = bytes / USB_FRAME_BYTES;
+	g_live_got = got;   /* INFX-672 */
+	if (g_in_on) in_slot_block(tmp, got, mix32, mix32R);   /* INFX-672: the input slot (W291 shape); skips itself on a bounce block */
 	if (primed && got < BLK_FRAMES) {
 		g_ring_underruns++;
 		g_zero_pad += BLK_FRAMES - got;   /* silence frames injected (and recorded) */
@@ -5274,8 +5543,8 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 	 * invariants hoist out of the 48 kHz hot path. */
 	static uint32_t posb[BLK_FRAMES];
 	static uint16_t fracb[BLK_FRAMES];
-	static int32_t  mix32[BLK_FRAMES];   /* LEFT bus */
-	static int32_t  mix32R[BLK_FRAMES];  /* M63a RIGHT bus */
+	/* INFX-672: mix32 / mix32R are file-scope statics now (declared with the
+	 * input-path globals); same storage, same code, reachable by the slot. */
 	/* BNC3-605 THE SOURCE SWAP, OUTSIDE THE FRAME LOOP (W291). mix32/mix32R
 	 * still hold the previous block's post-FX bus (the lean loop only reads
 	 * them). On a bounce block: keep the jack, put the limited, 12 dB-down
@@ -5283,48 +5552,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 	 * The monitor gets the jack back right after PASS A (below). */
 	uint32_t got_live = got;   /* BNC3-606 */
 	if (_bnc) { bnc_prepass(tmp, mix32, mix32R); got = BLK_FRAMES; }
-	/* ===== TAPE-569 WOW/FLUTTER: one Q16 read offset per block =====
-	 * A read OFFSET, never a rate change: g_pphase's wraps also clock the
-	 * RECORD decimator, so wobbling the rate would print the wobble
-	 * permanently into every overdub. The offset is always >= 0, so posb[]
-	 * only ever moves further BEHIND trk[].p_w -- `avail` can only GROW,
-	 * which pushes the starve gate AWAY from its threshold. */
-	{
-		g_wb_off = g_wb_tgt;                 /* land the previous ramp */
-		g_wb_wowph += WOB_WOW_INC * BLK_FRAMES;
-		g_wb_fltph += WOB_FLT_INC * BLK_FRAMES;
-		g_wb_rng = g_wb_rng * 1664525u + 1013904223u;
-		int32_t _n1 = (int32_t)((int16_t)(g_wb_rng >> 16));
-		g_wb_rng = g_wb_rng * 1664525u + 1013904223u;
-		int32_t _n2 = (int32_t)((int16_t)(g_wb_rng >> 16));
-		g_wb_wnse += (_n1 - g_wb_wnse) >> 6;
-		g_wb_fnse += (_n2 - g_wb_fnse) >> 4;
-		int32_t _d = (int32_t)g_tp_wob, _tg;
-		if (_d == 0) {
-			/* idle target is ZERO, not the base tap. His rc2 hardware fix:
-			 * pinning idle at the base tap while a fast path read at offset 0
-			 * made crossing between them an instant 5 ms jump -- a click every
-			 * time the fader crossed zero. Ramping to 0 makes engage and
-			 * disengage the same glide. */
-			_tg = 0;
-		} else {
-			/* TUNE-575: LINEAR depth. The squared curve left the bottom three
-			 * quarters of the fader below 2 cents -- inaudible on a loop. */
-			int32_t _d2 = _d;
-			int32_t _ws = ((wob_sin(g_wb_wowph) * 7) >> 3) + (g_wb_wnse >> 3);
-			int32_t _fs = ((wob_sin(g_wb_fltph) * 7) >> 3) + (g_wb_fnse >> 3);
-			int32_t _w = (int32_t)(((int64_t)WOB_WOW_PEAK * _ws) >> 15);
-			int32_t _l = (int32_t)(((int64_t)WOB_FLT_PEAK * _fs) >> 15);
-			_tg = (int32_t)(WOB_BASE_SAMP << 16)
-			    + (int32_t)(((int64_t)(_w + _l) * _d2) >> 8);
-		}
-		int32_t _ms = (int32_t)(WOB_MAX_RATE_Q16 * BLK_FRAMES);
-		int32_t _dl = _tg - g_wb_off;
-		if (_dl >  _ms) _tg = g_wb_off + _ms;
-		if (_dl < -_ms) _tg = g_wb_off - _ms;
-		if (_d != 0 && _tg < (1 << 16)) _tg = (1 << 16);
-		g_wb_tgt = _tg;
-	}
+	/* WOBBUS-673: the wobble is on the bus (wob_tick_block + in_wobble_block in the chain) */
 	/* BNC-570 B1: consume the PREVIOUS block's PASS C tap. This is exactly
 	 * the handoff a real bounce needs -- PASS A runs before PASS C, so the
 	 * print is one block (5.33 ms) late by construction. The counter
@@ -5334,11 +5562,6 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		g_bt_acc = (g_bt_acc * 7u + _bl) >> 3;   /* slow mean, no divide */
 		g_bt_n++;
 	}
-	int32_t _wb_o = g_wb_off;
-	/* zero offset AND zero target: the read position is provably
-	 * unmodified this block, so the per-frame work is skippable. */
-	const int _wb_on = (g_wb_off != 0) || (g_wb_tgt != 0);
-	const int32_t _wb_d = (g_wb_tgt - _wb_o) / (int32_t)BLK_FRAMES;
 	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 		/* The UAC2 input is a stereo pair and always has been; the
 		 * engine simply summed it away. liveL/liveR feed the monitor;
@@ -5361,23 +5584,8 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		 * of every build, page closed and fader down.
 		 * At depth 0 the ramp settles at exactly 0, so idle playback carries
 		 * no added latency, and the engage/disengage transition is a glide. */
-		if (_wb_on) _wb_o += _wb_d;
-		if (!_wb_on) {
-			posb[f]  = _cpos;
-			fracb[f] = (uint16_t)(_pphase & 0xFFFFu);
-		} else {
-			uint32_t _wp = _cpos - (uint32_t)(_wb_o >> 16);
-			int32_t  _wf = (int32_t)(_pphase & 0xFFFFu)
-			             - (int32_t)((uint32_t)_wb_o & 0xFFFFu);
-			if (_wf < 0) { _wf += 65536; _wp -= 1u; }
-			posb[f]  = _wp;
-			fracb[f] = (uint16_t)_wf;
-			{	/* WBDIAG-577 */
-				int32_t _dj = (int32_t)(_wp - g_wb_lastpos);
-				if (f != 0u && (_dj < -1 || _dj > 2)) g_wbj++;
-				g_wb_lastpos = _wp;
-			}
-		}
+		posb[f]  = _cpos;   /* WOBBUS-673: the plain read position, always */
+		fracb[f] = (uint16_t)(_pphase & 0xFFFFu);
 
 		/* advance the playback phase; each integer step is one loop-sample tick */
 		/* S2CAP: accumulate TRUE channels. `live` (the downmix) still
@@ -5824,7 +6032,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		 * 187.5 Hz sample-and-hold of the audio at a wandering position --
 		 * marc: "rhythmic, bitcrushy, square-ish, moving around the pan".
 		 * With the wobble on, take the exact per-frame path instead. */
-		if (step == 0u && !_wb_on && !trk[i].starved && trk[i].fade >= 256u && vd == 0) {
+		if (step == 0u && !trk[i].starved && trk[i].fade >= 256u && vd == 0) {   /* WOBBUS-673: no wobble term */
 			int32_t avail = (int32_t)(trk[i].p_w - posb[0]);
 			if (avail < 2) {
 				trk[i].starved = 1; g_starve_cnt[i]++; STV_BUMP();
@@ -5869,8 +6077,6 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		 * the streamer is what lifts the refill ceiling past that. */
 		if (vd == 0 && !trk[i].starved && trk[i].fade >= 256u &&
 		    (int32_t)(trk[i].p_w - posb[BLK_FRAMES - 1u]) >= 258) {
-			/* WBDIAG-577: history check, one compare per track-block */
-			if ((int32_t)(trk[i].p_w - posb[0]) > (int32_t)(RING_SAMPLES - 64u)) g_wbx++;
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				uint32_t cpos = posb[f];
 				uint32_t frac = fracb[f];
@@ -6235,7 +6441,7 @@ static uint8_t g_xfer_dirty[NUM_SLOTS][NTRK];
  * bus-blocking flush has nothing live to starve. */
 static void xfer_commit(void)
 {
-	static uint8_t mblk[META_BLOCKS * EMMC_BLOCK_SIZE];
+	static uint8_t mblk[X3_NBLK * EMMC_BLOCK_SIZE] __aligned(4);   /* X3RELOAD-677: 3 blocks (was META_BLOCKS) */
 	if (g_emmc_ready && emmc_read_blocks(META_BLOCK, mblk, META_BLOCKS)) {
 		struct meta_blk *m = (struct meta_blk *)mblk;
 		if (m->magic == META_MAGIC && m->cur_slot < NUM_SLOTS) {
@@ -6275,6 +6481,30 @@ static void xfer_commit(void)
 				memset(mblk, 0, sizeof(mblk));
 				memcpy(mblk, &g_meta, sizeof(g_meta));
 				(void)meta_write_blocks(mblk);
+			}
+		}
+	}
+	/* X3RELOAD-677: the host may have rewritten blocks 3-5 (a 3.0 upload / delete). Pull them
+	 * now, exactly as boot does, so the slot reload and the next save see the CARD's table and
+	 * not the stale RAM copy. A table that does not validate is ignored (RAM stays). */
+	if (g_emmc_ready && emmc_read_blocks(X3_BLK, mblk, X3_NBLK)) {
+		const struct x3_tab *xt = (const struct x3_tab *)mblk;
+		if (x3_valid(xt)) {
+			memcpy(&g_x3, xt, sizeof(g_x3));
+			g_x3_ok = 1u;
+			/* the mask re-derivation, a private copy of p14s_mask_from_x3 (that one stays
+			 * single-caller so the streamer's boot inline -- and its text -- do not move) */
+			if (g_slot < NUM_SLOTS) {
+				g_p14s_mask = 0;
+				for (int xi = 0; xi < NTRK; xi++) {
+					const struct x3_trk *xe = &g_x3.t[g_slot][xi];
+					if (xe->codec_id == X3_CODEC_P14S || xe->codec_id == X3_CODEC_P16M) {
+						g_p14s_mask |= (uint8_t)(1u << xi);
+						trk[xi].p16m = (xe->codec_id == X3_CODEC_P16M) ? 1u : 0u;
+						trk[xi].gsh  = (uint8_t)((xe->flags >> 1) & 3u);
+						trk[xi].p16m_next = (xe->rsv & 0x80u) ? (uint8_t)(xe->rsv & 1u) : trk[xi].p16m;
+					}
+				}
 			}
 		}
 	}
@@ -7817,6 +8047,13 @@ static uint32_t bk_navail(const struct looptrk *t)
 /* The flush's unit of work, in whichever units this take is in. */
 static inline uint32_t bk_flush_navail(const struct looptrk *t, int i)
 {
+	/* TAPECOPY-684: the tap/hold verdict (<= BK_DECIDE_MS after the chord) decides bake or
+	 * not; until it lands, a bounce that COULD bake packs nothing -- the ring holds it.
+	 * A print that reached TS_DONE undecided is a tape copy (the release is what stops it). */
+	if (g_bk_spd != 0u && g_bk_trk == (int8_t)i && g_bk_mode == 0u) {
+		if (t->state != TS_DONE) return 0u;
+		g_bk_mode = 1u; g_bk_spd = 0u;
+	}
 	return bk_flush_on(t, i) ? bk_navail(t) : (t->r_w - t->r_r) / TSPB(t);
 }
 
@@ -7901,9 +8138,13 @@ static void __attribute__((noinline)) bk_promote(struct looptrk *t)
 	if (cb < 1u) cb = 1u;
 	t->len_blocks = lb; t->content_blocks = cb;
 	t->len_samps = lb * TSPB(t);
+	if (g_bk_mode == 2u) {   /* SMPSTART-687: a held (sampler) print plays from its beginning at finger-up */
+		uint32_t sb = (g_bk_stop_pos + TSPB(t) / 2u) / TSPB(t);
+		t->start_blk = sb; t->start_samps = sb * TSPB(t);
+	}
 	t->r_r = t->r_w;
 	g_bk_last_spd = spd; g_bk_last_len = lb;
-	g_bk_spd = 0u; g_bk_trk = -1;
+	g_bk_spd = 0u; g_bk_trk = -1; g_bk_mode = 0u;   /* TAPECOPY-684 */
 }
 /* ===== end BAKE-619 kernel ===== */
 
@@ -9399,10 +9640,12 @@ static void audio_thread(void *a, void *b, void *c)
 			_FXS(g_swp_amt  >= 32u, 10u); _FXS(g_trm_amt >= 32u, 11u);
 			_FXS(g_tp_drive >= 32u, 12u); _FXS(g_tp_tone >= 160u || g_tp_tone <= 96u, 13u);
 			_FXS(g_tp_hiss  >= 32u, 14u); _FXS(g_tp_wob >= 32u, 15u);
+			_FXS(g_rv_mix   >= 32u, 16u);   /* REVERB-676 */
 			#undef _FXS
-			uint32_t _k = (_n == 0u) ? 0u : (_n == 1u) ? _c : 16u;
+			uint32_t _k = (_n == 0u) ? 0u : (_n == 1u) ? _c : 17u;
 			uint32_t _s = g_starve_cnt[0] + g_starve_cnt[1] + g_starve_cnt[2] + g_starve_cnt[3];
 			g_fxs_blk[_k]++;
+			if (_cus > g_fxs_aus[_k]) g_fxs_aus[_k] = _cus;   /* FXA */
 			g_fxs_stv[_k] += _s - g_fxs_prev;  g_fxs_prev = _s;
 			if (g_playing)   /* GRIDFIX-626 (W303): a starved flag parked across a STOP is not a dropout */
 				g_fxs_dry[_k] += (uint32_t)trk[0].starved + trk[1].starved + trk[2].starved + trk[3].starved;
@@ -9875,7 +10118,7 @@ static void controls_diag(void)
 
 
 
-		printk("PF,v=5,pg=%u,id=%u,flt=%u,dst=%u,chr=%u,gat=%u,rate=%u,pat=%u,step=%u,gg=%u,vu=%u,fn=%u,bcr=%u,rng=%u,awh=%u,phs=%u,swp=%u,trm=%u,awe=%d,btpk=%u,btacc=%u,btn=%u,bnc=%u,bon=%u,tdr=%u,ttn=%u,ths=%u,twb=%u,wbj=%u,wbx=%u,ec=%u,ecdiv=%u,ecdly=%u,ecv=%u,ecw=%u\n",
+		printk("PF,v=5,pg=%u,id=%u,flt=%u,dst=%u,chr=%u,gat=%u,rate=%u,pat=%u,step=%u,gg=%u,vu=%u,fn=%u,bcr=%u,rng=%u,awh=%u,phs=%u,swp=%u,trm=%u,awe=%d,btpk=%u,btacc=%u,btn=%u,bnc=%u,bon=%u,tdr=%u,ttn=%u,ths=%u,twb=%u,wbj=%u,wbx=%u,ec=%u,ecdiv=%u,ecdly=%u,ecv=%u,ecw=%u,rt1=%u,rt2=%u,rt3=%u,rt4=%u,mm=%u,inb=%u,inw=%u\n",
 		       (unsigned)g_pg_open, (unsigned)g_pg_id, (unsigned)g_flt_pos,
 		       (unsigned)g_dst_amt, (unsigned)g_chr_mix, (unsigned)g_gat_amt,
 		       (unsigned)g_gat_amt, (unsigned)g_gat_pat, (unsigned)g_tg_idx,
@@ -9892,7 +10135,9 @@ static void controls_diag(void)
 		       (unsigned)g_tp_hiss,  (unsigned)g_tp_wob,
 		       (unsigned)g_wbj, (unsigned)g_wbx,
 		       (unsigned)g_ec_mix, (unsigned)g_ec_div, (unsigned)g_ec_dly,
-		       (unsigned)(((uint32_t)g_ec_mix * 166u) >> 8), (unsigned)g_ec2_w);   /* ECHO2-610: fb q8, line index */
+		       (unsigned)(((uint32_t)g_ec_mix * 166u) >> 8), (unsigned)g_ec2_w,   /* ECHO2-610: fb q8 + line index */
+		       (unsigned)g_pg_route[1], (unsigned)g_pg_route[2], (unsigned)g_pg_route[3], (unsigned)g_pg_route[4],
+		       (unsigned)g_mon_mute, (unsigned)g_in_blk, (unsigned)g_inw_blk);   /* INFX-672 */
 		printk("GF,n=%u,nf=%u,ref=%u,%u\n",   /* GRIDSPD-622: rescales, beat frames now, reference nf/speed */
 		       (unsigned)g_grid_follow_n, (unsigned)g_grid_beat_frames, (unsigned)g_grid_ref_nf, (unsigned)g_grid_ref_spd);
 		printk("BK,p=%u,s=%u,l=%u,c=%u,b=%u,n=%u\n",   /* BAKE-619/TRUE-621: prints baked, last speed q16, last len (baked blocks), capped, blocks this print, loop chosen at the stop */
@@ -9909,10 +10154,14 @@ static void controls_diag(void)
 		       (unsigned)g_stv_lo, (unsigned)g_stv_up,
 		       (unsigned)g_stv_cx, (unsigned)g_stv_pf, (unsigned)g_stv_re,
 		       (unsigned)g_rw_hw);
-		/* FXSTAT2-585: 17 x starves/dry/blocks, one class per field */
+		/* FXSTAT2-585: 18 x starves/dry/blocks, one class per field (676: 16 = reverb, 17 = MULTI) */
 		printk("FXS2");
 		for (uint32_t _k = 0; _k < FXS_N; _k++)
 			printk(",%u/%u/%u", (unsigned)g_fxs_stv[_k], (unsigned)g_fxs_dry[_k], (unsigned)g_fxs_blk[_k]);
+		printk("\n");
+		printk("FXA");   /* WOBCLAMP-681: worst block us per class (the pop instrument, W324) */
+		for (uint32_t _k = 0; _k < FXS_N; _k++)
+			printk(",%u", (unsigned)g_fxs_aus[_k]);
 		printk("\n");
 
 		printk("BTN,lat=%u,max=%u\n",
@@ -10210,7 +10459,7 @@ static void controls_diag(void)
 
 /* ---- decode the ladders into named buttons (verified thresholds) ---- */
 enum trk_btn { TRK_NONE = -1, TRK_1, TRK_2, TRK_3, TRK_4, TRK_PLAY };
-enum vol_btn { VOL_NONE = -1, VOL_TEMPO_DOWN, VOL_DOWN, VOL_TEMPO_UP, VOL_UP };
+enum vol_btn { VOL_NONE = -1, VOL_TEMPO_DOWN, VOL_DOWN, VOL_TEMPO_UP, VOL_UP, VOL_BOTH };   /* INFX-672: both volume buttons */
 
 static enum trk_btn decode_tracks(int v)
 {
@@ -10228,7 +10477,8 @@ static enum vol_btn decode_vol(int v)
 	if (v <  560) return VOL_TEMPO_DOWN; /* ~404  */
 	if (v <  950) return VOL_DOWN;       /* ~729  */
 	if (v < 1500) return VOL_TEMPO_UP;   /* ~1220 */
-	return VOL_UP;                       /* ~1820 */
+	if (v < 1910) return VOL_UP;         /* ~1820 */
+	return VOL_BOTH;                     /* ~1998 (W115) -- INFX-672 */
 }
 
 /* ================= ALWAYS-DIM LEDs (soft PWM) =========================
@@ -10613,12 +10863,17 @@ static void show_page_number(void)
 		 * opening a page starts bright and breathes out, then in. ~3.5 s
 		 * period; the floor keeps it clearly lit at its dimmest. */
 		{
+			if (g_mon_mute) {   /* INFX-672: MUTED -- the number BLINKS (~2 Hz) instead of breathing */
+				status_level((((uint32_t)g_pg_cnt / 31u) & 1u) ? 255u : 40u);
+				g_pg_cnt++;
+			} else {
 			uint32_t _t = (uint32_t)g_pg_cnt % TG_BREATH;
 			uint32_t _h = TG_BREATH / 2u;
 			uint32_t _tri = (_t < _h) ? (_h - _t) : (_t - _h);  /* max at 0 */
 			status_level(TG_BR_FLOOR +
 			             ((255u - TG_BR_FLOOR) * _tri) / _h);
 			g_pg_cnt++;
+			}
 		}
 	} else {
 		/* MORE THAN FOUR: count it out. Each group of four sits solid for
@@ -10736,20 +10991,34 @@ static void shutdown_leds(void)
  * As soon as a host streams audio or a loop exists, it falls through to state. */
 static void led_service(void)
 {
+	/* INFX-672: does the input slot have work this pass? (routes change only
+	 * by gesture, the wobble by a fader -- both land here within one pass) */
+	g_in_on = (uint8_t)((g_pg_route[1] == RT_IN || g_pg_route[2] == RT_IN ||
+	                     g_pg_route[3] == RT_IN || g_pg_route[4] == RT_IN) ? 1u : 0u);   /* WOBBUS-673: the wobble is page 4's, no slot term */
 	/* The standby chase means "never used yet": it shows until the FIRST time a
 	 * host streams audio (or anything is recorded) and then never returns. A
 	 * live host-presence gate flickered the chase mid-session whenever the
 	 * player closed the stream between songs / on pause. */
-	static int ever_streamed;
-	if (g_usb_streaming) ever_streamed = 1;
 
 	/* LED-549: the status row has four jobs now, in priority order:
 	 * a PAGE is open -> which page (+ announce) · FUNCTION held ->
 	 * the song indicators (row 100's escape hatch) · PLAYING -> the
 	 * VU meter · otherwise -> the song indicators. */
+	/* INFX-672: a routing choice just made flashes the whole status row N times
+	 * (1 INPUT, 2 TRACKS, 3 BOTH), page open or not; then the row returns. */
+	int _has_trk = g_loop_active;                     /* LEDSONG-674: any loaded/armed/taking track */
+	for (int _i = 0; _i < NTRK; _i++) if (trk[_i].state != TS_EMPTY) _has_trk = 1;
+	if (g_usb_streaming) _has_trk = 1;   /* LEDSONG2-679: a live input is content for the VU */
+	if (g_rt_flash) {
+		uint32_t _ph = g_rt_tick / 8u;              /* ~64 ms on, ~64 ms off */
+		int _on = (_ph & 1u) == 0u;
+		if (++g_rt_tick >= 16u) { g_rt_tick = 0u; g_rt_flash--; }
+		status_level(255u);
+		for (int i = 0; i < NUM_LEDS; i++) { if (_on) led_on(i); else led_clear(i); }
+	} else
 	if (g_fn_held)            show_song_leds();
 	else if (g_pg_open)       show_page_number();   /* LED-549 r11 */
-	else if (g_playing)       show_vu_leds();
+	else if (g_playing && _has_trk) show_vu_leds();   /* LEDSONG-674: an EMPTY song playing shows the song, not an empty VU */
 	else                      show_song_leds();
 
 	int active = g_loop_active;
@@ -10781,7 +11050,7 @@ static void led_service(void)
 		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
 	} else if (g_pg_open && g_pg_id == 3u) {
 		/* LAYOUT-562: PAGE 3 VIEW -- phaser / sweep / tremolo / [empty]. */
-		const uint32_t _lv[4] = { (g_lfo_div[0] >= 3u) ? 0u : (uint32_t)g_phs_amt, (g_lfo_div[1] >= 3u) ? 0u : (uint32_t)g_swp_amt, (g_lfo_div[2] >= 3u) ? 0u : (uint32_t)g_trm_amt, 0u };   /* A6: depth; OFF dark; fader 4 EMPTY (LAYOUT-562) */
+		const uint32_t _lv[4] = { (g_lfo_div[0] >= 3u) ? 0u : (uint32_t)g_phs_amt, (g_lfo_div[1] >= 3u) ? 0u : (uint32_t)g_swp_amt, (g_lfo_div[2] >= 3u) ? 0u : (uint32_t)g_trm_amt, (uint32_t)g_rv_mix };   /* A6: depth; OFF dark; fader 4 = reverb (REVERB-676) */
 		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
 	} else if (g_pg_open && g_pg_id == 4u) {
 		/* TAPE-569: PAGE 4 VIEW -- drive / tone / hiss / wobble. */
@@ -10855,13 +11124,9 @@ static void led_service(void)
 		for (int i = 0; i < NUM_TRACK_LEDS; i++)
 			son ? track_led_on(i) : track_led_off(i);
 		g_led_shrug--;
-	} else if (!ever_streamed && !active) {
-		/* STANDBY: no audio in + nothing recorded -> gentle chase = "waiting" */
-		static uint32_t ch;
-		uint32_t pos = (ch++ / 40u) % NUM_TRACK_LEDS;   /* advance ~every 320 ms */
-		for (int i = 0; i < NUM_TRACK_LEDS; i++)
-			((uint32_t)i == pos) ? track_led_on(i) : track_led_off(i);
 	} else {
+		/* LEDIDLE-685: the standby chase is gone -- an empty, ungridded song shows a DARK
+		 * track row (the status row carries the song); a gridded one shows its metronome. */
 		int on_beat = (g_beat_phase < (BEAT_SAMPLES_L / 8u));
 		int gbeat = -1;            /* tapped grid: beat 0..3 within the bar */
 		if (g_grid_active && g_grid_beat_frames) {
@@ -11186,7 +11451,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 4\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 14\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -11290,6 +11555,7 @@ static void lane_tap(uint32_t page, int btn, int64_t t_ms, uint64_t t_s)
 	else if (page == 1u && btn == 1) lane = 5;   /* 660: chorus */
 	else if (page == 2u && btn == 3) lane = 1;
 	else if (page == 3u && btn >= 0 && btn <= 2) lane = 2 + btn;
+	else if (page == 4u && btn == 3) lane = 6;   /* WOBTAP-675: the wobble's wow */
 	if (lane < 0) return;
 	if (lane != lt_lane || lt_n == 0 || t_ms - lt_last > 1500 || t_ms - lt_last < 200) {
 		lt_lane = lane; lt_n = 0; lt_first = t_ms; lt_first_s = t_s;
@@ -11314,6 +11580,7 @@ static void lane_reset(uint32_t page, int btn)
 	else if (page == 1u && btn == 1) lane = 5;
 	else if (page == 2u && btn == 3) lane = 1;
 	else if (page == 3u && btn >= 0 && btn <= 2) lane = 2 + btn;
+	else if (page == 4u && btn == 3) lane = 6;   /* WOBTAP-675 */
 	if (lane >= 0) g_lane_per[lane] = 0u;
 }
 
@@ -12251,7 +12518,14 @@ int main(void)
 				if (vb != VOL_NONE) {
 					if (vb == cp_cand) { if (cp_cnt < 1000) cp_cnt++; }
 					else { cp_cand = vb; cp_cnt = 1; }
-					if (g_pg_open && (vb == VOL_UP || vb == VOL_DOWN)) {
+					if (vb == VOL_BOTH) {
+						/* INFX-672: FN + both VOL = MONITOR MUTE, pages mode only
+						 * (D6); outside a page the pair is swallowed. */
+						if (cp_cnt == 3) {
+							combo_seen = 1;
+							if (g_pg_open) g_mon_mute = (uint8_t)!g_mon_mute;
+						}
+					} else if (g_pg_open && (vb == VOL_UP || vb == VOL_DOWN)) {
 						if (cp_cnt == 3) {   /* PF-549 r12: WALK THE PAGE LIST */
 							uint32_t _n = (uint32_t)g_pg_id;
 							if (_n < 1u || _n > PG_LAST) _n = 1u;
@@ -12925,6 +13199,17 @@ int main(void)
 			 * its release sweep -- which passes through PLAY (1807) and, if PLAY
 			 * lifts first, through the bare track band, where a fresh press would
 			 * otherwise read as the STOP tap 48 ms later. */
+			{	/* TAPECOPY-684: the tap/hold verdict on the bounce chord. Armed below when the
+				 * chord fires; TN lifted (the ladder drops out of the chord bands) before
+				 * BK_DECIDE_MS = a tap = TAPE COPY; still down at BK_DECIDE_MS = SAMPLER. */
+				static int64_t bk_dec_t;
+				if (g_bnc_arm_t != 0) { bk_dec_t = g_bnc_arm_t; g_bnc_arm_t = 0; g_bk_hold_trk = -1; }
+				if (bk_dec_t != 0) {
+					int64_t _tn = k_uptime_get();
+					if (trk_raw < 1840) { g_bk_mode = 1u; g_bk_spd = 0u; bk_dec_t = 0; }
+					else if (_tn - bk_dec_t >= BK_DECIDE_MS) { g_bk_mode = 2u; g_bk_hold_trk = g_bk_trk_ctl; bk_dec_t = 0; }   /* HOLDSTOP-686: a held bounce */
+				}
+			}
 			int bchord = -1;
 			if      (trk_raw >= 1840 && trk_raw < 1886) bchord = 0;   /* PLAY+T1 ~1861 */
 			else if (trk_raw >= 1886 && trk_raw < 1957) bchord = 1;   /* PLAY+T2 ~1910 */
@@ -13161,6 +13446,16 @@ int main(void)
 			 * chord's own finger caused on the way in is cancelled losslessly --
 			 * the engine processes the cancel before the arm in the same block.
 			 * Refusals shrug: not playing, nothing else playing, a take busy. */
+			/* HOLDSTOP-686: a HELD bounce stops when TN comes up. 'Up' = the ladder is neither
+			 * in the chord bands nor on TN's own band (PLAY lifted first leaves TN alone on the
+			 * ladder -- still a hold). The stop is the ordinary stop request. */
+			if (g_bk_hold_trk >= 0 && trk_raw < 1840 && (int)decode_tracks(trk_raw) != (int)g_bk_hold_trk) {
+				int _ht = (int)g_bk_hold_trk; g_bk_hold_trk = -1;
+				if (g_rec_track == _ht && (trk[_ht].state == TS_ARMED || trk[_ht].state == TS_REC)) {
+					g_bk_stop_pos = g_consume_pos;   /* SMPSTART-687: the print's beginning is HERE */
+					g_stop_req = 1; tap_deadline[_ht] = 0; stop_tap_trk = _ht;
+				}
+			}
 			if (bch_fire >= 0) {
 				int ti = bch_fire; bch_fire = -1;
 				int64_t tnow = k_uptime_get();
@@ -13196,6 +13491,7 @@ int main(void)
 					tap_deadline[ti] = 0;
 					press_from_above[ti] = 0;
 					g_bnc_arm = (int8_t)ti;
+					g_bk_mode = 0u; g_bnc_arm_t = tnow; g_bk_trk_ctl = (int8_t)ti;   /* TAPECOPY-684 / HOLDSTOP-686 */
 					__DSB();                      /* the flag lands before the request */
 					g_arm_req[ti] = 1;
 				} else {
@@ -13293,7 +13589,7 @@ int main(void)
 						/* A5: page 3 tap = the lane's DIVISION (beat -> half -> quarter) and
 						 * it clears a tapped rate; the fader to the bottom is the kill. */
 						if (ti < 3) { g_lfo_div[ti] = (uint8_t)((g_lfo_div[ti] + 1u) % 4u); g_lane_per[2 + ti] = 0u; led_flash_lane(ti, (g_lfo_div[ti] < 3u) ? (uint32_t)g_lfo_div[ti] + 1u : 0u); }   /* 660: beat -> half -> quarter -> OFF; 661/664: count the division, not OFF */
-						/* LAYOUT-562: track 4 empty -- no-op */
+						if (ti == 3) g_rv_mix = 0u;   /* REVERB-676: the kill */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
 					} else if (g_pg_open && g_pg_id == 4u && g_rec_track < 0 &&
@@ -13306,7 +13602,7 @@ int main(void)
 						if (ti == 0) g_tp_drive = 0u;
 						if (ti == 1) g_tp_tone  = 128u;
 						if (ti == 2) g_tp_hiss  = 0u;
-						if (ti == 3) g_tp_wob   = 0u;
+						if (ti == 3) { g_tp_wob = 0u; g_lane_per[6] = 0u; }   /* WOBTAP-675: the kill also frees the wow (page 3's rule) */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
 					} else if (g_pg_open && g_pg_id >= 5u && g_pg_id <= 7u &&
@@ -13694,7 +13990,7 @@ int main(void)
 						 * parameter to wherever the fader happens to sit. */
 						uint8_t _pv = (fi == 0) ? g_phs_amt
 						            : (fi == 1) ? g_swp_amt
-						            : (fi == 2) ? g_trm_amt : 0u;
+						            : (fi == 2) ? g_trm_amt : g_rv_mix;   /* REVERB-676 */
 						int _q8 = (int)((q > 255u) ? 255u : q);
 						if (g_fx_pick[fi]) {
 							int _d = _q8 - (int)_pv;
@@ -13708,7 +14004,7 @@ int main(void)
 							if      (fi == 0) g_phs_amt = (uint8_t)_q8;
 							else if (fi == 1) g_swp_amt = (uint8_t)_q8;
 							else if (fi == 2) g_trm_amt = (uint8_t)_q8;
-							/* LAYOUT-562: fader 4 empty -- no-op */
+							else              g_rv_mix  = (uint8_t)_q8;   /* REVERB-676: page 3 fader 4 */
 						}
 					} else if (!g_fh_latch[fi])
 						trk[fi].vol_q8 = (uint16_t)q;
@@ -13730,9 +14026,31 @@ int main(void)
 			/* master volume: one perceptual (~3 dB) step per fresh press, along
 			 * g_vol_table[] — gradual from full (256) down to fully muted (0).
 			 * Hold to repeat for a quick sweep. */
+			/* INFX-672: PLAY held + VOL-/VOL+/both, anywhere = route the WHOLE
+			 * chain (INPUT / TRACKS / BOTH, all pages at once). One action per
+			 * press edge; the PLAY press is spent (no toggle, no restart); the
+			 * master volume is suppressed while PLAY is down. */
+			int _rt_hold = 0;
+			static int64_t _rt_last_t;   /* INFX-672: the previous VOL press under PLAY (double-click = BOTH) */
+			if (committed == TRK_PLAY) {   /* anywhere -- the routing is GLOBAL */
+				_rt_hold = 1;
+				if (vcommit != vbefore && (vcommit == VOL_DOWN || vcommit == VOL_UP)) {
+					int64_t _tn = k_uptime_get();
+					uint8_t nr = (_rt_last_t != 0 && _tn - _rt_last_t <= 350) ? RT_BOTH
+					           : (vcommit == VOL_DOWN) ? RT_IN : RT_TRK;
+					_rt_last_t = (nr == RT_BOTH) ? 0 : _tn;   /* a double-click closes the pair */
+					for (int _p = 1; _p <= 4; _p++) g_pg_route[_p] = nr;   /* all four pages */
+					ep_play_spent = 1;
+					g_rt_flash = (nr == RT_IN) ? 1u : (nr == RT_TRK) ? 2u : 3u;
+					g_rt_tick  = 0u;
+				}
+			} else {
+				_rt_last_t = 0;   /* PLAY lifted: the next press starts fresh */
+			}
+			if (!g_pg_open) g_mon_mute = 0u;   /* INFX-672: the mute lives in pages mode only */
 			{
 				static int64_t vrep_t = -1, vrep_last;
-				int vdir = (vcommit == VOL_UP) ? 1 : (vcommit == VOL_DOWN) ? -1 : 0;
+				int vdir = _rt_hold ? 0 : (vcommit == VOL_UP) ? 1 : (vcommit == VOL_DOWN) ? -1 : 0;
 				int vstep = 0;
 				if (vdir != 0) {
 					int64_t tnow = k_uptime_get();
