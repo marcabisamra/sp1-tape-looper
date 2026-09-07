@@ -5,6 +5,68 @@ Versions 1.0.0-1.2.4 below were the 2.0 development line (developed as a
 fork by marc, never announced) — kept for the honest record. The classic
 4-song firmware lives on the `v1` branch. Base: 1.x at commit c60941c.
 
+## [3.0.0] - stereo, fx, and much more
+
+**Back up first. 3.0 changes the storage format.** Use *Download all* on the
+transfer site before you flash. The first boot formats the card. Every song on
+it is gone. Songs recorded on 3.0 survive later 3.x flashes.
+
+### Sound
+- **Stereo.** Takes record in stereo. Playback is stereo.
+- **Mono or stereo per take.** Page 8: tap a track to set its next take.
+- **Speed range 0.25× to 1.5×.** Pitch follows speed, as before.
+- **The dropouts at max speed are gone.** Four tracks at 1.5× with USB audio in plays clean. The one edge left: heavy effect stacks at that corner can still drop out.
+
+### Effects — eight pages
+- **Open a page:** hold FN + a track button ~0.4 s. The faders become that page's controls. Tap FN to close. FN + VOL−/VOL+ steps through all eight pages.
+- **Page 1 FX:** filter, chorus, distortion, trance gate.
+- **Page 2 FX:** bitcrush, ring mod, auto-wah, echo.
+- **Page 3 FX:** phaser, sweep, tremolo, reverb.
+- **Page 4 TAPE:** drive, tone, hiss / vinyl crackle, wobble.
+- **Page 5 EQ:** four bands on the whole mix.
+- **Page 6 PLACE:** stereo placement per track, saved with the song.
+- **Page 7 TAKE & TIMING:** downbeat offset, next take's length in bars, and a per-track nudge (hold the track button, move its fader).
+- **Page 8 MODE:** mono / stereo for each track's next take.
+- **Taps on a page are resets.** FN + T1 + T4 resets every page.
+- **Second controls.** Hold a track button and move its fader: wah resonance, echo feedback, tremolo shape and spread, reverb damping.
+- **Tap a rate.** Hold FN and tap a lane's button in time. That lane follows your taps instead of the grid.
+- **Routing.** PLAY + VOL− = effects on the input (takes record with them). PLAY + VOL+ = effects on the tracks only. PLAY + double-click VOL = the whole mix.
+- **Monitor mute.** FN + both VOL on a page.
+
+### Bounce
+- **Tape copy.** Hold PLAY, tap a track: the mix records into it at the speed you hear. Tap again to stop.
+- **Sampler print.** Hold PLAY, hold a track: records while you hold, baked to play back at 1×.
+
+### Playing
+- **Record = hold an empty track.** Release; it is armed. Capture starts on the first sound. Tap it to stop.
+- **Delete = tap a track, then press again and hold ~0.4 s.** A double-tap no longer deletes.
+- **Reverse a track.** Hold FN + the track, tap PLAY. Works in every mode.
+- **Isolate.** Hold FN + PLAY, press a track: a momentary solo.
+- **Octave up / down.** Hold FN + PLAY, click the rocker.
+- **Chop reset / home.** FN + PLAY + VOL− resets the window. FN + PLAY + VOL+ moves it home.
+- **The chop window reaches one block.**
+
+### Timing
+- **The grid stays on the loops.** The beat lights and the MIDI clock no longer drift off the audio over minutes. A pause keeps the beat phase.
+- **Tap tempo retunes against the loops' native tempo.** A fifth tap no longer undoes the fourth. A rocker move no longer skews the next tap run.
+- **Preset take length.** Set bars on page 7. The take stops itself on the grid.
+
+### Lights
+- **VU meter** on the side row while playing.
+- **Page lights.** Each lane shows its depth. Page 7 shows the beat chase.
+- **Hardware PWM.** The LEDs no longer cost CPU.
+
+### Not fixed
+- A bounce at the full corner (three stereo tracks at 1.5× with USB audio in) can overrun. Bounce at 1× when it matters.
+
+### Transfer site (ships with this firmware)
+- Reads and writes the 3.0 format: stereo WAV in and out, mono and stereo takes side by side, *Download all*.
+
+### Removed
+- Heads-mode double-tap reverse (use FN + track, then PLAY).
+- The FN + rocker double-click chop reset (use FN + PLAY + VOL−). Every FN + rocker click now halves or doubles.
+
+
 ## [2.7.2] - the dropout fix
 
 - **USB streaming: no more dropouts at normal speeds.** USB traffic

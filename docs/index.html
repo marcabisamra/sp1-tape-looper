@@ -114,6 +114,12 @@
         Instant record (default) — takes keep everything from the moment you press.
         If unchecked, recording keeps only what comes after the short arm delay
         (the old behavior).</label>
+      <label id="upmoderow" style="display:none;margin-top:8px">Upload as
+        <select id="upmode">
+          <option value="auto" selected>the file&rsquo;s channels (stereo file &rarr; stereo, mono file &rarr; mono)</option>
+          <option value="stereo">stereo (P14S)</option>
+          <option value="mono">mono (P16M, half the card space)</option>
+        </select></label>
     </div>
   </div>
 
@@ -139,10 +145,18 @@
 
 <script>
 "use strict";
-const SAMP_PER_BLK = 256;
+/* A1 (3.0): frames per 512-byte block. Legacy (v2.7.2 'S816') blocks hold 256
+ * mono int16 samples; a 3.0 'SE3A' block holds 280 engine frames (P14S stereo
+ * take or A7), or 496 for a P16M mono take. Set on connect; per-track via trackSpb(). */
+let SAMP_PER_BLK = 256;
+const SPB_30 = 280, SPB_P16M = 496;
+const META_MAGIC_30 = 0x53453341;          // A2 (3.0): 'SE3A' — the pinned 3.0 index magic (MG-509)
+let FMT30 = false;                         // true once the device reports the 3.0 magic
 let RATE = 24000;                          // device rate, confirmed from the device after connect
 // The on-flash format magic encodes the device's sample rate; the device reports 24 kHz.
-function rateFromMagic(magic){ return (magic === 0x53453234 || magic === 0x53453241) ? 24000 : 48000; } // 'SE24'/'SE2A' = 24 kHz; 'SE4A'/'SE8A'/'SE16'/'S816' fall through to 48 kHz — correct
+// A2 (3.0): 'SE3A' is the 48 kHz two-tier format (engine frames are 48 kHz stereo).
+function rateFromMagic(magic){ if (magic === META_MAGIC_30) return 48000;
+  return (magic === 0x53453234 || magic === 0x53453241) ? 24000 : 48000; } // 'SE24'/'SE2A' = 24 kHz; 'SE4A'/'SE8A'/'SE16'/'S816' fall through to 48 kHz — correct
 const $ = s => document.querySelector(s);
 const logEl = $("#log");
 function log(msg, cls){ const t = new Date().toLocaleTimeString();
@@ -291,6 +305,330 @@ async function exit(){ try{ await io.write(new Uint8Array([0x58])); await io.rea
 
 function trkBlk(slot, t){ return layout.slot0 + (slot*layout.ntrk + t)*layout.trackBlocks; }
 
+/* ==== 3.0 on-device block decoders (A3/A4/A5). Bit-exact ports of the staged
+ * firmware (main.c: a7_decode_block_ring, p14s_dec_ring, p16m_dec_ring,
+ * p14s_unpack). Every block is self-contained: a 16-byte header selects the
+ * codec (blk[11] == 0x5B -> take codec by signature blk[2]; else A7 song
+ * codec). A stereo P14S block yields 280 engine frames, a mono P16M block 496,
+ * an A7 block 280. Frames are 48 kHz stereo int16, interleaved L,R. ==== */
+const P14S_MARK = 0x5B, SIG_P14S = 0x34, SIG_P16M = 0x36;
+const A7_STEP = [7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,
+  73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,
+  408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,
+  1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,
+  7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,
+  22385,24623,27086,29794,32767];
+const A7_IDX7 = [-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 1,1,1,1,2,2,2,2,3,3,3,4,4,4,5,5,
+  6,6,7,7,8,8,9,10,10,11,12,13,14,15,16,16];
+const clip16 = v => v > 32767 ? 32767 : (v < -32768 ? -32768 : v);
+const s16 = v => (v << 16) >> 16;           // int16 wrap, as the firmware's (int16_t) casts
+/* A3: SP1-ADPCM7 (A7). One decoder state per channel, reseeded from the header. */
+function a7Decode(st, c){
+  const pr = clip16(st.p1 + ((st.p1 - st.p2) >> 1));
+  const step = A7_STEP[st.idx], mag = c & 63;
+  const q = ((mag * step) >>> 5) + ((step / 64) | 0);   // (mag*step)/32 + step/64, both unsigned/positive
+  const rec = clip16((c & 64) ? (pr - q) : (pr + q));
+  let ni = st.idx + A7_IDX7[mag]; st.idx = ni < 0 ? 0 : (ni > 88 ? 88 : ni);
+  st.p2 = st.p1; st.p1 = rec;
+  return rec;
+}
+/* A7 block -> 280 frames appended at out[o*2..]. 7-bit codes, LSB-first, 8 codes per 7 bytes. */
+function a7DecodeBlock(blk, out, o){
+  const stereo = blk[5] & 1;
+  const dL = { p1: s16(blk[0] | (blk[1] << 8)), p2: s16(blk[2] | (blk[3] << 8)), idx: blk[4] > 88 ? 88 : blk[4] };
+  const dR = { p1: s16(blk[6] | (blk[7] << 8)), p2: s16(blk[8] | (blk[9] << 8)), idx: blk[10] > 88 ? 88 : blk[10] };
+  let i2 = 0;
+  const ngroups = stereo ? 70 : 35;
+  for (let g = 0; g < ngroups && i2 < 280; g++){
+    const p = 16 + g * 7;
+    let acc = 0, nb = 0, bi = 0;
+    const fill = () => { while (nb <= 24 && bi < 7){ acc |= blk[p + bi++] << nb; nb += 8; } };
+    const take = () => { const c = acc & 0x7F; acc >>>= 7; nb -= 7; return c; };
+    fill();
+    if (stereo){
+      for (let k = 0; k < 8 && i2 < 280; k += 2, i2++){
+        const cl = take(); fill(); const cr = take(); fill();
+        out[(o + i2) * 2] = a7Decode(dL, cl); out[(o + i2) * 2 + 1] = a7Decode(dR, cr);
+      }
+    } else {
+      for (let k = 0; k < 8 && i2 < 280; k++, i2++){
+        const c = take(); fill();
+        const s = a7Decode(dL, c); out[(o + i2) * 2] = s; out[(o + i2) * 2 + 1] = s;
+      }
+    }
+  }
+  return 280;
+}
+/* A4: PCM14S stereo take block -> 280 frames. 140 stored 24 kHz frames, 4 x 14-bit
+ * BIG-endian in 7 bytes, value = (s14 << 2) >> blk[14] (BG-470 block gain),
+ * 2:1 linear upsample; frame 279 holds and is HEALED by the next block
+ * (midpoint of this block's last exact frame and the next block's first). */
+function p14sDecodeBlock(blk, out, o, prev){
+  const sh = blk[14] & 3;
+  let p = 16, pl = prev[0], pr = prev[1], f = o;
+  for (let g = 0; g < 70; g++){
+    const a = ((blk[p] << 24) | (blk[p+1] << 16) | (blk[p+2] << 8) | blk[p+3]) >>> 0;
+    const b = ((blk[p+3] << 24) | (blk[p+4] << 16) | (blk[p+5] << 8) | blk[p+6]) >>> 0;
+    p += 7;
+    let s0 = (a >>> 18) & 0x3FFF, s1 = (a >>> 4) & 0x3FFF, s2 = (b >>> 14) & 0x3FFF, s3 = b & 0x3FFF;
+    if (s0 > 8191) s0 -= 16384; if (s1 > 8191) s1 -= 16384;
+    if (s2 > 8191) s2 -= 16384; if (s3 > 8191) s3 -= 16384;
+    const l0 = s16((s0 << 2) >> sh), r0 = s16((s1 << 2) >> sh);
+    const l1 = s16((s2 << 2) >> sh), r1 = s16((s3 << 2) >> sh);
+    if (g === 0){ if (o > 0){ out[(o - 1) * 2] = s16((pl + l0) >> 1); out[(o - 1) * 2 + 1] = s16((pr + r0) >> 1); } }
+    else { out[f * 2] = s16((pl + l0) >> 1); out[f * 2 + 1] = s16((pr + r0) >> 1); f++; }
+    out[f * 2] = l0; out[f * 2 + 1] = r0; f++;
+    out[f * 2] = s16((l0 + l1) >> 1); out[f * 2 + 1] = s16((r0 + r1) >> 1); f++;
+    out[f * 2] = l1; out[f * 2 + 1] = r1; f++;
+    pl = l1; pr = r1;
+  }
+  out[f * 2] = pl; out[f * 2 + 1] = pr;          // frame 279: the hold
+  prev[0] = pl; prev[1] = pr;                    // last EXACT frame (278)
+  return 280;
+}
+/* A4: P16M mono take block -> 496 frames. 248 little-endian int16 stored samples
+ * (24 kHz), frame 2i = v[i] on both channels, 2i+1 = (v[i]+v[i+1]+1)>>1, final
+ * odd frame holds; previous block's hold frame healed as (prev+v[0])>>1. */
+function p16mDecodeBlock(blk, out, o, prev){
+  let v = s16(blk[16] | (blk[17] << 8)), f = o;
+  if (o > 0){ out[(o - 1) * 2] = s16((prev[0] + v) >> 1); out[(o - 1) * 2 + 1] = s16((prev[1] + v) >> 1); }
+  for (let i = 0; i < 248; i++){
+    const vn = (i < 247) ? s16(blk[18 + i * 2] | (blk[19 + i * 2] << 8)) : v;
+    const h = s16((v + vn + 1) >> 1);
+    out[f * 2] = v; out[f * 2 + 1] = v; f++;
+    out[f * 2] = h; out[f * 2 + 1] = h; f++;
+    v = vn;
+  }
+  prev[0] = v; prev[1] = v;
+  return 496;
+}
+/* Frames a block will produce, from its header (or the owner's stride for a
+ * pad block that carries no header) -- mirrors p14s_unpack's _spb. */
+function blockFrames(blk, ownerSpb){
+  if (blk[11] === P14S_MARK) return blk[2] === SIG_P16M ? 496 : 280;
+  return ownerSpb === 496 ? 496 : 280;
+}
+/* A5: decode a run of on-card blocks into interleaved stereo int16 frames,
+ * dispatching per block exactly like the firmware's sequential fill
+ * (p14s_unpack). `ownerSpb` is the track's own stride (496 for a P16M take,
+ * else 280); it only matters for headerless pad blocks. */
+function decodeBlocks(bytes, nblk, ownerSpb){
+  let total = 0;
+  for (let b = 0; b < nblk; b++) total += blockFrames(bytes.subarray(b * 512, b * 512 + 512), ownerSpb);
+  const out = new Int16Array(total * 2);
+  const prev = [0, 0];                          // per-track decode continuity (g_p14s_prev)
+  let o = 0;
+  for (let b = 0; b < nblk; b++){
+    const blk = bytes.subarray(b * 512, b * 512 + 512);
+    if (blk[11] === P14S_MARK){
+      if (blk[2] === SIG_P16M)       o += p16mDecodeBlock(blk, out, o, prev);
+      else if (blk[2] === SIG_P14S)  o += p14sDecodeBlock(blk, out, o, prev);
+      else {                          // marked but FOREIGN signature: silence, healed against 0
+        const n = blockFrames(blk, ownerSpb);
+        for (let f = 0; f < n; f++){ out[(o + f) * 2] = 0; out[(o + f) * 2 + 1] = 0; }
+        if (o > 0){ out[(o - 1) * 2] = s16(prev[0] >> 1); out[(o - 1) * 2 + 1] = s16(prev[1] >> 1); }
+        prev[0] = 0; prev[1] = 0; o += n;
+      }
+    } else if (ownerSpb === 496){     // headerless block under a P16M owner: the silence pad
+      for (let f = 0; f < 496; f++){ out[(o + f) * 2] = 0; out[(o + f) * 2 + 1] = 0; }
+      o += 496;
+    } else {                          // legacy / song-tier A7 block
+      o += a7DecodeBlock(blk, out, o);
+    }
+  }
+  return out;
+}
+/* ==== end 3.0 decoders ==== */
+
+/* ==== 3.0 on-device block ENCODERS (phase 2). Bit-exact ports of the staged
+ * firmware's take packers (main.c: p14s_pack_blocks, p16m_pack_blocks) and of
+ * the recorder's 48k -> 24k capture average (CD-463). This file is the module
+ * copy used by the harness; the SAME text is inlined in ../index.html.
+ *
+ * Stored input: Int16Array of interleaved L,R STORED (24 kHz) frames.
+ * P14S: 140 stored frames -> one 512 B block = 280 engine frames.
+ * P16M: 248 stored frames -> one 512 B block = 496 engine frames. ==== */
+
+/* CD-463 capture average: engine (48 kHz) interleaved stereo int16 frames ->
+ * stored (24 kHz) frames. The pair grid is ABSOLUTE: even engine frame = hold,
+ * odd = store (hold + cur + 1) >> 1 at index (n >> 1). An odd trailing frame
+ * is held and never stored (the firmware pads a take to whole blocks first;
+ * callers here pad to an even count too). */
+function pairAverage48to24(eng, nEngFrames){
+  const nOut = nEngFrames >> 1;
+  const out = new Int16Array(nOut*2);
+  let holdL = 0, holdR = 0;
+  for (let n = 0; n < nEngFrames; n++){
+    const l = eng[n*2], r = eng[n*2+1];
+    if ((n & 1) === 0){ holdL = l; holdR = r; }
+    else { const fi = n >> 1; out[fi*2] = (holdL + l + 1) >> 1; out[fi*2+1] = (holdR + r + 1) >> 1; }
+  }
+  return out;
+}
+
+/* P14S encoder state: the noise shaper e1[2] is CARRIED across blocks within a
+ * take and reset whenever the block gain shift moves (S8/Q rule); both start
+ * at 0 at the punch (main.c: g_p14s_e1 = 0, g_p14s_sh = 0 at TS_REC). */
+function p14sEncoderState(){ return { e1: [0, 0], sh: 0 }; }
+/* stored: Int16Array LR stored frames; start: first stored frame; nblk blocks
+ * -> out (Uint8Array, nblk*512) from byte offset outOff. st = encoder state. */
+function p14sEncodeBlocks(stored, start, nblk, out, outOff, st){
+  for (let b = 0; b < nblk; b++){
+    const o0 = outOff + b*512, f0 = start + b*140;
+    out[o0] = 0x50; out[o0+1] = 0x31; out[o0+2] = 0x34; out[o0+3] = 0x53;   // 'P14S'
+    out[o0+4] = 0; out[o0+5] = 1; out[o0+6] = 0; out[o0+7] = 0;
+    out[o0+8] = 0; out[o0+9] = 0; out[o0+10] = 0; out[o0+11] = 0x5B;       // P14S_MARK
+    out[o0+12] = 280 & 0xFF; out[o0+13] = 280 >> 8;                          // SAMP_PER_BLK (engine frames)
+    // BG-470 block floating point: peak of the 140 stored frames, both channels
+    let pk = 0;
+    for (let i = 0; i < 140; i++){
+      const fa = (f0 + i)*2;
+      let a = stored[fa] | 0; if (a < 0) a = -a;
+      let d = stored[fa+1] | 0; if (d < 0) d = -d;
+      if (a > pk) pk = a;
+      if (d > pk) pk = d;
+    }
+    let sh = 0;
+    while (sh < 3 && (pk << (sh + 1)) < 32000) sh++;
+    out[o0+14] = sh; out[o0+15] = 0;
+    if (sh !== st.sh){ st.e1[0] = 0; st.e1[1] = 0; st.sh = sh; }   // S8/Q rule
+    let o = o0 + 16;
+    const q4 = [0, 0, 0, 0];
+    for (let i = 0; i < 140; i += 2){
+      for (let k = 0; k < 2; k++){
+        const fa = (f0 + i + k)*2;
+        for (let c = 0; c < 2; c++){
+          const s24 = (stored[fa + c] | 0) << sh;
+          let v = s24 - st.e1[c];
+          if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+          let q = (v + 2) >> 2;
+          if (q > 8191) q = 8191; else if (q < -8192) q = -8192;
+          let e = (q << 2) - v;
+          if (e > 16) e = 16; else if (e < -16) e = -16;
+          st.e1[c] = e;
+          q4[k*2 + c] = q;
+        }
+      }
+      // PK32-484: two 32-bit words, big-endian bytes -- the exact inverse of the decode
+      const p0 = q4[0] & 0x3FFF, p1 = q4[1] & 0x3FFF, p2 = q4[2] & 0x3FFF, p3 = q4[3] & 0x3FFF;
+      const pa = ((p0 << 18) | (p1 << 4) | (p2 >>> 10)) >>> 0;
+      const pb = ((p2 << 14) | p3) >>> 0;
+      out[o]   = (pa >>> 24) & 0xFF; out[o+1] = (pa >>> 16) & 0xFF;
+      out[o+2] = (pa >>> 8) & 0xFF;  out[o+3] = pa & 0xFF;
+      out[o+4] = (pb >>> 16) & 0xFF; out[o+5] = (pb >>> 8) & 0xFF; out[o+6] = pb & 0xFF;
+      o += 7;
+    }
+  }
+}
+/* P16M: 248 consecutive stored frames per block, mono downmix (L+R+1)>>1, int16 LE. */
+function p16mEncodeBlocks(stored, start, nblk, out, outOff){
+  for (let b = 0; b < nblk; b++){
+    const o0 = outOff + b*512, f0 = start + b*248;
+    out[o0] = 0x50; out[o0+1] = 0x31; out[o0+2] = 0x36; out[o0+3] = 0x4D;   // 'P16M'
+    out[o0+4] = 0; out[o0+5] = 0; out[o0+6] = 0; out[o0+7] = 0;
+    out[o0+8] = 0; out[o0+9] = 0; out[o0+10] = 0; out[o0+11] = 0x5B;
+    out[o0+12] = 496 & 0xFF; out[o0+13] = 496 >> 8;
+    out[o0+14] = 0; out[o0+15] = 0;
+    let o = o0 + 16;
+    for (let i = 0; i < 248; i++){
+      const fa = (f0 + i)*2;
+      const m = ((stored[fa] | 0) + (stored[fa+1] | 0) + 1) >> 1;
+      out[o] = m & 0xFF; out[o+1] = (m >> 8) & 0xFF;
+      o += 2;
+    }
+  }
+}
+/* whole take: engine frames (interleaved stereo int16, already padded to
+ * nblk * spb frames) -> nblk on-card blocks of the chosen codec */
+function encodeTake(eng, nblk, mono){
+  const spb = mono ? 496 : 280;
+  const stored = pairAverage48to24(eng, nblk*spb);
+  const out = new Uint8Array(nblk*512);
+  if (mono) p16mEncodeBlocks(stored, 0, nblk, out, 0);
+  else p14sEncodeBlocks(stored, 0, nblk, out, 0, p14sEncoderState());
+  return out;
+}
+/* ==== end 3.0 encoders ==== */
+
+/* ---- x3_tab (3.0): the per-track extended table on blocks 3, 4 AND 5
+ * (X3_NBLK = 3; the struct is 1040 B: 16 B header + 64 x 16 B entries).
+ * Self-validating: magic 'SE3X', ver 1, u16 sum over the 1024 entry bytes.
+ * A mismatch means "no table" (blocks 3-5 hold stale stock bytes on some
+ * cards). Read-only here: codec_id (5 = P14S stereo, 6 = P16M mono) is the
+ * sole authority for a take's stride, len_samps is its exact loop length,
+ * flags bits 1-2 are the print-gain shift (a bounce is stored >> gsh and
+ * played back << gsh). ---- */
+const X3_MAGIC = 0x53453358, X3_VER = 1, X3_BLK = 3, X3_NBLK = 3;
+const X3_CODEC_P14S = 5, X3_CODEC_P16M = 6;
+/* firmware MAX_LOOP_BLOCKS on 3.0: BEAT_SAMPLES_L 35840 x MAX_BEATS 643 / SAMP_PER_BLK 280
+ * (the recorder clamps content/len to this, in the track's own blocks) */
+const MAX_LOOP_BLOCKS_30 = 82304;
+let x3 = null;                             // { valid, t[slot][trk] = {start,len,content,codec,flags,pan,rsv} }
+function parseX3(b){
+  const tab = { valid: false, t: [] };
+  let sum = 0; for (let i = 0; i < 1024; i++) sum = (sum + b[16 + i]) & 0xFFFF;
+  tab.valid = le32(b,0) === X3_MAGIC && (b[4] | (b[5]<<8)) === X3_VER && (b[6] | (b[7]<<8)) === sum;
+  for (let s = 0; s < 16; s++){ const row = [];
+    for (let t = 0; t < 4; t++){ const o = 16 + (s*4 + t)*16;
+      row.push({ start: le32(b,o), len: le32(b,o+4), content: le32(b,o+8), codec: b[o+12], flags: b[o+13], pan: b[o+14], rsv: b[o+15] }); }
+    tab.t.push(row); }
+  return tab;
+}
+function x3Of(slot, t){ return (FMT30 && x3 && x3.valid && slot < 16 && t < 4) ? x3.t[slot][t] : null; }
+/* frames per block for THIS track (the owner's stride): 496 for a P16M take, else 280; 256 legacy */
+function trackSpb(slot, t){ if (!FMT30) return SAMP_PER_BLK; const xe = x3Of(slot, t); return (xe && xe.codec === X3_CODEC_P16M) ? SPB_P16M : SPB_30; }
+/* the song's base loop length in THIS track's blocks (firmware TLOOPB: rounded) */
+function baseBlocks(slot, spb){ const ll = meta.slots[slot].loopLen; return ll ? Math.floor((ll + (spb>>1)) / spb) : 0; }
+/* the track's exact loop length in engine frames (firmware slot load: x3 len_samps
+ * when the table is valid, else rebuilt from the block length and the song master) */
+function trackFrames(slot, t, blocks, spb){
+  const xe = x3Of(slot, t);
+  if (xe && xe.len) return xe.len;
+  const ms = meta.slots[slot].loopLen;
+  if (FMT30 && ms && blocks && (ms % spb) !== 0){ let mult = Math.floor((blocks*spb + (ms>>1)) / ms); if (!mult) mult = 1; return mult*ms; }
+  return blocks*spb;
+}
+/* ---- x3_tab WRITE (phase 2): read-modify-write of blocks 3-5. The firmware
+ * authors a row at take promotion (start_samps, len_samps, content_blocks,
+ * codec_id 5/6, flags bit0 stereo | bits 1-2 gsh, pan 128, rsv) and its
+ * delete zeroes the row but KEEPS rsv (the per-song next-record-mode
+ * preference outlives the take, main.c FX3-537). The u16 sum covers the 1024
+ * entry bytes; blocks 4 and 5 are written first and block 3 (magic + sum)
+ * last, so an interrupted write reads as "no table", never as a wrong one. ---- */
+async function readX3Raw(){
+  const xb = new Uint8Array(512 * X3_NBLK);
+  for (let i = 0; i < X3_NBLK; i++) xb.set(await readBlock(X3_BLK + i), i*512);
+  const t = parseX3(xb);
+  if (t.valid) return xb;
+  const fresh = new Uint8Array(512 * X3_NBLK);      // stale/absent table: start clean
+  put32(fresh, 0, X3_MAGIC); fresh[4] = X3_VER & 255; fresh[5] = X3_VER >> 8;
+  return fresh;
+}
+function x3Seal(xb){ let sum = 0; for (let i = 0; i < 1024; i++) sum = (sum + xb[16 + i]) & 0xFFFF;
+  put32(xb, 0, X3_MAGIC); xb[4] = X3_VER & 255; xb[5] = X3_VER >> 8; xb[6] = sum & 255; xb[7] = sum >> 8; }
+async function writeX3Raw(xb){
+  x3Seal(xb);
+  await writeBlock(X3_BLK + 1, xb.slice(512, 1024));
+  await writeBlock(X3_BLK + 2, xb.slice(1024, 1536));
+  await writeBlock(X3_BLK, xb.slice(0, 512));        // magic + sum last
+}
+/* e = { start, len, content, codec, flags, pan } (rsv is preserved); e = null zeroes the row like the device's delete */
+async function writeX3Entry(slot, t, e){
+  const xb = await readX3Raw();
+  const o = 16 + (slot*4 + t)*16;
+  if (e){ put32(xb, o, e.start); put32(xb, o+4, e.len); put32(xb, o+8, e.content); xb[o+12] = e.codec; xb[o+13] = e.flags; xb[o+14] = e.pan; }
+  else  { put32(xb, o, 0); put32(xb, o+4, 0); put32(xb, o+8, 0); xb[o+12] = 0; xb[o+13] = 0; xb[o+14] = 128; }
+  await writeX3Raw(xb);
+}
+/* the song's effective loop-length mode: song_mode low nibble (1 variable, 2 fixed), else the global fixed_len */
+function songFixed(slot){
+  if (!meta || !meta.raw || !FMT30) return false;
+  const fl = le32(meta.raw, 8 + layout.numSlots*SLOT_SZ);
+  const sm = meta.raw[settingsOff() + 4 + layout.numSlots*2 + slot] & 0x0F;
+  return sm ? sm === 2 : !!fl;
+}
+
 /* meta_blk: magic u32 | cur_slot u32 | slot[NUM_SLOTS] (each: speed_q16,loop_len,present[4],trk_len[4],trk_start[4]) */
 const SLOT_SZ = 44;
 function parseMeta(b){
@@ -376,7 +714,10 @@ $("#connect").onclick = async () => {
     log("Port open. Entering transfer mode…");
     layout = await handshake();
     RATE = rateFromMagic(layout.magic);            // match the device rate
-    log(`Connected. ${layout.numSlots} songs x ${layout.ntrk} tracks, ${RATE/1000} kHz.`, "ok");
+    FMT30 = (layout.magic === META_MAGIC_30);       // A2 (3.0)
+    SAMP_PER_BLK = FMT30 ? SPB_30 : 256;            // A1 (3.0)
+    log(`Connected. ${layout.numSlots} songs x ${layout.ntrk} tracks, ${RATE/1000} kHz${FMT30 ? ", 3.0 format (stereo takes)" : ""}.`, "ok");
+    if (FMT30) log("3.0 device: takes are stored as P14S stereo or P16M mono. Uploads are encoded the same way (see \"Upload as\" in Device settings).");
     setConnected(true);
     await refresh();
     startKeepalive();                              // hold transfer mode open between actions
@@ -402,9 +743,9 @@ $("#dlall").onclick = async () => {
     const todo = [];
     for (let s = 0; s < layout.numSlots; s++){
       const slot = meta.slots[s];
-      const base = slot.loopLen ? slot.loopLen/SAMP_PER_BLK : 0;
       for (let t = 0; t < layout.ntrk; t++){
         if (!slot.present[t]) continue;
+        const base = baseBlocks(s, trackSpb(s, t));   // A1 (3.0): per-track stride
         const blocks = slot.trkLen[t] || base;
         if (blocks) todo.push({s, t, blocks, content: slot.trkContent[t]||0});
       }
@@ -424,6 +765,7 @@ function setConnected(on){
   $("#connect").style.display = on ? "none" : "";
   $("#done").style.display = on ? "" : "none";
   $("#cards").style.display = on ? "" : "none";
+  $("#upmoderow").style.display = (on && FMT30) ? "" : "none";   // 3.0 only: the upload codec choice
   $("#hint").style.display = on ? "none" : "";
   syncAdmin();
 }
@@ -511,25 +853,34 @@ async function refresh(){
     b0 = joined;
   }
   meta = parseMeta(b0);
+  x3 = null;
+  if (FMT30){                                          // 3.0: blocks 3-5 = x3_tab
+    const xb = new Uint8Array(512 * X3_NBLK);
+    for (let i = 0; i < X3_NBLK; i++) xb.set(await readBlock(X3_BLK + i), i*512);
+    x3 = parseX3(xb);
+    if (!x3.valid) log("Note: no valid extended track table (blocks 3-5) — lengths fall back to the index.", "err");
+  }
   syncSettings();
   syncAdmin();
   if (meta.magic !== layout.magic) log("Note: the index block looks unformatted/empty.", "err");
   render();
 }
 
-function fmtLen(blocks){ const s = blocks*SAMP_PER_BLK/RATE; return s>=1 ? s.toFixed(1)+" s" : Math.round(s*1000)+" ms"; }
+function fmtLen(blocks, spb){ const s = blocks*(spb||SAMP_PER_BLK)/RATE; return s>=1 ? s.toFixed(1)+" s" : Math.round(s*1000)+" ms"; }
 
 function render(){
   stopPreview();                       // cells are about to be rebuilt
   const root = $("#songs"); root.innerHTML = "";
   for (let s=0; s<layout.numSlots; s++){
     const slot = meta.slots[s];
-    const base = slot.loopLen ? slot.loopLen/SAMP_PER_BLK : 0;
+    const baseFrames = slot.loopLen || 0;   // A1 (3.0): the master is in frames; blocks are per-track
     const song = document.createElement("div"); song.className = "song";
-    song.innerHTML = `<h2>Song ${s+1}${base? " · base "+fmtLen(base):""}</h2>`;
+    song.innerHTML = `<h2>Song ${s+1}${baseFrames? " · base "+fmtLen(baseFrames, 1):""}</h2>`;
     const grid = document.createElement("div"); grid.className = "tracks";
     for (let t=0; t<layout.ntrk; t++){
       const present = !!slot.present[t];
+      const spb = trackSpb(s, t);
+      const base = baseBlocks(s, spb);
       const blocks = present ? (slot.trkLen[t] || base) : 0;
       // the AUDIO length is trk_content when a fixed-mode take recorded less
       // than its loop region — showing the region here was the "56.3 s on a
@@ -538,10 +889,13 @@ function render(){
       const audioBlocks = (content && content < blocks) ? content : blocks;
       const mult = (present && base && blocks % base === 0) ? (blocks/base) : 0;
       const cell = document.createElement("div"); cell.className = "cell" + (present?"":" empty");
+      const xe = x3Of(s, t);   // 3.0: codec + print gain, shown so a mono take / bounce is recognisable
+      const tag = xe ? (xe.codec === X3_CODEC_P16M ? " · mono" : (xe.codec === X3_CODEC_P14S ? " · stereo" : ` · codec ${xe.codec}`))
+                       + (((xe.flags >> 1) & 3) ? " · bounce" : "") : "";
       cell.innerHTML = `<div class="name">Track ${t+1}</div>
-        <div class="len">${present ? fmtLen(audioBlocks)
-          + (audioBlocks < blocks ? ` · loops at ${fmtLen(blocks)}` : "")
-          + (mult>1 ? ` · ${mult}× base` : "") : "empty"}</div>`;
+        <div class="len">${present ? fmtLen(audioBlocks, spb)
+          + (audioBlocks < blocks ? ` · loops at ${fmtLen(blocks, spb)}` : "")
+          + (mult>1 ? ` · ${mult}× base` : "") + tag : "empty"}</div>`;
       const acts = document.createElement("div"); acts.className = "acts";
       if (present){
         const pl = document.createElement("div"); pl.className="mini dl"; pl.textContent="Play";
@@ -549,10 +903,10 @@ function render(){
         const dl = document.createElement("div"); dl.className="mini dl"; dl.textContent="Download";
         dl.onclick = () => download(s, t, blocks, content); acts.appendChild(dl);
       }
-      const up = document.createElement("label"); up.className="up"; up.textContent = present? "Replace…" : "Upload…";
+      { const up = document.createElement("label"); up.className="up"; up.textContent = present? "Replace…" : "Upload…";
       const inp = document.createElement("input"); inp.type="file"; inp.accept=".wav,.mp3,audio/*";
       inp.onchange = e => { if (e.target.files[0]) upload(s, t, e.target.files[0]); };
-      up.appendChild(inp); acts.appendChild(up);
+      up.appendChild(inp); acts.appendChild(up); }
       if (present){
         const del = document.createElement("div"); del.className="mini del"; del.textContent="Delete";
         del.onclick = () => deleteTrack(s, t); acts.appendChild(del);
@@ -580,7 +934,13 @@ async function download(slot, t, blocks, content){
       progress(null);
       const spd = (meta.slots[slot].speed || 65536) / 65536;   // song tape speed
       const hz  = Math.max(8000, Math.round(RATE * spd));      // heard-rate stamp
-      const wav = makeWav(pcm, blocks*SAMP_PER_BLK, hz);
+      let wav;
+      if (FMT30){   // A5/A6 (3.0): decode per block -> stereo frames, exact loop length, stereo WAV
+        const dec = decodeTrack(slot, t, pcm, readN, blocks);
+        wav = makeWav(new Uint8Array(dec.buffer, dec.byteOffset, dec.byteLength), dec.length/2, hz, 2);
+      } else {
+        wav = makeWav(pcm, blocks*SAMP_PER_BLK, hz);
+      }
       const a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob([wav], {type:"audio/wav"}));
       a.download = `sp1_song${slot+1}_track${t+1}.wav`; a.click();
@@ -640,7 +1000,9 @@ async function preview(slot, t, blocks, content, btn){
       }
       progress(null);
       if (pvJob !== job) return;
-      const i16 = new Int16Array(pcm.buffer, 0, readN*SAMP_PER_BLK);
+      const i16 = FMT30 ? decodeTrack(slot, t, pcm, readN, blocks)     // A5 (3.0): stereo frames
+                        : new Int16Array(pcm.buffer, 0, readN*SAMP_PER_BLK);
+      const nch = FMT30 ? 2 : 1;
       const spd = (meta.slots[slot].speed || 65536) / 65536;
       const hz  = Math.max(8000, Math.round(RATE * spd));
       if (!pvCtx) pvCtx = new (window.AudioContext||window.webkitAudioContext)();
@@ -649,9 +1011,9 @@ async function preview(slot, t, blocks, content, btn){
       if (!routed && !pvTip){ pvTip = true;
         log("Hear nothing? Your computer's sound output may be set to the SP-1 itself, which is silent during transfer — pick your speakers or headphones in the sound menu.", "err"); }
       if (pvJob !== job) return;                   // cancelled during the audio setup awaits
-      const buf = pvCtx.createBuffer(1, i16.length, hz);
-      const ch = buf.getChannelData(0);
-      for (let i=0;i<i16.length;i++) ch[i] = i16[i]/32768;
+      const buf = pvCtx.createBuffer(nch, i16.length/nch, hz);
+      for (let c=0;c<nch;c++){ const ch = buf.getChannelData(c);
+        for (let i=0;i<ch.length;i++) ch[i] = i16[i*nch+c]/32768; }
       const src = pvCtx.createBufferSource();
       src.buffer = buf; src.loop = true;
       src.connect(pvCtx.destination); src.start();
@@ -677,20 +1039,37 @@ async function deleteTrack(slot, t){
       const mb = buildMeta(meta);
       if (layout.numSlots > 8) await writeBlock(1, mb.slice(512, 1024));
       await writeBlock(0, mb.slice(0, 512));
+      if (FMT30) await writeX3Entry(slot, t, null);   // 3.0: the row dies with the take, like the device's delete (main.c FX3-537)
       await commitToDevice();
       log(`Deleted song ${slot+1} track ${t+1}.`, "ok");
-      render();
+      if (FMT30) await refresh(); else render();
     }catch(e){ log("Delete failed: "+e.message, "err"); }
   });
 }
 
-function makeWav(pcmBytes, nSamples, hz){
+/* 3.0: on-card blocks of one track -> interleaved stereo int16 engine frames,
+ * trimmed/padded to the track's exact loop length (frames past the recorded
+ * content are the device's synthesized silence) with the print gain applied
+ * (a bounce is stored >> gsh and played << gsh; saturated to int16). */
+function decodeTrack(slot, t, pcm, readN, blocks){
+  const spb = trackSpb(slot, t);
+  const dec = decodeBlocks(pcm, readN, spb);
+  const nfr = trackFrames(slot, t, blocks, spb);
+  const out = new Int16Array(nfr*2);
+  out.set(dec.length <= out.length ? dec : dec.subarray(0, out.length));
+  const xe = x3Of(slot, t), gsh = xe ? (xe.flags >> 1) & 3 : 0;
+  if (gsh) for (let i=0;i<out.length;i++){ const v = out[i] << gsh; out[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : v); }
+  return out;
+}
+/* A6 (3.0): nch = 1 (legacy mono) or 2 (stereo, interleaved L,R); nSamples = frames */
+function makeWav(pcmBytes, nSamples, hz, nch){
+  nch = nch || 1;
   const hdr = new ArrayBuffer(44), v = new DataView(hdr);
-  const dataLen = nSamples*2;
+  const dataLen = nSamples*2*nch;
   const wr = (o,str)=>{ for(let i=0;i<str.length;i++) v.setUint8(o+i, str.charCodeAt(i)); };
   wr(0,"RIFF"); v.setUint32(4, 36+dataLen, true); wr(8,"WAVE"); wr(12,"fmt ");
-  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
-  v.setUint32(24,hz,true); v.setUint32(28,hz*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,nch,true);
+  v.setUint32(24,hz,true); v.setUint32(28,hz*2*nch,true); v.setUint16(32,2*nch,true); v.setUint16(34,16,true);
   wr(36,"data"); v.setUint32(40,dataLen,true);
   const out = new Uint8Array(44+dataLen); out.set(new Uint8Array(hdr)); out.set(pcmBytes.slice(0,dataLen),44);
   return out;
@@ -698,6 +1077,7 @@ function makeWav(pcmBytes, nSamples, hz){
 
 /* ---- upload: decode -> 24 kHz mono int16 -> snap to loop multiple -> write ---- */
 async function upload(slot, t, file){
+  if (FMT30) return upload30(slot, t, file);   // 3.0: P14S / P16M takes + the x3 row (below)
   try{
     log(`Reading ${file.name}…`);
     const ac = new (window.AudioContext||window.webkitAudioContext)();
@@ -758,6 +1138,90 @@ async function upload(slot, t, file){
       progress(null);
       log("Uploaded and saved to the device.", "ok");
       render();
+    });
+  }catch(e){ log("Upload failed: "+e.message, "err"); }
+  finally{ progress(null); }
+}
+
+/* ---- upload, 3.0: the WAV becomes a device take exactly the way the recorder
+ * makes one. Resample to the heard rate (48 kHz engine x the song's tape speed,
+ * stereo), int16 engine frames, pad to whole blocks, the recorder's 48k -> 24k
+ * pair average (CD-463), then P14S (stereo, 280 engine frames per block) or
+ * P16M (mono, 496) with the firmware's own packers. The loop is a whole number
+ * of blocks (nearest, the recorder's own rounding: a stop past the line snaps
+ * back, a stop before it pads) because the firmware plays whole blocks. Index:
+ * present, trk_len = trk_content = the blocks, trk_start 0; the first track of
+ * an empty song sets loop_len (= blocks x stride, engine frames) like a first
+ * take does. Then the x3 row (codec, len_samps = blocks x stride, gsh 0), then
+ * the index, then commit. ---- */
+async function upload30(slot, t, file){
+  try{
+    log(`Reading ${file.name}…`);
+    const ac = new (window.AudioContext||window.webkitAudioContext)();
+    const decoded = await ac.decodeAudioData(await file.arrayBuffer());
+    const sl = meta.slots[slot];
+    const uspd = ((sl && sl.speed) || 65536) / 65536;
+    const uhz  = Math.min(96000, Math.max(8000, Math.round(RATE * uspd)));   // engine 48 kHz x tape speed = the rate it is heard at
+    const frames = Math.ceil(decoded.duration*uhz);
+    const off = new OfflineAudioContext(2, Math.max(1,frames), uhz);        // a mono file is upmixed L = R
+    const src = off.createBufferSource(); src.buffer = decoded; src.connect(off.destination); src.start();
+    const rend = await off.startRendering();
+    const L = rend.getChannelData(0), R = rend.numberOfChannels > 1 ? rend.getChannelData(1) : L;
+    ac.close();
+    const sel = document.getElementById('upmode'), modeV = sel ? String(sel.value) : 'auto';
+    const mono = modeV === 'mono' || (modeV === 'auto' && decoded.numberOfChannels < 2);
+    const spb = mono ? SPB_P16M : SPB_30;
+    let N = L.length;                                                       // engine frames in the file
+    let blocks = Math.floor((N + (spb >> 1)) / spb); if (blocks < 1) blocks = 1;   // the loop (recorder: nearest block)
+    const maxBlk = Math.min(layout.trackBlocks, MAX_LOOP_BLOCKS_30);
+    if (blocks > maxBlk){                                                   // the only length the firmware cannot hold
+      blocks = maxBlk;
+      log(`Clip too long — truncated to ${fmtLen(blocks, spb)} (the device's longest loop).`, "err");
+    }
+    const content = blocks;                                                 // the card holds exactly the loop
+    const isBase = !sl.loopLen;
+    const base = baseBlocks(slot, spb);
+    const clipS = (N/uhz).toFixed(1);
+    if (N !== blocks*spb) log(`Note: ${clipS}s is not a whole number of ${mono ? 496 : 280}-frame blocks; the device loops in whole blocks, so the loop is ${fmtLen(blocks, spb)} (` +
+      (blocks*spb > N ? `${Math.round((blocks*spb - N)*1000/uhz)} ms of silence at the end` : `the last ${Math.round((N - blocks*spb)*1000/uhz)} ms are dropped`) + ").");
+    if (isBase) log(`First track in song ${slot+1}: its ${clipS}s also sets the song's loop length and beat grid (${fmtLen(blocks, spb)}).`);
+    else if (base && blocks % base !== 0 && songFixed(slot))
+      log(`Song ${slot+1} is in FIXED loop mode and this clip (${fmtLen(blocks, spb)}) is not a whole multiple of its base (${fmtLen(base, spb)}). The device does not refuse it: the track loops at its own length, but the fixed-mode bar tiling (chop, heads) will not lock to it. Resample the file to a multiple of the base for a locked loop.`, "err");
+    else log(`Clip is ${clipS}s — the track loops at its own length (${fmtLen(blocks, spb)}${base && blocks % base === 0 ? `, ${blocks/base}× base` : ""}).`);
+    if (x3 && !x3.valid) log("Note: the device had no valid extended track table (blocks 3-5); a fresh one is written now.");
+
+    // int16 stereo engine frames, padded with silence to whole blocks (the recorder pads its last block the same way)
+    const total = content*spb;
+    const eng = new Int16Array(total*2);
+    const n = Math.min(N, total);
+    for (let i=0;i<n;i++){
+      let x = Math.round(L[i]*32767); eng[i*2]   = x>32767?32767:(x<-32768?-32768:x);
+      let y = Math.round(R[i]*32767); eng[i*2+1] = y>32767?32767:(y<-32768?-32768:y);
+    }
+    const bytes = encodeTake(eng, content, mono);   // CD-463 pair average + P14S / P16M packers (bit-exact with the firmware)
+
+    await withLock(async () => {
+      log(`Writing ${content} ${mono ? "P16M mono" : "P14S stereo"} blocks (${fmtLen(blocks, spb)})…`);
+      const dst = trkBlk(slot, t);
+      for (let i=0;i<content;i++){ await writeBlock(dst+i, bytes.subarray(i*512,(i+1)*512));
+        if (i%16===0) progress(`Uploading song ${slot+1} track ${t+1}`, i/content); }
+      // the x3 row first (it is only read for a PRESENT track, so a torn session leaves nothing half-true)
+      await writeX3Entry(slot, t, { start: 0, len: blocks*spb, content: content, codec: mono ? X3_CODEC_P16M : X3_CODEC_P14S,
+                                    flags: mono ? 0 : 1, pan: 128 });   // flags: bit0 stereo, bits 1-2 gsh = 0 (no print gain)
+      // then the index, preserving every other song/track (magic-last block order, as the firmware's own save)
+      sl.present[t] = 1; sl.trkLen[t] = blocks; sl.trkStart[t] = 0;
+      sl.trkContent[t] = content;
+      if (!sl.speed) sl.speed = 65536;
+      if (isBase) sl.loopLen = blocks*spb;
+      { const mb = buildMeta(meta);
+        if (layout.numSlots > 8) await writeBlock(1, mb.slice(512, 1024));
+        await writeBlock(0, mb.slice(0, 512)); }
+      progress(`Saving song ${slot+1} track ${t+1} to the device`, 1);
+      await commitToDevice();                            // 'F': the device re-reads the index and flushes to NAND
+      progress(null);
+      log("Uploaded and saved to the device.", "ok");
+      log("Power-cycle the SP-1 before recording into this song: the device reads the extended track table (blocks 3-5) only at boot, and its next save would write its own stale copy over the row this upload just wrote.", "err");
+      await refresh();
     });
   }catch(e){ log("Upload failed: "+e.message, "err"); }
   finally{ progress(null); }
