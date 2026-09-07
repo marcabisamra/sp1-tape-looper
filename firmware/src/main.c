@@ -1009,6 +1009,18 @@ static inline __attribute__((always_inline)) int x3_valid(const struct x3_tab *t
 	       tb->sum == x3_sum(tb);
 }
 static volatile uint32_t g_slot;
+/* PLACE-715: the track's place (balance) lives in the x3 row's pan byte; 0 = unset = centre. */
+static volatile uint32_t g_place_dirty_ms;   /* last fader move (|1); 0 = clean */
+static uint8_t place_get(int i)
+{
+	return (g_slot < NUM_SLOTS && g_x3.t[g_slot][i].pan) ? g_x3.t[g_slot][i].pan : 128u;
+}
+static void place_set(int i, uint8_t v)
+{
+	if (g_slot >= NUM_SLOTS || g_x3.t[g_slot][i].pan == v) return;
+	g_x3.t[g_slot][i].pan = v;
+	g_place_dirty_ms = k_uptime_get_32() | 1u;
+}
 static volatile int      g_slot_switch_req;   /* main -> audio: reload tracks for the new slot */
 static volatile int      g_meta_save_req;     /* -> streamer: persist g_meta to eMMC */
 /* ---- TAPPED GRID (M8a): per-song tempo grid taught by FN-taps ----
@@ -1028,6 +1040,62 @@ BUILD_ASSERT(sizeof(struct grid_ext) <= 512, "grid ext must fit one block");
 static volatile uint16_t g_grid_bpm_q8[NUM_SLOTS];
 static volatile uint64_t g_grid_anchor;       /* sample-clock frame of a downbeat */
 static volatile uint32_t g_grid_beat_frames;  /* I2S frames per grid beat (current song) */
+/* STACKT-716: page 7 TAKE & TIMING, per song. */
+static volatile int8_t   g_grid_off_q8[NUM_SLOTS];  /* the downbeat offset, -128..127 = -1/2..+1/2 beat */
+static volatile uint8_t  g_take_preset[NUM_SLOTS];  /* 0 off, 1/2/4/8 bars (fixed mode: base loops) */
+static volatile uint8_t  g_trk_nudge[NUM_SLOTS][NTRK];   /* 717: the loop-phase nudge, 128 = centre, 0 = unset (stored here for the tail) */
+static volatile uint32_t g_take_auto_at;            /* recorder: raise the stop when rec_count reaches this */
+static volatile uint32_t g_grid_dirty_ms;           /* last page-7 move (|1); 0 = clean */
+static volatile uint64_t g_grid_anchor_e;           /* THE EFFECTIVE ANCHOR every reader uses: raw + the offset */
+static uint64_t grid_anchor_eff(void)
+{
+	const uint64_t a = g_grid_anchor;
+	const uint32_t bf = g_grid_beat_frames;
+	const int32_t q = (g_slot < NUM_SLOTS) ? (int32_t)g_grid_off_q8[g_slot] : 0;
+	if (!q || !bf) return a;
+	const int64_t o = ((int64_t)q * (int64_t)bf) >> 8;
+	const uint64_t back = (o > 0) ? ((uint64_t)bf * 4u - (uint64_t)o) : (uint64_t)(-o);   /* a bar back, then forward */
+	return (a >= back) ? a - back : a;
+}
+#define GRID_EXT2_OFF   256u
+#define GRID_EXT2_MAGIC 0x32445247u   /* 'GRD2' */
+struct grid_ext2 {
+	uint32_t magic;
+	int8_t   off_q8[NUM_SLOTS];
+	uint8_t  preset[NUM_SLOTS];
+	uint8_t  nudge[NUM_SLOTS][NTRK];
+	uint16_t sum;                 /* over off_q8 .. nudge */
+};
+BUILD_ASSERT(GRID_EXT2_OFF + sizeof(struct grid_ext2) <= 512, "grid ext2 must fit block 2's tail");
+static uint16_t grid_ext2_sum(const struct grid_ext2 *e)
+{
+	const uint8_t *b = (const uint8_t *)&e->off_q8[0];
+	const size_t n = (size_t)((const uint8_t *)&e->sum - b);
+	uint16_t sum = 0;
+	for (size_t i = 0; i < n; i++) sum = (uint16_t)(sum + b[i]);
+	return sum;
+}
+static void __attribute__((noinline)) grid_ext2_store(uint8_t *blk)
+{
+	struct grid_ext2 *e = (struct grid_ext2 *)(blk + GRID_EXT2_OFF);
+	memset(e, 0, sizeof(*e));
+	e->magic = GRID_EXT2_MAGIC;
+	for (uint32_t i = 0; i < NUM_SLOTS; i++) {
+		e->off_q8[i] = g_grid_off_q8[i]; e->preset[i] = g_take_preset[i];
+		for (int k = 0; k < NTRK; k++) e->nudge[i][k] = g_trk_nudge[i][k];
+	}
+	e->sum = grid_ext2_sum(e);
+}
+static void __attribute__((noinline)) grid_ext2_load(const uint8_t *blk)
+{
+	const struct grid_ext2 *e = (const struct grid_ext2 *)(blk + GRID_EXT2_OFF);
+	if (e->magic != GRID_EXT2_MAGIC || grid_ext2_sum(e) != e->sum) return;   /* an older card: all zero */
+	for (uint32_t i = 0; i < NUM_SLOTS; i++) {
+		g_grid_off_q8[i] = e->off_q8[i];
+		g_take_preset[i] = (e->preset[i] == 1u || e->preset[i] == 2u || e->preset[i] == 4u || e->preset[i] == 8u) ? e->preset[i] : 0u;
+		for (int k = 0; k < NTRK; k++) g_trk_nudge[i][k] = e->nudge[i][k];
+	}
+}
 static volatile uint64_t g_grid_next_tick;
 static uint64_t          g_grid_tick_base;      /* M22-A: exact tick schedule base */
 static uint64_t          g_grid_tick_base_sync; /* M22-A: last value WE wrote to next_tick */
@@ -1061,7 +1129,7 @@ static volatile uint32_t g_dbg_anc_mod;    /* start_samps % beat */
  * but "early against a grid line" and "early against an origin that was never
  * on one" are indistinguishable in the log without the anchor to measure from.
  * Low 32 bits is plenty: the question is a phase, not an absolute. */
-static volatile uint32_t g_dbg_ganc;       /* g_grid_anchor at the punch */
+static volatile uint32_t g_dbg_ganc;       /* g_grid_anchor_e at the punch */
 static volatile uint32_t g_dbg_pat;        /* g_grid_punch_at at the punch */
 /* M25-r6 THE CHAIN. bf ended at 22504 while rf measured 22612 — the loop was
  * built on one beat and the grid ran on another, 0.48% apart, which walks the
@@ -1299,8 +1367,10 @@ static volatile uint32_t g_cph_n, g_cph_blk;
  * at speed from the speed-scaled walk itself. */
 static volatile uint64_t g_dph[4];
 static volatile uint32_t g_dph_blk;
+#if M82_PROBES
 static volatile uint64_t g_pa82[2];  /* M82: PASS A sub-spans */
 static volatile uint32_t g_t1min = 0xFFFFFFFFu; /* M86 min cyc/call */
+#endif
 static volatile uint32_t g_enmin = 0xFFFFFFFFu; /* M88 min cyc/emit */
 static volatile uint32_t g_dbg_rw, g_dbg_rr, g_dbg_rc; /* M86-r2 raw */
 static volatile uint32_t g_w4_pk, g_w4_pb, g_w4_sq, g_w4_tq; /* W4P */
@@ -1437,6 +1507,7 @@ struct looptrk {
 	uint16_t          vol_now;           /* gain actually applied last block (mixer-only; ramps toward fader/mute target) */
 	uint8_t           rec_fade;          /* stop-pad fade-down remaining, of 128 (recorder-only) */
 	uint8_t           rec_fstep;         /* fade decrement per sample (fits the fade inside the pad) */
+	uint8_t           pan_al, pan_ar;    /* PLACE-715: side attenuation 0..255 applied last block (0 = unity, 255 = -48 dB; slewed <= 4 a block) -- in the pad: no offset moves */
 	uint32_t flush_blk;                  /* streamer: next loop block to write */
 	uint32_t flush_mod;                  /* wrap the flush at this many blocks (overdub = loop len) */
 	/* SEGMENT looper: a track's length is a whole multiple of the base loop. The
@@ -1690,9 +1761,8 @@ static volatile uint8_t  g_pg_open;        /* PG-533: a page is open (PF-545: st
 static volatile uint8_t  g_pg_id;          /* FXP-547: WHICH page -- 4 = MODE (T4), 2 = FX (T2) */
 static uint8_t           g_fx_pick[4];     /* FXP-547: fader owes a pickup cross on this page */
 static int               g_fx_lastq[4];    /* FXP-547: last raw read while un-picked */
-static uint8_t  g_dmp_buf[512];            /* DMP-466's one-block read buffer
-                                            * (it borrowed the 4 KB bounce
-                                            * accumulator until R1-597) */
+/* STACKT-716: DMP-466's private 512 B read buffer is gone -- the dump borrows the streamer's
+ * metabuf (same thread, same pass; it runs only with nothing recording or draining). */
 #define head_active(i) (g_heads_mode && (i) != g_head_src && \
 			trk[g_head_src].state == TS_PLAY)
 /* HG-646 (W185): the geometry of the BYTES a ring plays -- its own track's,
@@ -3419,6 +3489,8 @@ static uint32_t tempo_median_ioi(void)
 }
 static uint32_t tempo_refine(uint32_t bs)
 {
+	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
+	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -3544,8 +3616,8 @@ static void beat_set(uint32_t nf)
 		g_grid_save_req = 1;
 	}
 	{ uint64_t _bar = (uint64_t)nf * 4u;
-	  g_grid_next_bar = g_grid_anchor +
-		(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
+	  g_grid_next_bar = g_grid_anchor_e +
+		(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
 }
 
 /* Convert a RECORDING-domain beat to grid domain and hand it to beat_set. The
@@ -3667,6 +3739,15 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
 					_rw++; _rc++;
 					__asm__ volatile("" ::: "memory");   /* RECW-711: the ring store lands before r_w moves */
 					rt->r_w = _rw; rt->rec_count = _rc;
+					{	/* STACKT-716: the preset take length -- the same stop the finger
+						 * raises, one block early, the backdate pinned to its floor
+						 * (the trigger point adds it back): the stop path's nearest-beat
+						 * / run-on rounding lands the take on the line. */
+						const uint32_t _ta = g_take_auto_at;
+						if (_ta && _rc + BLK_FRAMES >= _ta + STOP_COMP_SAMPLES && !g_stop_req) {
+							g_take_auto_at = 0u; g_stop_lat_ms = 0u; g_stop_req = 1;
+						}
+					}
 					{ uint32_t _bl = _rw - _rr;   /* S2CAP meter */
 					  if (_bl > g_rw_hw) g_rw_hw = _bl; }
 					/* RP: the per-sample pre-roll frontier store is DELETED
@@ -3953,7 +4034,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			             : ((g_play_bpm > 0)
 			                ? (48000u * 60u / (uint32_t)g_play_bpm) : 0u);
 			uint64_t _anc = (g_grid_active && g_grid_beat_frames)
-			              ? g_grid_anchor : 0u;
+			              ? g_grid_anchor_e : 0u;
 			if (lane_p0) { _bf = lane_p0; _anc = g_lane_anc; }   /* A4: the tapped beat, from its first tap */
 			uint32_t _spb = tg_spb[tg_rate];
 			if (_bf && _spb) tg_sf = _bf / _spb;
@@ -5005,7 +5086,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				struct x3_trk *_xe = &g_x3.t[g_slot][i];
 				_xe->start_samps = 0; _xe->len_samps = 0;
 				_xe->content_blocks = 0;
-				_xe->codec_id = 0; _xe->flags = 0; _xe->pan = 128u;
+				_xe->codec_id = 0; _xe->flags = 0;   /* PLACE-715: pan survives, as rsv does */
 			}
 			g_meta.song_mode[g_slot] &= (uint8_t)~(uint8_t)(0x10u << i); /* M7-r4: unmute */
 		}
@@ -5541,10 +5622,10 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				 * hold is a deliberate content-track gesture filter,
 				 * and arming early achieves line-exact there. */
 				uint64_t ref = (g_loop_len == 0u && g_arm_press_sclk &&
-						g_arm_press_sclk > g_grid_anchor)
+						g_arm_press_sclk > g_grid_anchor_e)
 					     ? g_arm_press_sclk : g_sample_clock;
-				uint64_t off = ref - g_grid_anchor;
-				g_grid_punch_at = g_grid_anchor +
+				uint64_t off = ref - g_grid_anchor_e;
+				g_grid_punch_at = g_grid_anchor_e +
 					((off + unit - 1u) / unit) * unit;
 			}
 			g_arm_press_sclk = 0;
@@ -5898,9 +5979,9 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 						 * press just after the beat is as good as a
 						 * press just before it. */
 						if (!trigger && _pre_val &&
-						    now_f > g_grid_anchor) {
+						    now_f > g_grid_anchor_e) {
 							uint64_t unit = g_grid_beat_frames;
-							uint64_t off = now_f - g_grid_anchor;
+							uint64_t off = now_f - g_grid_anchor_e;
 							/* GP-506: this runs once per EMITTED SAMPLE for the
 							 * whole ARMED punch wait -- up to a full beat. The
 							 * 64/64 divide compiled to bl __aeabi_uldivmod
@@ -5918,7 +5999,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 									       (uint32_t)unit);
 							else
 								_q = off / unit;
-							uint64_t prev = g_grid_anchor + _q * unit;
+							uint64_t prev = g_grid_anchor_e + _q * unit;
 							uint64_t back = now_f - prev;
 							uint32_t need = (uint32_t)
 								((back * g_cur_speed_q16) >> 16);
@@ -6081,8 +6162,8 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 							 * line; ~0 = exact) */
 							uint64_t nowp = g_sample_clock + f;
 							if (g_grid_beat_frames &&
-							    nowp > g_grid_anchor) {
-								uint64_t ph = (nowp - g_grid_anchor)
+							    nowp > g_grid_anchor_e) {
+								uint64_t ph = (nowp - g_grid_anchor_e)
 									% g_grid_beat_frames;
 								int32_t sp2 = (ph > g_grid_beat_frames / 2u)
 									? (int32_t)ph - (int32_t)g_grid_beat_frames
@@ -6109,10 +6190,11 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 								 * grids only — M20 F1: a fresh
 								 * TAPPED grid keeps its own phase;
 								 * the punch already landed on it) */
-								g_grid_anchor = g_grid_punch_at;
+								g_grid_anchor = g_grid_punch_at + (g_grid_anchor - g_grid_anchor_e);   /* STACKT-716: punch_at came from the effective anchor */
+								g_grid_anchor_e = g_grid_punch_at;
 								{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
-			  g_grid_next_bar = g_grid_anchor +
-				(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
+			  g_grid_next_bar = g_grid_anchor_e +
+				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
 							}
 						} else {
 							g_gridrec = 0;
@@ -6248,6 +6330,22 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		trk[i].vol_now = (uint16_t)vtar;
 		const int16_t *const pr = trk[i].pring;
 		const int32_t vol = vtar;
+		/* PLACE-715: the place as a BALANCE -- above centre the LEFT side comes
+		 * down, below centre the RIGHT, 120..136 = centre; (d - 8) * 551 >> 8
+		 * reaches 255 (-48 dB) at the ends. The side attenuation slews <= 4/256 a
+		 * block (~340 ms full travel), the volume slew above is untouched. */
+		int32_t gL, gR;
+		{
+			const uint32_t _pn = (g_slot < NUM_SLOTS) ? (uint32_t)g_x3.t[g_slot][i].pan : 128u;
+			int32_t tL = 0, tR = 0;
+			if (_pn > 136u) { tL = (int32_t)(((_pn - 136u) * 551u) >> 8); if (tL > 255) tL = 255; }
+			else if (_pn && _pn < 120u) { tR = (int32_t)(((120u - _pn) * 551u) >> 8); if (tR > 255) tR = 255; }
+			int32_t aL = trk[i].pan_al, aR = trk[i].pan_ar;
+			if (aL != tL) { aL += (tL > aL) ? ((tL - aL > 4) ? 4 : (tL - aL)) : ((aL - tL > 4) ? -4 : (tL - aL)); trk[i].pan_al = (uint8_t)aL; }
+			if (aR != tR) { aR += (tR > aR) ? ((tR - aR > 4) ? 4 : (tR - aR)) : ((aR - tR > 4) ? -4 : (tR - aR)); trk[i].pan_ar = (uint8_t)aR; }
+			gL = 256 - aL; gR = 256 - aR;
+		}
+		const int32_t volL = (vol * gL) >> 8, volR = (vol * gR) >> 8;   /* PLACE-715 */
 		/* STOPPED fast path: the transport is frozen (no phase steps this
 		 * block), so this track contributes ONE constant sample — compute
 		 * it once instead of 256 times. Falls back to the exact per-frame
@@ -6283,8 +6381,8 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				svL = (int16_t)(((int32_t)svL * avail) >> 8);
 				svR = (int16_t)(((int32_t)svR * avail) >> 8);
 			}
-			int32_t addL = ((int32_t)svL * vol) >> 8;
-			int32_t addR = ((int32_t)svR * vol) >> 8;
+			int32_t addL = ((int32_t)svL * volL) >> 8;   /* PLACE-715 */
+			int32_t addR = ((int32_t)svR * volR) >> 8;
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				mix32[f] += addL; mix32R[f] += addR;
 			}
@@ -6320,8 +6418,8 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 					svR = (int16_t)((int32_t)aR +
 						(int32_t)(((bR - aR) * (int32_t)((frac) >> 1)) >> 15));
 				}
-				mix32[f]  += ((int32_t)svL * vol) >> 8;
-				mix32R[f] += ((int32_t)svR * vol) >> 8;
+				mix32[f]  += ((int32_t)svL * volL) >> 8;   /* PLACE-715 */
+				mix32R[f] += ((int32_t)svR * volR) >> 8;
 			}
 			continue;
 		}
@@ -6374,8 +6472,9 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				}
 			}
 			int32_t vf = vd ? (vprev + ((vd * (int32_t)(f + 1)) >> 8)) : vol;
-			mix32[f]  += ((int32_t)sv * vf) >> 8;
-			mix32R[f] += ((int32_t)svR2 * vf) >> 8;
+			const int32_t vfL = (vf * gL) >> 8, vfR = (vf * gR) >> 8;   /* PLACE-715 */
+			mix32[f]  += ((int32_t)sv * vfL) >> 8;
+			mix32R[f] += ((int32_t)svR2 * vfR) >> 8;
 		}
 	}
 
@@ -8381,6 +8480,38 @@ static void __attribute__((noinline)) bk_promote(struct looptrk *t)
  * code unmoved -- ran clean). Pinning makes every future stage
  * placement-immune. If THIS build regresses, phase 0 is unlucky:
  * iterate the alignment offset, do not unpin. */
+/* PAGE7V-718: set track t's nudge (1..255, 128 = centre) with 717's law -- refused while the
+ * track is taking, the M14 dip when it is playing, the tail marked dirty. Controls thread only. */
+static void nudge_set(int t, uint8_t v)
+{
+	if (t < 0 || t >= NTRK || g_slot >= NUM_SLOTS || v == 0u) return;
+	if (v >= 120u && v <= 136u) v = 128u;
+	const uint8_t _st = trk[t].state;
+	if (_st == TS_ARMED || _st == TS_REC || _st == TS_DONE) return;
+	const uint8_t _cur = g_trk_nudge[g_slot][t] ? g_trk_nudge[g_slot][t] : 128u;
+	if (_cur == v) return;
+	g_trk_nudge[g_slot][t] = v;
+	g_grid_dirty_ms = k_uptime_get_32() | 1u;
+	if (_st == TS_PLAY || head_active(t)) {
+		g_head_blip[t] = 3;
+		trk[t].p_w = (g_consume_pos / TSPB_SRC(t)) * TSPB_SRC(t);
+	}
+}
+/* NUDGE-717: the anchor as the phase reads it -- (start + nudge) reduced into [0, mod). `start_mod`
+ * is the caller's start % mod; `div` = 1 for the sample-exact paths, TSPB for the block paths. */
+static uint32_t __attribute__((noinline)) nudge_anchor(int i, uint32_t start_mod, uint32_t mod, uint32_t div)
+{
+	if (i < 0 || i >= NTRK || g_slot >= NUM_SLOTS || !mod || !div) return start_mod;
+	const uint32_t nq = g_trk_nudge[g_slot][i];
+	if (!nq || nq == 128u) return start_mod;
+	const struct looptrk *t = &trk[i];
+	const uint32_t beat = (g_grid_active && g_grid_beat_frames)
+	                    ? (uint32_t)(((uint64_t)g_grid_beat_frames * g_cur_speed_q16) >> 16)
+	                    : ((t->len_samps ? t->len_samps : 1u) / 8u);
+	const uint32_t q = (nq > 128u) ? (nq - 128u) : (128u - nq);
+	uint32_t m = (uint32_t)((((uint64_t)q * beat) >> 8) / div) % mod;
+	return (nq > 128u) ? (start_mod + m) % mod : (start_mod + mod - m) % mod;
+}
 static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -8490,6 +8621,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 		if (ge->magic == GRID_EXT_MAGIC && gsum == ge->sum)
 			for (uint32_t gi = 0; gi < NUM_SLOTS; gi++)
 				g_grid_bpm_q8[gi] = ge->bpm_q8[gi];
+		grid_ext2_load(metabuf);   /* STACKT-716: the tail (own magic + sum) */
 	}
 	g_slot = g_meta.cur_slot;
 	g_mode_pref = g_meta.fixed_len ? 1u : 0u;   /* M7c: global mode preference */
@@ -8555,7 +8687,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 			static uint32_t _dcp;
 			if (g_consume_pos != _dcp) { _dcp = g_consume_pos; _di = false; }
 			if (_di) {
-				uint8_t *_db = g_dmp_buf;
+				uint8_t *_db = metabuf;   /* STACKT-716: the song-index buffer, idle in this pass */
 				if (!g_dmp_state) {
 					g_dmp_n = trk[0].len_blocks ? trk[0].len_blocks : 344u;
 					if (g_dmp_n > 344u) g_dmp_n = 344u;
@@ -8633,6 +8765,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					gsum = (uint16_t)(gsum + ge->bpm_q8[gi]);
 				}
 				ge->sum = gsum;
+				grid_ext2_store(metabuf);   /* STACKT-716: the tail rides along */
 				(void)emmc_write_blocks(GRID_EXT_BLOCK, metabuf, 1);
 				work = true;
 			}
@@ -8909,7 +9042,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 							                              : X3_CODEC_P14S;
 							_xe->flags          = (uint8_t)((g_cap_stereo ? 1u : 0u) |
 							                      ((t->gsh & 3u) << 1));   /* BNC2-604: bits 1-2 */
-							_xe->pan            = 128u;
+							/* PLACE-715: pan untouched -- the place survives the take (0 reads as centre; a store here cost the streamer a spill, 206 > 205) */
 							_xe->rsv            = (uint8_t)(0x80u |
 							                      (t->p16m_next & 1u));
 						}
@@ -9049,7 +9182,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 						if (_plain) {
 							uint32_t _Ls  = t->len_samps;
 							uint32_t _lp  = ((_pw % _Ls) + _Ls -
-							              (t->start_samps % _Ls)) % _Ls;
+							              nudge_anchor(i, t->start_samps % _Ls, _Ls, 1u)) % _Ls;   /* NUDGE-717 */
 							uint32_t _off = _lp % TSPB(t);
 							uint32_t _lb2 = _lp / TSPB(t);
 							uint32_t _n2  = 32u;
@@ -9092,7 +9225,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 #endif
 						uint32_t _pwb = _pw / TSPB(t);
 						uint32_t _c   = ((_pwb % _cyc) + _cyc -
-								 (t->start_blk % _cyc)) % _cyc;
+								 nudge_anchor(i, t->start_blk % _cyc, _cyc, TSPB(t))) % _cyc;   /* NUDGE-717 */
 						uint32_t _lb  = (_c / _win) * _wper + _wb + (_c % _win);
 						uint32_t _n   = 32u;
 						if (_n > (RING_SAMPLES / TSPB(t)) - 1u) _n = (RING_SAMPLES / TSPB(t)) - 1u;
@@ -9332,7 +9465,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					    !g_head_rev[i]) {   /* M50a / REV2-641: reversed -> the block path */
 						uint32_t Ls  = t->len_samps;
 						uint32_t lp  = ((pw % Ls) + Ls -
-						              (t->start_samps % Ls)) % Ls;
+						              nudge_anchor(i, t->start_samps % Ls, Ls, 1u)) % Ls;   /* NUDGE-717 */
 						uint32_t off = lp % TSPB(t);
 						uint32_t lb  = lp / TSPB(t);
 						uint32_t n   = budget;
@@ -9393,7 +9526,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					uint32_t hoff = heads_engaged()
 						      ? (((uint32_t)g_head_pos[i] * cyc) >> 8) : 0u;
 					uint32_t c = ((pwb % cyc) + cyc -
-						      (hsrc->start_blk % cyc) + hoff) % cyc;
+						      nudge_anchor(head_active(i) ? (int)g_head_src : i, hsrc->start_blk % cyc, cyc, TSPB(hsrc)) + hoff) % cyc;   /* NUDGE-717: the source's */
 					/* M15 REVERSE: mirror the phase — consecutive ring
 					 * blocks then walk the source BACKWARD, and each
 					 * block's samples are flipped after decode below:
@@ -9750,6 +9883,7 @@ static void midi_thread(void *a, void *b, void *c)
  * speed. At a constant speed this does nothing. */
 static void __attribute__((noinline)) grid_follow_tape(void)
 {
+	g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716: once a block, for every reader */
 	const uint32_t nf = g_grid_beat_frames;
 	if (!g_grid_active || !nf) return;
 	if (nf != g_grid_nf_shadow) {   /* someone redefined the grid: that is the new reference */
@@ -9776,9 +9910,10 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 		g_grid_anchor = g_sample_clock - (k * want + f2);
 		g_grid_beat_frames = want;
 		g_grid_nf_shadow = want;
+		g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716: the new beat, the new effective anchor */
 		{	const uint64_t bar = (uint64_t)want * 4u;
-			const uint64_t ph2 = g_sample_clock - g_grid_anchor;
-			g_grid_next_bar = g_grid_anchor + ((ph2 / bar) + 1u) * bar; }
+			const uint64_t ph2 = g_sample_clock - g_grid_anchor_e;
+			g_grid_next_bar = g_grid_anchor_e + ((ph2 / bar) + 1u) * bar; }
 		/* MIDI ticks: keep the next one where it is, space the rest at the new beat */
 		g_grid_tick_base = g_grid_next_tick; g_grid_tick_base_sync = g_grid_next_tick; g_grid_tick_idx = 0u;
 		g_grid_follow_n++;
@@ -10284,8 +10419,8 @@ static void controls_diag(void)
 		       (unsigned)(g_ph[2] / 64000u), (unsigned)(g_ph[3] / 64000u),
 		       (unsigned)g_phmax[0], (unsigned)g_phmax[1],
 		       (unsigned)g_phmax[2], (unsigned)g_phmax[3],
-		       (unsigned)(g_pa82[0] / 64000u), (unsigned)(g_pa82[1] / 64000u),
-		       (unsigned)g_t1min, (unsigned)g_dbg_rw,
+		       0u, 0u,   /* PLACE-715: the M82 probes are compiled out */
+		       0u, (unsigned)g_dbg_rw,
 		       (unsigned)g_dbg_rr, (unsigned)g_dbg_rc,
 		       (unsigned)g_enmin);
 		printk("M8X,d=%u,a=%u,b=%u,c=%u,blk=%u\n",
@@ -10920,7 +11055,7 @@ static void show_song_leds(void)
 	 * unlike the brief 1/8-beat track pulses). The whole face keeps time. */
 	int blink = ((t / 250u) & 1u) == 0u;
 	if (g_grid_active && g_grid_beat_frames) {
-		uint64_t ph = g_sample_clock - g_grid_anchor;
+		uint64_t ph = g_sample_clock - g_grid_anchor_e;
 		blink = ((uint32_t)(ph % g_grid_beat_frames) <
 		         g_grid_beat_frames / 2u);
 	}
@@ -11245,7 +11380,7 @@ static void led_service(void)
 	for (int i = 0; i < NTRK; i++)
 		if (trk[i].state != TS_EMPTY) active = 1;
 
-	if (!(g_pg_open && g_pg_id >= 1u && g_pg_id <= 5u) || g_pg_sweep || g_pg_exit)
+	if (!(g_pg_open && g_pg_id >= 1u && g_pg_id <= 7u) || g_pg_sweep || g_pg_exit)
 		track_level_rest();   /* STACKA-664 A6: only the FX pages set levels (EQ-691: and page 5) */
 	if (g_pg_sweep) {
 		show_page_sweep();   /* LED-549 r9: the activation sweep owns the
@@ -11281,13 +11416,44 @@ static void led_service(void)
 		/* EQ-691: PAGE 5 VIEW -- four bands, LED = |gain| (bipolar, A1's deadband). */
 		const uint32_t _lv[4] = { bipolar_depth(g_eq_g[0]), bipolar_depth(g_eq_g[1]), bipolar_depth(g_eq_g[2]), bipolar_depth(g_eq_g[3]) };
 		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, (g_sec_led == (uint8_t)(i + 1)) ? (uint32_t)(g_sec_led2 ? g_sec2[(g_pg_id - 1u) & 3u][i] : g_sec[(g_pg_id - 1u) & 3u][i]) : _lv[i]);   /* SEC-695 / SHAPE-696 */
-	} else if (g_pg_open && g_pg_id >= 6u && g_pg_id <= 7u) {
-		/* PG8-560: pages 6-7 are RESERVED (place / take+timing; 5 = EQ since 691)
-		 * and are not built yet. A reserved page shows a DARK row and
-		 * swallows track taps. Until this stage it showed the MODE page and
-		 * a tap silently rewrote a track's next-record codec (W212) -- the
-		 * page was lying about what it was, on ten different ids. */
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) track_led_off(i);
+	} else if (g_pg_open && g_pg_id == 6u) {
+		/* PLACE-715: PAGE 6 VIEW -- LED = distance from centre (bipolar, the hiss / EQ deadband). */
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, bipolar_depth(place_get(i)));
+	} else if (g_pg_open && g_pg_id == 7u) {
+		/* PAGE7V-718: PAGE 7 VIEW -- time, not fader depth.
+		 *  hold TN      : that lane = |nudge|, the others dark;
+		 *  preset take  : a countdown -- lit = units (bars / base loops) to go, <= 4,
+		 *                 the last one blinking on the beat;
+		 *  otherwise    : the 1-2-3-4 chase off the EFFECTIVE anchor (fader 1 moves
+		 *                 it), nudged lanes glow dim between beats; no grid = dark. */
+		const int _rt7 = g_rec_track;
+		const uint32_t _ta7 = g_take_auto_at;
+		const uint8_t _pn7 = (g_slot < NUM_SLOTS) ? g_take_preset[g_slot] : 0u;
+		int _gb7 = -1, _ob7 = 0;
+		if (g_grid_active && g_grid_beat_frames) {
+			const uint64_t _ph7 = g_sample_clock - g_grid_anchor_e;
+			_gb7 = (int)((_ph7 / g_grid_beat_frames) & 3u);
+			_ob7 = ((uint32_t)(_ph7 % g_grid_beat_frames) < g_grid_beat_frames / 8u);
+		}
+		if (g_sec_led) {
+			for (int i = 0; i < NUM_TRACK_LEDS; i++)
+				page_led_depth(i, (g_sec_led == (uint8_t)(i + 1) && g_slot < NUM_SLOTS)
+				                  ? bipolar_depth(g_trk_nudge[g_slot][i] ? g_trk_nudge[g_slot][i] : 128u) : 0u);
+		} else if (_rt7 >= 0 && _rt7 < NTRK && trk[_rt7].state == TS_REC && _ta7 && _pn7) {
+			const uint32_t _rc7 = trk[_rt7].rec_count;
+			const uint32_t _unit = _ta7 / _pn7;
+			uint32_t _left = (_rc7 < _ta7 && _unit) ? ((_ta7 - _rc7) + _unit - 1u) / _unit : 0u;
+			if (_left > 4u) _left = 4u;
+			const uint32_t _bl = (k_uptime_get_32() >> 7) & 1u;   /* the last unit blinks */
+			for (int i = 0; i < NUM_TRACK_LEDS; i++)
+				page_led_depth(i, ((uint32_t)i < _left) ? ((_left == 1u && !_bl) ? 0u : 255u) : 0u);
+		} else {
+			for (int i = 0; i < NUM_TRACK_LEDS; i++) {
+				const uint8_t _nq = (g_slot < NUM_SLOTS) ? g_trk_nudge[g_slot][i] : 0u;
+				const uint32_t _dim = (_nq && _nq != 128u) ? 40u : 0u;
+				page_led_depth(i, (i == _gb7 && _ob7) ? 255u : _dim);
+			}
+		}
 	} else if (g_pg_open && g_pg_id == 8u) {
 		/* PG-533/LS-534: the MODE PAGE view -- each track LED shows
 		 * its NEXT-record mode live: BLINK = stereo, SOLID = mono
@@ -11322,7 +11488,7 @@ static void led_service(void)
 		uint32_t lit   = (sp_ <= 3u) ? sp_ : (6u - sp_);
 		int sgb = -1;
 		if (g_grid_active && g_grid_beat_frames)
-			sgb = (int)(((g_sample_clock - g_grid_anchor) /
+			sgb = (int)(((g_sample_clock - g_grid_anchor_e) /
 				g_grid_beat_frames) & 3u);
 		for (int i = 0; i < NUM_TRACK_LEDS; i++)
 			((uint32_t)i == lit) ? track_led_on(i) : track_led_off(i);
@@ -11354,7 +11520,7 @@ static void led_service(void)
 		int on_beat = (g_beat_phase < (BEAT_SAMPLES_L / 8u));
 		int gbeat = -1;            /* tapped grid: beat 0..3 within the bar */
 		if (g_grid_active && g_grid_beat_frames) {
-			uint64_t ph = g_sample_clock - g_grid_anchor;
+			uint64_t ph = g_sample_clock - g_grid_anchor_e;
 			uint32_t bf = g_grid_beat_frames;
 			gbeat  = (int)((ph / bf) & 3u);
 			on_beat = ((uint32_t)(ph % bf) < bf / 8u);  /* grid outranks
@@ -11382,7 +11548,7 @@ static void led_service(void)
 			    g_grid_active && g_grid_beat_frames) {
 				/* grid run-on ("finishing the beat"): double-blink so
 				 * continued recording reads deliberate, not stuck */
-				uint64_t ph3 = g_sample_clock - g_grid_anchor;
+				uint64_t ph3 = g_sample_clock - g_grid_anchor_e;
 				uint32_t hb2 = g_grid_beat_frames / 2u;
 				((hb2 && (uint32_t)(ph3 % hb2) < hb2 / 4u)
 					? track_led_on(i) : track_led_off(i));
@@ -11393,7 +11559,7 @@ static void led_service(void)
 				if (g_grid_punch_at && g_grid_active && g_grid_beat_frames) {
 					/* waiting for the punch-in: blink at HALF-beat
 					 * rate — clearly alive, clearly on purpose */
-					uint64_t ph2 = g_sample_clock - g_grid_anchor;
+					uint64_t ph2 = g_sample_clock - g_grid_anchor_e;
 					uint32_t hb = g_grid_beat_frames / 2u;
 					if (hb) ab = ((uint32_t)(ph2 % hb) < hb / 4u);
 				}
@@ -11433,7 +11599,7 @@ static void led_service(void)
 					             ? (((uint32_t)g_head_pos[i] * cyc2) >> 8) : 0u;
 					uint32_t pwb2 = (uint32_t)(g_consume_pos / SAMP_PER_BLK);
 					uint32_t c2 = ((pwb2 % cyc2) + cyc2 -
-						       (hs2->start_blk % cyc2) + ho2) % cyc2;
+						       nudge_anchor(head_active(i) ? (int)g_head_src : i, hs2->start_blk % cyc2, cyc2, TSPB(hs2)) + ho2) % cyc2;   /* NUDGE-717 */
 					{
 						int rv2 = g_win_rev ? 1 : 0;
 						if (g_head_rev[i]) rv2 ^= 1;   /* REV2-641 */
@@ -11512,7 +11678,28 @@ static void __attribute__((noinline)) iso_release(void)
 	g_iso_on = 0;
 }
 
-static void fnp_mode_toggle(void)
+/* STACKT-716: the preset take length in RECORDED samples for the take about to start, 0 = none.
+ * Variable mode counts BARS of the grid (no grid: nothing to count); fixed mode counts BASE LOOPS
+ * (the first take has none). Recording follows the tape, as the punch derives it (rs = nf * speed). */
+static uint32_t take_preset_samps(void)
+{
+	if (g_slot >= NUM_SLOTS) return 0u;
+	const uint32_t n = g_take_preset[g_slot];
+	if (!n) return 0u;
+	uint64_t t;
+	if (g_fixed_len) {
+		if (!g_loop_len) return 0u;
+		t = (uint64_t)g_loop_len * n;
+	} else {
+		if (!g_grid_active || !g_grid_beat_frames) return 0u;
+		const uint64_t rs = ((uint64_t)g_grid_beat_frames * g_cur_speed_q16) >> 16;
+		if (!rs) return 0u;
+		t = rs * 4u * n;
+	}
+	return (t == 0u || t >= (uint64_t)MAX_LOOP_SAMPLES) ? 0u : (uint32_t)t;
+}
+/* STACKT-716: the state part of the FN+PLAY toggle, without its LED show (page 7's T1 tap). */
+static void mode_toggle_core(void)
 {
 	g_fixed_len ^= 1u;
 	{
@@ -11532,6 +11719,10 @@ static void fnp_mode_toggle(void)
 		}
 	}
 	g_meta_save_req = 1;
+}
+static void fnp_mode_toggle(void)
+{
+	mode_toggle_core();
 	all_off(); track_all_off();
 	if (g_fixed_len) {
 		for (int r = 0; r < 2; r++) {
@@ -11675,7 +11866,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 6\n\tnop\n\t.endr");
+	/* PADHOST-715: the nop pad moved to tempo_refine (this build's between-function) */
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -11841,12 +12032,12 @@ static void jump_to_slot(uint32_t ns)
 		if (g_grid_bpm_q8[ns]) {
 			g_grid_beat_frames = (uint32_t)((48000ULL * 60u * 256u) /
 			                                g_grid_bpm_q8[ns]);
-			g_grid_anchor = g_sample_clock;
+			g_grid_anchor = g_sample_clock; g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
 			g_grid_next_tick = g_sample_clock;
 			g_grid_active = 1;
 			{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
-			  g_grid_next_bar = g_grid_anchor +
-				(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
+			  g_grid_next_bar = g_grid_anchor_e +
+				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
 		} else {
 			g_grid_active = 0;
 			g_grid_next_bar = 0;
@@ -12159,12 +12350,12 @@ int main(void)
 			if (g_grid_bpm_q8[g_slot]) {   /* M8a: boot grid tempo */
 				g_grid_beat_frames = (uint32_t)((48000ULL * 60u * 256u) /
 				                                g_grid_bpm_q8[g_slot]);
-				g_grid_anchor = g_sample_clock;
+				g_grid_anchor = g_sample_clock; g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
 				g_grid_next_tick = g_sample_clock;
 				g_grid_active = 1;
 				{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
-			  g_grid_next_bar = g_grid_anchor +
-				(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
+			  g_grid_next_bar = g_grid_anchor_e +
+				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
 			}
 		}
 		g_slot_switch_req = 1;
@@ -12633,7 +12824,16 @@ int main(void)
 				static int fxr_cnt;
 				if (fraw >= 1256 && fraw < 1347) {
 					if (++fxr_cnt == 2) {
-						fx_reset_all();
+						if (g_pg_open && g_pg_id == 6u) {   /* PLACE-715: on page 6 the chord centres the four places */
+							for (int _k = 0; _k < NTRK; _k++) { place_set(_k, 128u); g_fx_pick[_k] = 1; g_fx_lastq[_k] = -1; }
+						} else if (g_pg_open && g_pg_id == 7u) {   /* PAGE7V-718: on page 7 the chord resets the page */
+							if (g_slot < NUM_SLOTS) {
+								g_grid_off_q8[g_slot] = 0; g_take_preset[g_slot] = 0u;
+								g_grid_dirty_ms = k_uptime_get_32() | 1u;
+							}
+							for (int _k = 0; _k < NTRK; _k++) { nudge_set(_k, 128u); g_fx_pick[_k] = 1; g_fx_lastq[_k] = -1; }
+						} else
+							fx_reset_all();
 						g_fxrst_lock = 1;
 					}
 					if (fxr_cnt > 1000) fxr_cnt = 1000;   /* no wrap on a long hold */
@@ -13049,6 +13249,7 @@ int main(void)
 					 * tapping a tempo and then holding gives you
 					 * at any sane BPM (469 ms at 128). */
 					g_grid_bpm_q8[g_slot] = 0;
+					g_grid_off_q8[g_slot] = 0;   /* NUDGE-717: the offset goes with the grid (the tail rides the same save) */
 					g_grid_active = 0;
 					g_grid_fresh = 0;
 					g_cnv_set = 0;
@@ -13248,13 +13449,13 @@ int main(void)
 						g_dbg_tap_bs = nf;         /* r2 diag */
 						g_dbg_gbf0   = g_grid_beat_frames;   /* r6 */
 						g_grid_fresh = 1;   /* M20 F1: taps = truth */
-						g_grid_anchor = tap_first_s;
+						g_grid_anchor = tap_first_s; g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
 						g_grid_next_tick = g_sample_clock;
 						g_grid_active = 1;
 						g_grid_save_req = 1;
 						{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
-			  g_grid_next_bar = g_grid_anchor +
-				(((g_sample_clock - g_grid_anchor) / _bar) + 1u) * _bar; }
+			  g_grid_next_bar = g_grid_anchor_e +
+				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
 						if (native_q8) {
 							/* retune the tape so the loops play at
 							 * the tapped tempo (vinyl rules: pitch
@@ -13715,6 +13916,7 @@ int main(void)
 					press_from_above[ti] = 0;
 					g_bnc_arm = (int8_t)ti;
 					g_bk_mode = 0u; g_bnc_arm_t = tnow; g_bk_trk_ctl = (int8_t)ti;   /* TAPECOPY-684 / HOLDSTOP-686 */
+					g_take_auto_at = 0u;          /* STACKT-716: a bounce never takes the preset */
 					__DSB();                      /* the flag lands before the request */
 					g_arm_req[ti] = 1;
 				} else {
@@ -13835,10 +14037,31 @@ int main(void)
 						g_eq_g[ti] = 128u; g_eq_live = 1u;
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
-					} else if (g_pg_open && g_pg_id >= 6u && g_pg_id <= 7u &&
+					} else if (g_pg_open && g_pg_id == 6u && g_rec_track < 0 &&
+					    !armed_press[ti]) {
+						/* PLACE-715: a tap on page 6 = CENTRE (the kill), the
+						 * pickup re-armed like every other page. */
+						place_set(ti, 128u);
+						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
+						tap_deadline[ti] = 0;
+					} else if (g_pg_open && g_pg_id == 7u &&
 					    g_rec_track < 0 && !armed_press[ti]) {
-						/* PG8-560: reserved page -- SWALLOW. Without this the
-						 * tap falls through to stop / mute / delete. */
+						/* PAGE7V-718: every tap is a RESET (the other pages' rule; the
+						 * mode tap is gone -- FN+PLAY is the one gesture). A nudged
+						 * track's tap centres it; a centred T1 zeroes the offset, a
+						 * centred T2 switches the preset off; T3/T4 centred = nothing. */
+						if (g_slot < NUM_SLOTS) {
+							const uint8_t _nq = g_trk_nudge[g_slot][ti];
+							if (_nq && _nq != 128u) {
+								nudge_set(ti, 128u);
+							} else if (ti == 0 && g_grid_off_q8[g_slot]) {
+								g_grid_off_q8[g_slot] = 0; g_grid_dirty_ms = k_uptime_get_32() | 1u;
+								g_fx_pick[0] = 1; g_fx_lastq[0] = -1;
+							} else if (ti == 1 && g_take_preset[g_slot]) {
+								g_take_preset[g_slot] = 0u; g_grid_dirty_ms = k_uptime_get_32() | 1u;
+								g_fx_pick[1] = 1; g_fx_lastq[1] = -1;
+							}
+						}
 						tap_deadline[ti] = 0;
 					} else if (g_pg_open && g_pg_id == 8u && g_rec_track < 0 &&
 					    !armed_press[ti]) {
@@ -14069,6 +14292,7 @@ int main(void)
 						g_arm_press_sclk =
 							(_sc > _back) ? (_sc - _back) : _sc;
 					}
+					g_take_auto_at = take_preset_samps();   /* STACKT-716: the preset for THIS take (0 = none) */
 					g_arm_req[ti] = 1;
 					g_playing = 1;                   /* recording implies play */
 				}
@@ -14151,8 +14375,11 @@ int main(void)
 					int _sec = 0;
 					const int _held = (committed >= TRK_1 && committed <= TRK_4) ? (int)committed : -1;
 					const int _slot = (_held < 0) ? 0 : (fi == _held) ? 1 : (fi == ((_held + 1) & 3)) ? 2 : 0;   /* 1 = own fader, 2 = the fader to the right (SHAPE-696) */
-					if (g_pg_open && g_pg_id >= 1u && g_pg_id <= 4u && _slot) {
-						volatile uint8_t *_tab = (_slot == 1) ? &g_sec[g_pg_id - 1u][_held] : &g_sec2[g_pg_id - 1u][_held];
+					if (g_pg_open && ((g_pg_id >= 1u && g_pg_id <= 4u && _slot) ||
+					    (g_pg_id == 7u && _slot == 1 && g_slot < NUM_SLOTS))) {   /* NUDGE-717: page 7, own fader = the nudge */
+						volatile uint8_t *_tab = (g_pg_id == 7u) ? &g_trk_nudge[g_slot][_held]
+						                       : (_slot == 1) ? &g_sec[g_pg_id - 1u][_held] : &g_sec2[g_pg_id - 1u][_held];
+						if (g_pg_id == 7u && *_tab == 0u) *_tab = 128u;   /* unset reads as centre */
 						if (!sec_on[fi]) { sec_on[fi] = 1; sec_q0[fi] = (int)q; sec_moved[fi] = 0; sec_base[fi] = (int)*_tab; }
 						int _d = (int)q - sec_q0[fi];
 						if (!sec_moved[fi] && (_d >= 3 || _d <= -3)) {
@@ -14164,7 +14391,22 @@ int main(void)
 						if (sec_moved[fi]) {
 							int _v = sec_base[fi] + _d;
 							if (_v < 0) _v = 0; else if (_v > 255) _v = 255;
-							*_tab = (uint8_t)_v;
+							if (g_pg_id == 7u) {
+								/* NUDGE-717: 1..255 (0 = unset), dead band = centre; a taking
+								 * track is refused; on a change the M14 dip re-anchors the ring. */
+								if (_v < 1) _v = 1;
+								if (_v >= 120 && _v <= 136) _v = 128;
+								const uint8_t _st = trk[_held].state;
+								if (_st != TS_ARMED && _st != TS_REC && _st != TS_DONE && *_tab != (uint8_t)_v) {
+									*_tab = (uint8_t)_v;
+									g_grid_dirty_ms = k_uptime_get_32() | 1u;
+									if (_st == TS_PLAY || head_active(_held)) {
+										g_head_blip[_held] = 3;
+										trk[_held].p_w = (g_consume_pos / TSPB_SRC(_held)) * TSPB_SRC(_held);
+									}
+								}
+							} else
+								*_tab = (uint8_t)_v;
 						}
 						g_sec_led = (uint8_t)(_held + 1);
 						_sec = 1;
@@ -14233,6 +14475,51 @@ int main(void)
 							g_flt_pos = (uint8_t)_q8;   /* ONE filter,
 							 * two handles: FN+fader-4 and this page fader
 							 * drive the SAME state (the map's decision) */
+					} else if (g_pg_open && g_pg_id == 7u) {
+						/* STACKT-716: page 7 owns the faders -- F1 = the downbeat
+						 * offset (bipolar, +-1/2 beat), F2 = the preset take length
+						 * (off / 1 / 2 / 4 / 8), F3/F4 nothing; the pickup law (W155). */
+						if (fi < 2 && g_slot < NUM_SLOTS) {
+							const uint8_t _cur = g_take_preset[g_slot];
+							uint8_t _pv = (fi == 0) ? (uint8_t)((int)g_grid_off_q8[g_slot] + 128)
+							            : (_cur == 8u) ? 230u : (_cur == 4u) ? 178u : (_cur == 2u) ? 127u : (_cur == 1u) ? 76u : 0u;
+							int _q8 = (int)((q > 255u) ? 255u : q);
+							if (g_fx_pick[fi]) {
+								int _d = _q8 - (int)_pv;
+								int _p = g_fx_lastq[fi];
+								g_fx_lastq[fi] = _q8;
+								if ((_d >= -6 && _d <= 6) ||
+								    (_p >= 0 && ((_p - (int)_pv > 0) != (_d > 0))))
+									g_fx_pick[fi] = 0;
+							}
+							if (!g_fx_pick[fi]) {
+								if (fi == 0) {
+									int _o = (_q8 >= 120 && _q8 <= 136) ? 0 : (_q8 - 128);
+									if (_o != (int)g_grid_off_q8[g_slot]) { g_grid_off_q8[g_slot] = (int8_t)_o; g_grid_dirty_ms = k_uptime_get_32() | 1u; }
+								} else {
+									uint8_t _n = (_q8 < 51) ? 0u : (_q8 < 102) ? 1u : (_q8 < 153) ? 2u : (_q8 < 204) ? 4u : 8u;
+									if (_n != _cur) {
+										g_take_preset[g_slot] = _n; g_grid_dirty_ms = k_uptime_get_32() | 1u;
+										led_flash_lane(1, (_n == 8u) ? 4u : (_n == 4u) ? 3u : (_n == 2u) ? 2u : (_n == 1u) ? 1u : 0u);   /* PAGE7V-718 */
+									}
+								}
+							}
+						}
+					} else if (g_pg_open && g_pg_id == 6u) {
+						/* PLACE-715: page 6 owns the faders -- fader N = track N's
+						 * place, the same pickup law (W155). Was: fell through to
+						 * the track volume (the pages 6-7 plumbing bug). */
+						uint8_t _pv = place_get(fi);
+						int _q8 = (int)((q > 255u) ? 255u : q);
+						if (g_fx_pick[fi]) {
+							int _d = _q8 - (int)_pv;
+							int _p = g_fx_lastq[fi];
+							g_fx_lastq[fi] = _q8;
+							if ((_d >= -6 && _d <= 6) ||
+							    (_p >= 0 && ((_p - (int)_pv > 0) != (_d > 0))))
+								g_fx_pick[fi] = 0;
+						}
+						if (!g_fx_pick[fi]) place_set(fi, (uint8_t)(_q8 ? _q8 : 1));
 					} else if (g_pg_open && g_pg_id == 5u) {
 						/* EQ-691: page 5 owns the faders, the same pickup law (W155). */
 						uint8_t _pv = g_eq_g[fi];
@@ -14293,6 +14580,12 @@ int main(void)
 						trk[fi].vol_q8 = (uint16_t)q;
 				}
 				fi = (fi + 1) & 3;
+			}
+			if (g_place_dirty_ms && (k_uptime_get_32() - g_place_dirty_ms) > 1500u) {
+				g_place_dirty_ms = 0u; g_meta_save_req = 1;   /* PLACE-715: persist 1.5 s after the last move */
+			}
+			if (g_grid_dirty_ms && (k_uptime_get_32() - g_grid_dirty_ms) > 1500u) {
+				g_grid_dirty_ms = 0u; g_grid_save_req = 1;    /* STACKT-716: block 2's tail, the same way */
 			}
 
 			/* VOL ladder (master vol buttons + FWD/RWD varispeed rocker), DEBOUNCED

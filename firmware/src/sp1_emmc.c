@@ -93,6 +93,11 @@ uint16_t emmc_dbg_rd_crc     = 0;    /* CRC16 the card appended to last read blo
 #define RDAT_HIGH()  (NRF_P0->OUTSET = P0_DAT_BIT)
 #define RDAT_LOW()   (NRF_P0->OUTCLR = P0_DAT_BIT)
 #define RDAT_GET()   ((NRF_P0->IN >> 7) & 1u)
+/* CMDFAST-712: the command pin the same way (CMD = P0.08) */
+#define P0_CMD_BIT   (1u << 8)
+#define RCMD_HIGH()  (NRF_P0->OUTSET = P0_CMD_BIT)
+#define RCMD_LOW()   (NRF_P0->OUTCLR = P0_CMD_BIT)
+#define RCMD_GET()   ((NRF_P0->IN >> 8) & 1u)
 /* A few NOPs of settle after a clock edge for the delay-free (hd==0) path:
  * covers the card's data-output valid time without throttling to a busy-wait. */
 #define EDGE_SETTLE() __asm__ volatile("nop\nnop\nnop")
@@ -176,6 +181,11 @@ static inline void half_delay(uint32_t us)
 /* Safe clock pulse for command/CRC phases. */
 static inline void clk_pulse(void)
 {
+	if (s_cmd_half_us == 0u) {   /* CMDFAST-712: the data path's pulse */
+		RCLK_HIGH(); EDGE_SETTLE();
+		RCLK_LOW();  EDGE_SETTLE();
+		return;
+	}
 	CLK_HIGH();
 	half_delay(s_cmd_half_us);
 	CLK_LOW();
@@ -308,8 +318,64 @@ static uint16_t crc16(const uint8_t *data, uint32_t len)
 	return (uint16_t)crc;
 }
 
+/* CMDFAST-712: the full-speed command -- the same frame, clocks and sampling points as
+ * send_command() below, through the port registers. Only after identification. */
+static bool send_command_fast(uint8_t cmd_index, uint32_t arg, uint8_t *r1_out)
+{
+	uint8_t frame[6];
+	frame[0] = 0x40 | (cmd_index & 0x3F);      /* start 0, transmission 1, index */
+	frame[1] = (uint8_t)(arg >> 24);
+	frame[2] = (uint8_t)(arg >> 16);
+	frame[3] = (uint8_t)(arg >> 8);
+	frame[4] = (uint8_t)(arg);
+	frame[5] = crc7(frame, 5);                  /* (crc << 1) | 1 : the end bit is in it */
+
+	CMD_IN();
+	for (int i = 0; i < 24; i++) { RCLK_HIGH(); EDGE_SETTLE(); RCLK_LOW(); EDGE_SETTLE(); }
+	CMD_OUT();
+	for (int i = 0; i < 6; i++) {
+		const uint32_t by = frame[i];
+		for (int b = 7; b >= 0; b--) {
+			if ((by >> b) & 1u) RCMD_HIGH(); else RCMD_LOW();
+			RCLK_HIGH(); EDGE_SETTLE();
+			RCLK_LOW();  EDGE_SETTLE();
+		}
+	}
+
+	CMD_IN();
+	emmc_dbg_resp_clocks = -1;
+	for (int t = 0; t < 200; t++) {
+		RCLK_HIGH(); EDGE_SETTLE();
+		RCLK_LOW();  EDGE_SETTLE();
+		if (!RCMD_GET()) {                      /* sampled after the pulse, as before */
+			emmc_dbg_resp_clocks = t;
+			break;
+		}
+	}
+	if (emmc_dbg_resp_clocks < 0) {
+		return false;
+	}
+
+	if (!r1_out) {
+		return true;
+	}
+
+	uint8_t resp[6] = {0};
+	for (int i = 0; i < 38; i++) {
+		RCLK_HIGH(); EDGE_SETTLE();
+		const uint8_t bit = (uint8_t)RCMD_GET();   /* after the rising edge, as cmd_recv_bit */
+		RCLK_LOW();  EDGE_SETTLE();
+		resp[i / 8] |= (uint8_t)(bit << (7 - (i % 8)));
+	}
+	memcpy(r1_out, resp, 6);
+
+	return true;
+}
+
 static bool send_command(uint8_t cmd_index, uint32_t arg, uint8_t *r1_out)
 {
+	if (s_cmd_half_us == 0u)
+		return send_command_fast(cmd_index, arg, r1_out);   /* CMDFAST-712 */
 	uint8_t frame[6];
 	frame[0] = 0x40 | (cmd_index & 0x3F);
 	frame[1] = (uint8_t)(arg >> 24);
