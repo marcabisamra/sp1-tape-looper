@@ -3085,6 +3085,33 @@ static volatile uint8_t g_rv_mix;    /* REVERB-676: page 3 fader 4: 0 = dry and 
  * on any write, cleared by the chain once every band has landed flat). */
 static volatile uint8_t g_eq_g[4] = { 128u, 128u, 128u, 128u };
 static volatile uint8_t g_eq_live;
+/* SEC-695: the secondary layer. g_sec[page-1][lane], pages 1-4; the defaults
+ * reproduce the kernels as they were before the layer existed. */
+#define SEC_DEF { { 128u, 128u, 128u, 128u }, { 128u, 128u, 128u, 166u }, { 128u, 128u, 128u, 179u }, { 128u, 128u, 128u, 128u } }
+static volatile uint8_t g_sec[4][4] = SEC_DEF;
+/* SHAPE-696: the THIRD control -- hold TN + the fader to its right. g_sec2[page-1][lane];
+ * wired: page 3 lane 3 (tremolo) = stereo spread (default 0 = mono tremolo). */
+static volatile uint8_t g_sec2[4][4];
+static volatile uint8_t g_sec_led;   /* 1..4 = that lane's LED shows its secondary (a hold is on) */
+static volatile uint8_t g_sec_led2;  /* SHAPE-696: 1 = the LED shows the third control instead */
+static void sec_reset(void)
+{
+	static const uint8_t _d[4][4] = SEC_DEF;
+	for (int _p = 0; _p < 4; _p++) for (int _l = 0; _l < 4; _l++) { g_sec[_p][_l] = _d[_p][_l]; g_sec2[_p][_l] = 0u; }
+}
+/* SHAPE-696: the tremolo's shape morph on a 0..255 triangle. m < 128: blend toward
+ * smoothstep (a sine-like S); m > 128: expand the centre and clamp (toward a square). */
+static inline __attribute__((always_inline)) int32_t trm_shape(int32_t tt, int32_t m)
+{
+	if (m < 128) {
+		int32_t sm = (tt * tt * (768 - 2 * tt)) >> 16;   /* 3t^2 - 2t^3, 0..255 */
+		return tt + (((sm - tt) * (128 - m)) >> 7);
+	} else {
+		int32_t d = ((tt - 128) * (256 + (m - 128) * 14)) >> 8;   /* x1 .. x7.9: triangle -> trapezoid -> square */
+		if (d > 127) d = 127; else if (d < -128) d = -128;
+		return d + 128;
+	}
+}
 static int32_t g_eq_k[4];
 static int32_t g_eq_lo[4][2], g_eq_bp[4][2];   /* SVF state per band, L/R */
 static const int32_t eq_f_q30[4] = { 213 << 16, 750 << 16, 3406 << 16, 6680 << 16 };   /* EQ2-692: Q30 = Q14 << 16; shelves 1 - exp(-2 pi fc / 48k) at 100 / 4000 Hz, peaks 2 sin(pi fc / 48k) at 350 / 1600 Hz */
@@ -3145,6 +3172,7 @@ static void fx_reset_all(void)
          * (569); marc: "FN + T1 + T4 is resetting all the FX except page 4". */
         g_ec_mix = 0u;  g_ec_div = 0u;  g_rv_mix = 0u;   /* REVERB-676 */
         for (int _b = 0; _b < 4; _b++) g_eq_g[_b] = 128u;   /* EQ-691: flat; the chain ramps down */
+        sec_reset();   /* SEC-695 */
         g_eq_live = 1u;
         g_tp_drive = 0u;  g_tp_tone = 128u;  g_tp_hiss = 0u;  g_tp_wob = 0u;
         /* STACKA-664: the reset also clears every tapped rate, division and type */
@@ -3666,9 +3694,9 @@ static inline __attribute__((always_inline)) void rv_wr(uint32_t k, int32_t v)
 	g_ec2_line[(g_rv_w + g_rv_base[k]) & RV_MASK] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));   /* RV2-680: clamp, not the knee */
 }
 /* one 12 kHz step of the Clouds network: in = the mono sum, krt = loop feedback q8 */
-static inline __attribute__((always_inline)) void rv_step(int32_t in, int32_t krt, int32_t *oL, int32_t *oR)
+static inline __attribute__((always_inline)) void rv_step(int32_t in, int32_t krt, int32_t klp, int32_t *oL, int32_t *oR)
 {
-	const int32_t kap = 160, klp = 179;   /* 0.625, 0.7 */
+	const int32_t kap = 160;   /* 0.625; klp (0.7 by default) is the damping secondary since SEC-695 */
 	int32_t acc = in >> 2, t;   /* RV2-680: -12 dB into the network (x4 out) */
 #define RV_AP(k, s) t = rv_rd(k); acc += ((s) * kap * t) >> 8; rv_wr(k, acc); acc = (((-(s)) * kap * acc) >> 8) + t;
 	RV_AP(0u, 1) RV_AP(1u, 1) RV_AP(2u, 1) RV_AP(3u, 1)
@@ -3752,6 +3780,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		/* PG8-560 FX3 per-block constants. */
 		const int32_t  rng_d    = rp2 ? (int32_t)g_rng_amt : 0;
 		const int32_t  awh_d    = rp2 ? (int32_t)g_awh_amt : 0;
+		const int32_t  awh_q    = (g_sec[1][2] < 40u) ? 40 : (int32_t)g_sec[1][2];   /* SEC-695: damping q8 (default 128 = the old >> 1); floor 40 keeps the SVF stable at the top of the sweep */
 		const int32_t  phs_d    = (!rp3 || g_lfo_div[0] >= 3u) ? 0 : (int32_t)g_phs_amt;   /* 660: division 3 = OFF */
 		/* Ring carrier: ONE fader sets depth and pitch together, 40 Hz at the
 		 * bottom to ~1.2 kHz at the top. Low = growl, high = clangorous metal.
@@ -3788,7 +3817,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			 * tone can build to ~1.4x dry and no further; the bus is int32 and
 			 * the lean loop's limiter is downstream. */
 			ec2_wet = ec_mix >> 1;
-			ec2_fb  = (ec_mix * 166) >> 8;
+			ec2_fb  = (int32_t)g_sec[1][3]; if (ec2_fb > 250) ec2_fb = 250;   /* SEC-695: feedback is the secondary (default 166 = 0.65, as before) */
 			if (!g_ec2_live) {
 				/* engage edge: an old tail must never play back */
 				memset(g_ec2_line, 0, sizeof(g_ec2_line));
@@ -3805,6 +3834,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		const int32_t rv_mix = (!rp3 || (g_ec_mix != 0u && g_ec_div < 3u)) ? 0 : (int32_t)g_rv_mix;
 		int rv_n = 0;
 		int32_t rv_krt = 0, rv_wet = 0;
+		const int32_t rv_klp = (g_sec[2][3] < 32u) ? 32 : (g_sec[2][3] > 250u) ? 250 : (int32_t)g_sec[2][3];   /* SEC-695: damping (default 179 = 0.7) */
 		/* EQ-691 per-block: ramp each band's gain toward its fader (16 Q8 steps a
 		 * block, a full throw in ~170 ms); the group runs while any band is off flat
 		 * or still landing, and hands the wrapper's gate back once all four are 0. */
@@ -4288,10 +4318,10 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 				 * this is a moving tone control, not a wah -- that missing
 				 * peak is why 560's version read as subtle. */
 				_h_g_awh_lowL += (int32_t)(((int64_t)_cf * _h_g_awh_bandL) >> 14);
-				int32_t _hL = xL - _h_g_awh_lowL - (_h_g_awh_bandL >> 1);
+				int32_t _hL = xL - _h_g_awh_lowL - ((_h_g_awh_bandL * awh_q) >> 8);   /* SEC-695 */
 				_h_g_awh_bandL += (int32_t)(((int64_t)_cf * _hL) >> 14);
 				_h_g_awh_lowR += (int32_t)(((int64_t)_cf * _h_g_awh_bandR) >> 14);
-				int32_t _hR = xR - _h_g_awh_lowR - (_h_g_awh_bandR >> 1);
+				int32_t _hR = xR - _h_g_awh_lowR - ((_h_g_awh_bandR * awh_q) >> 8);   /* SEC-695 */
 				_h_g_awh_bandR += (int32_t)(((int64_t)_cf * _hR) >> 14);
 				xL += ((_h_g_awh_bandL - xL) * awh_d) >> 8;
 				xR += ((_h_g_awh_bandR - xR) * awh_d) >> 8;
@@ -4360,6 +4390,8 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		}
 		if (trm_d) {
 			uint32_t _lfo = g_lfo_ph[2];   /* A3: the tremolo's own clock */
+			const uint32_t _sprd = (uint32_t)g_sec2[2][2] << 23;   /* SEC-695/SHAPE-696: R's phase lead, 0..~180 deg (the third control) */
+			const int32_t  _shp  = (int32_t)g_sec[2][2];          /* SHAPE-696: 0 sine .. 128 triangle .. 255 square */
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				_lfo += trm_inc;
 				int32_t xL = mix32[f];
@@ -4377,9 +4409,15 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 					uint32_t _ts = _lfo >> 23;             /* 0..511 (A3: own clock; the x4 became the quarter default) */
 					int32_t  _tt = (_ts < 256u) ? (int32_t)_ts
 					                           : (int32_t)(511u - _ts);
+					if (_shp != 128) _tt = trm_shape(_tt, _shp);   /* SHAPE-696 */
 					int32_t _g = 128 - ((_tt * trm_d) >> 9);
+					uint32_t _tsR = (_lfo + _sprd) >> 23;   /* SEC-695: the spread */
+					int32_t  _ttR = (_tsR < 256u) ? (int32_t)_tsR
+					                             : (int32_t)(511u - _tsR);
+					if (_shp != 128) _ttR = trm_shape(_ttR, _shp);
+					int32_t _gR = 128 - ((_ttR * trm_d) >> 9);
 					xL = (xL * _g) >> 7;
-					xR = (xR * _g) >> 7;
+					xR = (xR * _gR) >> 7;
 				mix32[f] = xL; mix32R[f] = xR;
 			}
 		}
@@ -4433,7 +4471,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 				             + mix32[f0 + 2u] + mix32R[f0 + 2u]
 				             + mix32[f0 + 3u] + mix32R[f0 + 3u]) >> 3;
 				int32_t _oL, _oR;
-				rv_step(_in, rv_krt, &_oL, &_oR);
+				rv_step(_in, rv_krt, rv_klp, &_oL, &_oR);
 				_oL = (_oL * rv_wet) >> 6; _oR = (_oR * rv_wet) >> 6;   /* RV2-680: x4 back out */
 				const int32_t _dL = _oL - _pL, _dR = _oR - _pR;
 				mix32[f0]      += _pL;                     mix32R[f0]      += _pR;
@@ -11157,7 +11195,7 @@ static void led_service(void)
 	} else if (g_pg_open && g_pg_id == 2u) {
 		/* LAYOUT-562: PAGE 2 VIEW -- bitcrush / ring mod / auto-wah / [echo]. */
 		const uint32_t _lv[4] = { g_bcr_amt, g_rng_amt, g_awh_amt, (g_ec_div >= 3u) ? 0u : (uint32_t)g_ec_mix };   /* A6: depth; OFF dark */
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, (g_sec_led == (uint8_t)(i + 1)) ? (uint32_t)(g_sec_led2 ? g_sec2[(g_pg_id - 1u) & 3u][i] : g_sec[(g_pg_id - 1u) & 3u][i]) : _lv[i]);   /* SEC-695 / SHAPE-696 */
 	} else if (g_pg_open && g_pg_id == 1u) {
 		/* FXP-547: THE FX PAGE VIEW -- one LED per effect, lit when
 		 * that effect is ENGAGED (away from neutral). Filter only
@@ -11168,20 +11206,20 @@ static void led_service(void)
 		const uint32_t _fl = (g_flt_pos < 112u) ? (uint32_t)(128u - g_flt_pos) * 2u
 		                   : (g_flt_pos > 143u) ? (uint32_t)(g_flt_pos - 128u) * 2u : 0u;
 		const uint32_t _lv[4] = { _fl, g_chr_mix, (g_dst_typ >= 3u) ? 0u : (uint32_t)g_dst_amt, (g_gat_pat < 2u) ? (uint32_t)g_gat_amt : 0u };
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, (g_sec_led == (uint8_t)(i + 1)) ? (uint32_t)(g_sec_led2 ? g_sec2[(g_pg_id - 1u) & 3u][i] : g_sec[(g_pg_id - 1u) & 3u][i]) : _lv[i]);   /* SEC-695 / SHAPE-696 */
 	} else if (g_pg_open && g_pg_id == 3u) {
 		/* LAYOUT-562: PAGE 3 VIEW -- phaser / sweep / tremolo / [empty]. */
 		const uint32_t _lv[4] = { (g_lfo_div[0] >= 3u) ? 0u : (uint32_t)g_phs_amt, (g_lfo_div[1] >= 3u) ? 0u : (uint32_t)g_swp_amt, (g_lfo_div[2] >= 3u) ? 0u : (uint32_t)g_trm_amt, (uint32_t)g_rv_mix };   /* A6: depth; OFF dark; fader 4 = reverb (REVERB-676) */
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, (g_sec_led == (uint8_t)(i + 1)) ? (uint32_t)(g_sec_led2 ? g_sec2[(g_pg_id - 1u) & 3u][i] : g_sec[(g_pg_id - 1u) & 3u][i]) : _lv[i]);   /* SEC-695 / SHAPE-696 */
 	} else if (g_pg_open && g_pg_id == 4u) {
 		/* TAPE-569: PAGE 4 VIEW -- drive / tone / hiss / wobble. */
 		/* A6: depth; tone (A1) is bipolar with a 120..136 deadband; the hiss is 655's */
 		const uint32_t _lv[4] = { g_tp_drive, bipolar_depth(g_tp_tone), g_tp_hiss, g_tp_wob };
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, (g_sec_led == (uint8_t)(i + 1)) ? (uint32_t)(g_sec_led2 ? g_sec2[(g_pg_id - 1u) & 3u][i] : g_sec[(g_pg_id - 1u) & 3u][i]) : _lv[i]);   /* SEC-695 / SHAPE-696 */
 	} else if (g_pg_open && g_pg_id == 5u) {
 		/* EQ-691: PAGE 5 VIEW -- four bands, LED = |gain| (bipolar, A1's deadband). */
 		const uint32_t _lv[4] = { bipolar_depth(g_eq_g[0]), bipolar_depth(g_eq_g[1]), bipolar_depth(g_eq_g[2]), bipolar_depth(g_eq_g[3]) };
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, (g_sec_led == (uint8_t)(i + 1)) ? (uint32_t)(g_sec_led2 ? g_sec2[(g_pg_id - 1u) & 3u][i] : g_sec[(g_pg_id - 1u) & 3u][i]) : _lv[i]);   /* SEC-695 / SHAPE-696 */
 	} else if (g_pg_open && g_pg_id >= 6u && g_pg_id <= 7u) {
 		/* PG8-560: pages 6-7 are RESERVED (place / take+timing; 5 = EQ since 691)
 		 * and are not built yet. A reserved page shows a DARK row and
@@ -11576,7 +11614,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 4\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 10\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -14040,7 +14078,41 @@ int main(void)
 						     ((p - (int)trk[fi].vol_q8 > 0) != (d > 0))))
 							g_fh_latch[fi] = 0;
 					}
-					if (g_pg_open && g_pg_id == 2u) {
+					/* SEC-695: THE SECONDARY LAYER. On a page, the fader whose TRACK
+					 * BUTTON is held moves that lane's second parameter, RELATIVE to
+					 * the fader's position at the hold's start; the first move
+					 * (>= 3 counts) spends the press so the release is not the
+					 * kill; on release the primary's pickup is re-armed (W155). */
+					static int     sec_q0[4], sec_base[4];
+					static uint8_t sec_on[4], sec_moved[4];
+					int _sec = 0;
+					const int _held = (committed >= TRK_1 && committed <= TRK_4) ? (int)committed : -1;
+					const int _slot = (_held < 0) ? 0 : (fi == _held) ? 1 : (fi == ((_held + 1) & 3)) ? 2 : 0;   /* 1 = own fader, 2 = the fader to the right (SHAPE-696) */
+					if (g_pg_open && g_pg_id >= 1u && g_pg_id <= 4u && _slot) {
+						volatile uint8_t *_tab = (_slot == 1) ? &g_sec[g_pg_id - 1u][_held] : &g_sec2[g_pg_id - 1u][_held];
+						if (!sec_on[fi]) { sec_on[fi] = 1; sec_q0[fi] = (int)q; sec_moved[fi] = 0; sec_base[fi] = (int)*_tab; }
+						int _d = (int)q - sec_q0[fi];
+						if (!sec_moved[fi] && (_d >= 3 || _d <= -3)) {
+							sec_moved[fi] = 1;
+							armed_press[_held] = 1;   /* spend the press: its release is not the kill */
+							tap_deadline[_held] = 0;
+							g_sec_led2 = (uint8_t)(_slot == 2);   /* the LED follows the fader that moved last */
+						}
+						if (sec_moved[fi]) {
+							int _v = sec_base[fi] + _d;
+							if (_v < 0) _v = 0; else if (_v > 255) _v = 255;
+							*_tab = (uint8_t)_v;
+						}
+						g_sec_led = (uint8_t)(_held + 1);
+						_sec = 1;
+					} else if (sec_on[fi]) {   /* the hold ended, or the page went */
+						sec_on[fi] = 0;
+						if (sec_moved[fi]) { sec_moved[fi] = 0; g_fx_pick[fi] = 1; g_fx_lastq[fi] = -1; }
+						if (!sec_on[0] && !sec_on[1] && !sec_on[2] && !sec_on[3]) { g_sec_led = 0; g_sec_led2 = 0; }
+					}
+					if (_sec) {
+						/* the secondary owns this fader this pass */
+					} else if (g_pg_open && g_pg_id == 2u) {
 						/* FX2-558: page 5 owns the faders, same pickup law. */
 						uint8_t _pv = (fi == 0) ? g_bcr_amt
 						            : (fi == 1) ? g_rng_amt
@@ -14059,6 +14131,7 @@ int main(void)
 							else if (fi == 1) g_rng_amt = (uint8_t)_q8;
 							else if (fi == 2) g_awh_amt = (uint8_t)_q8;
 							else              g_ec_mix = (uint8_t)_q8;   /* ECHO-572 */
+							if (fi == 3 && _q8 > 0 && g_ec_div >= 3u) { g_ec_div = 0u; led_flash_lane(fi, 1u); }   /* OFFWAKE-697: the fader wakes an OFF lane */
 						}
 					} else if (g_pg_open && g_pg_id == 1u) {
 						/* FXP-547: THE FX PAGE OWNS THE FADERS while it is
@@ -14083,12 +14156,16 @@ int main(void)
 						if (!g_fx_pick[fi] && fi == 1)
 							g_chr_mix = (uint8_t)_q8;   /* FX2-550:
 							 * fader 2 = chorus depth; bottom = dry */
-						if (!g_fx_pick[fi] && fi == 3)
+						if (!g_fx_pick[fi] && fi == 3) {
 							g_gat_amt = (uint8_t)_q8;   /* FX2-550:
 							 * fader 4 = gate threshold; bottom = open */
-						if (!g_fx_pick[fi] && fi == 2)
+							if (_q8 > 0 && g_gat_pat >= 2u) { g_gat_pat = 0u; g_gat_g = 4096; led_flash_lane(fi, 1u); }   /* OFFWAKE-697 */
+						}
+						if (!g_fx_pick[fi] && fi == 2) {
 							g_dst_amt = (uint8_t)_q8;   /* DST-548:
 							 * fader 3 = drive; bottom = clean */
+							if (_q8 > 0 && g_dst_typ >= 3u) { g_dst_typ = 0u; led_flash_lane(fi, 1u); }   /* OFFWAKE-697 */
+						}
 						if (!g_fx_pick[fi] && fi == 0)
 							g_flt_pos = (uint8_t)_q8;   /* ONE filter,
 							 * two handles: FN+fader-4 and this page fader
@@ -14147,6 +14224,7 @@ int main(void)
 							else if (fi == 1) g_swp_amt = (uint8_t)_q8;
 							else if (fi == 2) g_trm_amt = (uint8_t)_q8;
 							else              g_rv_mix  = (uint8_t)_q8;   /* REVERB-676: page 3 fader 4 */
+							if (fi < 3 && _q8 > 0 && g_lfo_div[fi] >= 3u) { g_lfo_div[fi] = 0u; led_flash_lane(fi, 1u); }   /* OFFWAKE-697 */
 						}
 					} else if (!g_fh_latch[fi])
 						trk[fi].vol_q8 = (uint16_t)q;
