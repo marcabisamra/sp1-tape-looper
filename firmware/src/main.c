@@ -113,6 +113,7 @@ static const struct led track_leds[] = {
  * FUNCTION+PLAY double-tap; persisted in the song index tail (led_full).
  * Declared here (not with the dimmer) because xfer_commit persists it. */
 static volatile uint8_t g_led_dim = 1;
+static void led_hw_refresh(void);   /* LEDPWM-710: the xfer-mode dim toggle sits above the LED block */
 
 static void track_led_on(int i);
 static void track_led_off(int i);   /* LED-549 r10: show_page_sweep */
@@ -195,8 +196,34 @@ static bool    i2c_scanned;
  * back record-ring overflows (corrupt loops). 2x + round-robin faders keeps the
  * main loop's ADC cost at the level the working builds had.
  * Returns -1 on ADC error (callers treat <0 as "no change / hold last"). */
+/* ADCSCAN-710: one scan of every channel per control pass; ladder_read() reads the
+ * cache. g_lad_ok = 0 until the first scan (or after a failed one) -> the old
+ * blocking single-channel path, unchanged. */
+static int16_t g_lad_buf[NUM_LADDERS];
+static int     g_lad_val[NUM_LADDERS];
+static uint8_t g_lad_ok;
+static uint8_t g_lad_scan_ok;   /* init: every channel id == its ladder index (buffer order) */
+static void ladder_scan(void)
+{
+	if (!g_lad_scan_ok) { g_lad_ok = 0; return; }
+	int16_t first[NUM_LADDERS];
+	struct adc_sequence seq = {
+		.buffer      = g_lad_buf,
+		.buffer_size = sizeof(g_lad_buf),
+	};
+	if (adc_sequence_init_dt(&adc_ladder[0], &seq) < 0) { g_lad_ok = 0; return; }
+	seq.channels = 0u;
+	for (int i = 0; i < (int)NUM_LADDERS; i++) seq.channels |= BIT(adc_ladder[i].channel_id);
+	if (adc_read_dt(&adc_ladder[0], &seq) < 0) { g_lad_ok = 0; return; }
+	memcpy(first, g_lad_buf, sizeof(first));
+	if (adc_read_dt(&adc_ladder[0], &seq) < 0) { g_lad_ok = 0; return; }
+	for (int i = 0; i < (int)NUM_LADDERS; i++)
+		g_lad_val[i] = (int)(((int32_t)first[i] + (int32_t)g_lad_buf[i]) / 2);
+	g_lad_ok = 1;
+}
 static int ladder_read(const struct adc_dt_spec *spec)
 {
+	if (g_lad_ok) return g_lad_val[spec - adc_ladder];   /* ADCSCAN-710: this pass's scan */
 	struct adc_sequence seq = {
 		.buffer      = &adc_sample,
 		.buffer_size = sizeof(adc_sample),
@@ -223,9 +250,12 @@ static void controls_init(void)
 		(GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos);
 	BTN_COM_PORT->OUTSET = (1u << BTN_COM_PIN);
 
+	g_lad_scan_ok = 1u;   /* ADCSCAN-710 */
 	for (int i = 0; i < NUM_LADDERS; i++) {
 		if (device_is_ready(adc_ladder[i].dev))
 			adc_channel_setup_dt(&adc_ladder[i]);
+		if (adc_ladder[i].channel_id != (uint8_t)i || adc_ladder[i].dev != adc_ladder[0].dev)
+			g_lad_scan_ok = 0u;   /* the scan's buffer order would not be the ladder order: keep the old path */
 	}
 
 	/* USB is brought up later in main() on the device_next stack (UAC2 audio
@@ -1914,9 +1944,10 @@ static uint8_t           g_arm_gsh_prev;    /* the target's print gain before AN
  * be left uninitialised by a call that never happens. */
 static volatile uint8_t g_tp_drive = 0u;
 static volatile uint8_t g_tp_tone  = 128u;   /* 128 = flat */
-static volatile uint8_t g_tp_hiss  = 0u;
+static volatile uint8_t g_tp_hiss  = 128u;   /* HISS2-701: bipolar -- 128 = off, above = the cassette hiss, below = vinyl crackle */
 static volatile uint8_t g_tp_wob   = 0u;
 static int32_t  g_tp_toneL, g_tp_toneR;      /* tilt one-pole state */
+static int32_t  g_tp_ck1, g_tp_ck2;          /* HISS2-701: the crackle resonator (two-pole, ~2.4 kHz, ~1.2 ms) */
 static uint16_t g_tp_hsi;                    /* FXCOST-578: hiss table index */
 #define TP_HISS_N     16384u
 #define TP_HISS_MASK  (TP_HISS_N - 1u)
@@ -2967,6 +2998,8 @@ static volatile uint32_t g_wbj, g_wbx;
 #define FXS_N 19u   /* 0 none, 1-17 one effect (16 = reverb, REVERB-676; 17 = eq, EQ-691), 18 = more than one */
 static uint32_t g_fxs_stv[FXS_N], g_fxs_dry[FXS_N], g_fxs_blk[FXS_N];
 static uint32_t g_fxs_aus[FXS_N];   /* WOBCLAMP-681 FXA: worst looper_audio_block us per class */
+static uint32_t g_fxs_over[FXS_N];  /* POPS-700 FXO: blocks over the 5,333 us period per class (output clicks) */
+static volatile uint32_t g_rv_clip; /* POPS-700: the reverb's line-store clamp engaged (a clip inside the loop) */
 static uint32_t g_fxs_prev;
 static uint32_t g_wb_lastpos;
 static uint32_t g_tp_rng   = 0x89abcdefu;
@@ -3174,7 +3207,7 @@ static void fx_reset_all(void)
         for (int _b = 0; _b < 4; _b++) g_eq_g[_b] = 128u;   /* EQ-691: flat; the chain ramps down */
         sec_reset();   /* SEC-695 */
         g_eq_live = 1u;
-        g_tp_drive = 0u;  g_tp_tone = 128u;  g_tp_hiss = 0u;  g_tp_wob = 0u;
+        g_tp_drive = 0u;  g_tp_tone = 128u;  g_tp_hiss = 128u;  g_tp_wob = 0u;   /* HISS2-701: the hiss rests at centre */
         /* STACKA-664: the reset also clears every tapped rate, division and type */
         for (int _l = 0; _l < 7; _l++) g_lane_per[_l] = 0u;   /* WOBTAP-675: 7 lanes */
         g_lfo_div[0] = 0u; g_lfo_div[1] = 0u; g_lfo_div[2] = 2u;
@@ -3597,11 +3630,12 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
 					 * +0x8000 (beyond Thumb-2 imm12); naive access pays
 					 * movw+mla per field per sample (M84 disasm). Volatile
 					 * semantics, store order, per-sample publish: UNCHANGED. */
-					volatile uint32_t * const prw = &rt->r_w;
-					volatile uint32_t * const prr = &rt->r_r;
-					volatile uint32_t * const prc = &rt->rec_count;
-					volatile uint32_t * const ptg = &rt->rec_target;
-					if (((*prw) - (*prr)) >= (RRING_SAMPLES * 2u))  /* CD-463: 2x engine capacity */
+					/* RECW-711: each counter is read ONCE (they are volatile for the
+					 * streamer / controls readers; nothing else can write them inside
+					 * the mixer), the two the recorder advances are stored once. */
+					uint32_t _rw = rt->r_w, _rc = rt->rec_count;
+					const uint32_t _rr = rt->r_r, _tg = rt->rec_target;
+					if ((_rw - _rr) >= (RRING_SAMPLES * 2u))  /* CD-463: 2x engine capacity */
 						g_rec_overruns++;   /* take corrupting: flush too slow */
 					int16_t wsamp = lsamp;
 					int16_t wsampR = rsamp;
@@ -3615,10 +3649,10 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
 						} else {
 							wsamp = 0; wsampR = 0;
 						}
-					} else if ((*ptg)) {
+					} else if (_tg) {
 						/* fixed-mode run-to-the-bar: fade the final ~2.7 ms
 						 * into the bar line so the loop seam can't click */
-						uint32_t rem = (*ptg) - (*prc);
+						uint32_t rem = _tg - _rc;
 						if (rem <= 128u) {
 							wsamp  = (int16_t)(((int32_t)lsamp *
 									   (int32_t)rem) >> 7);
@@ -3626,13 +3660,14 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
 									   (int32_t)rem) >> 7); }
 					}
 					{ /* CD-463: 24k store — boxcar pairs; counters stay engine-based */
-					  if (((*prw) & 1u) == 0u) { g_cd_holdL = wsamp; g_cd_holdR = wsampR; }
-					  else { uint32_t _fi = (((*prw) >> 1) & RRING_MASK);
+					  if ((_rw & 1u) == 0u) { g_cd_holdL = wsamp; g_cd_holdR = wsampR; }
+					  else { uint32_t _fi = ((_rw >> 1) & RRING_MASK);
 					    g_rring[_fi * 2u]      = (int16_t)(((int32_t)g_cd_holdL + (int32_t)wsamp  + 1) >> 1);
 					    g_rring[_fi * 2u + 1u] = (int16_t)(((int32_t)g_cd_holdR + (int32_t)wsampR + 1) >> 1); } }
-					(*prw)++;
-					(*prc)++;
-					{ uint32_t _bl = (*prw) - (*prr);   /* S2CAP meter */
+					_rw++; _rc++;
+					__asm__ volatile("" ::: "memory");   /* RECW-711: the ring store lands before r_w moves */
+					rt->r_w = _rw; rt->rec_count = _rc;
+					{ uint32_t _bl = _rw - _rr;   /* S2CAP meter */
 					  if (_bl > g_rw_hw) g_rw_hw = _bl; }
 					/* RP: the per-sample pre-roll frontier store is DELETED
 					 * 72,000/s. Its only reader is at block START and the
@@ -3640,12 +3675,12 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
 					 * so nothing could ever observe it. (It also means
 					 * "pre-roll follows the take" has not worked since
 					 * M90 -- a real bug, logged, NOT fixed here.) */
-					if (g_tempo.active) tempo_feed(lsamp, (*prc));
-					if ((*ptg) == 0u) {
+					if (g_tempo.active) tempo_feed(lsamp, _rc);
+					if (_tg == 0u) {
 						/* OPEN take (first take AND independent overdubs):
 						 * force-stop at the maximum length. Only a FIRST
 						 * take defines the song grid/BPM. */
-						if ((*prc) >= MAX_LOOP_SAMPLES) {
+						if (_rc >= MAX_LOOP_SAMPLES) {
 							if (g_loop_len == 0u) {
 								g_loop_len = MAX_LOOP_SAMPLES;
 								g_loop_blocks = (g_loop_len + SAMP_PER_BLK / 2u) / SAMP_PER_BLK;
@@ -3655,14 +3690,14 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
 									g_meta_save_req = 1;
 								}
 							}
-							(*ptg) = MAX_LOOP_SAMPLES;
+							rt->rec_target = MAX_LOOP_SAMPLES;
 							rt->len_blocks = MAX_LOOP_BLOCKS;
 							rt->len_samps = MAX_LOOP_SAMPLES;
 							rt->content_blocks = MAX_LOOP_BLOCKS;  /* all content */
 							rt->state = TS_DONE; g_rec_track = -1;
 							g_done_pending = 1;   /* M20: ring busy */
 						}
-					} else if ((*prc) >= (*ptg)) {
+					} else if (_rc >= _tg) {
 						/* Take FINALIZE: rec_target is set by the stop tap
 						 * (free-length, block-rounded) — the recorder pads
 						 * the sub-block remainder with silence and lands
@@ -3691,6 +3726,7 @@ static uint8_t  g_rv_live;           /* the line holds the REVERB (cleared on en
 static inline __attribute__((always_inline)) int32_t rv_rd(uint32_t k) { return g_ec2_line[(g_rv_w + g_rv_base[k] + g_rv_len[k] - 1u) & RV_MASK]; }
 static inline __attribute__((always_inline)) void rv_wr(uint32_t k, int32_t v)
 {
+	if (v > 32767 || v < -32768) g_rv_clip++;   /* POPS-700: count the clamp -- a clip inside the loop recirculates */
 	g_ec2_line[(g_rv_w + g_rv_base[k]) & RV_MASK] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));   /* RV2-680: clamp, not the knee */
 }
 /* one 12 kHz step of the Clouds network: in = the mono sum, krt = loop feedback q8 */
@@ -3875,7 +3911,13 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		                                               * bat'. */
 		/* TUNE2-576: -12 dB. -38 dBFS at full was intrusive against quiet
 		 * loops; real tape hiss sits ~-50 dB below peak. */
-		const int32_t tp_hs = rp4 ? ((int32_t)g_tp_hiss >> 3) : 0;   /* TUNE3-577: marc: between -- -6 dB from the original */
+		/* HISS2-701: the hiss fader is BIPOLAR, 120..136 dead. Above: the cassette
+		 * hiss, (h - 128) >> 2 -- 31 at the top, the same as 700's 255 >> 3 (TUNE3-577).
+		 * Below: vinyl -- tp_ck is the depth (8..128); the hiss loop runs at a faint
+		 * surface-bed level (2..6) under the clicks. */
+		const uint32_t _tph  = rp4 ? (uint32_t)g_tp_hiss : 128u;
+		const int32_t  tp_ck = (_tph < 120u) ? (int32_t)(128u - _tph) : 0;
+		const int32_t  tp_hs = (_tph > 136u) ? (int32_t)((_tph - 128u) >> 2) : (tp_ck ? (2 + (tp_ck >> 5)) : 0);
 		/* A1: the tone fader has a DEADBAND (120..136 = flat), so the LED that
 		 * lights on 'not 128' and the kernel that engages on 'not 128' agree with
 		 * the hand: a fader parked near the middle is flat and dark. */
@@ -3884,7 +3926,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		                                      : (256 + (128 - tp_tn));
 		const int32_t tp_ghi = (tp_tn >= 128) ? (256 + (tp_tn - 128) * 3)
 		                                      : (256 - (128 - tp_tn) * 2);
-		const int      tp_any = rp4 && ((g_tp_drive != 0u) || (g_tp_hiss != 0u)
+		const int      tp_any = rp4 && ((g_tp_drive != 0u) || (tp_hs != 0) || (tp_ck != 0)   /* HISS2-701 */
 		                     || (tp_tn != 128) || (g_tp_wob != 0u) || (g_wb_off != 0) || (g_wb_tgt != 0));   /* WOBBUS-673 */
 		/* ONE accumulator serves sweep, tremolo and the phaser. */
 		const int      lfo_on   = (swp_d || trm_d || phs_d) ? 1 : 0;
@@ -4063,6 +4105,33 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			}
 			g_tp_hsi = (uint16_t)_h_g_tp_hsi;
 			g_tp_rng = _h_g_tp_rng;
+		}
+		if (tp_ck) {
+			/* HISS2-701 VINYL CRACKLE. The hiss's LCG decides a click with
+			 * probability (150 + 26 depth) / 2^24 a frame (~1 to ~10 a second). A
+			 * click is one excitation, depth x (1..4) (random per click, random
+			 * sign), into a two-pole resonator: 2.4 kHz, r = 0.983 (~1.2 ms) --
+			 * a band-limited TICK (peak ~1,550 = -26 dBFS at full depth, ~5 ms),
+			 * not 658's raw impulse. The sign and size come from a second LCG
+			 * step so they are the high bits, not the LCG's weak low bits. */
+			uint32_t _h_g_tp_rng = g_tp_rng;
+			int32_t  _y1 = g_tp_ck1, _y2 = g_tp_ck2;
+			const uint32_t _ckp = 150u + (uint32_t)tp_ck * 26u;
+			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+				_h_g_tp_rng = _h_g_tp_rng * 1664525u + 1013904223u;
+				int32_t _x = 0;
+				if ((_h_g_tp_rng >> 8) < _ckp) {
+					_h_g_tp_rng = _h_g_tp_rng * 1664525u + 1013904223u;
+					_x = tp_ck * (1 + (int32_t)(_h_g_tp_rng >> 30));
+					if (_h_g_tp_rng & 0x20000000u) _x = -_x;
+				}
+				int32_t _y = _x + ((_y1 * 30628) >> 14) - ((_y2 * 15825) >> 14);
+				_y2 = _y1; _y1 = _y;
+				mix32[f]  += _y;
+				mix32R[f] += _y;
+			}
+			g_tp_rng = _h_g_tp_rng;
+			g_tp_ck1 = _y1; g_tp_ck2 = _y2;
 		}
 		if (rp4 && tp_dr != 4096) {
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
@@ -6616,7 +6685,7 @@ static void xfer_commit(void)
 			 * length, then write the repaired index back (skipped when the
 			 * host's copy already matches, e.g. a read-only session). */
 			g_meta.fixed_len = g_mode_pref;      /* M7c: field = preference */
-			g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u;   /* M8c: site owns it */
+			{ g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u; led_hw_refresh(); }   /* M8c: site owns it */
 			g_instant_rec = (uint8_t)(((g_meta.led_full >> 1) & 1u) ? 0u : 1u);   /* M41-r5: bit 1 SET = classic */
 			memcpy(g_meta.chop, keep_chop, sizeof(keep_chop));
 			memcpy(g_meta.song_mode, keep_mode, sizeof(keep_mode));
@@ -9796,7 +9865,7 @@ static void audio_thread(void *a, void *b, void *c)
 			_FXS(g_ec_mix   >= 32u, 8u);  _FXS(g_phs_amt >= 32u, 9u);
 			_FXS(g_swp_amt  >= 32u, 10u); _FXS(g_trm_amt >= 32u, 11u);
 			_FXS(g_tp_drive >= 32u, 12u); _FXS(g_tp_tone >= 160u || g_tp_tone <= 96u, 13u);
-			_FXS(g_tp_hiss  >= 32u, 14u); _FXS(g_tp_wob >= 32u, 15u);
+			_FXS(g_tp_hiss >= 160u || g_tp_hiss <= 96u, 14u); _FXS(g_tp_wob >= 32u, 15u);   /* HISS2-701: bipolar */
 			_FXS(g_rv_mix   >= 32u, 16u);   /* REVERB-676 */
 			_FXS(g_eq_g[0] >= 160u || g_eq_g[0] <= 96u || g_eq_g[1] >= 160u || g_eq_g[1] <= 96u ||
 			     g_eq_g[2] >= 160u || g_eq_g[2] <= 96u || g_eq_g[3] >= 160u || g_eq_g[3] <= 96u, 17u);   /* EQ-691 */
@@ -9805,6 +9874,7 @@ static void audio_thread(void *a, void *b, void *c)
 			uint32_t _s = g_starve_cnt[0] + g_starve_cnt[1] + g_starve_cnt[2] + g_starve_cnt[3];
 			g_fxs_blk[_k]++;
 			if (_cus > g_fxs_aus[_k]) g_fxs_aus[_k] = _cus;   /* FXA */
+			if (_cus > 5333u) g_fxs_over[_k]++;   /* POPS-700 FXO: an output click */
 			g_fxs_stv[_k] += _s - g_fxs_prev;  g_fxs_prev = _s;
 			if (g_playing)   /* GRIDFIX-626 (W303): a starved flag parked across a STOP is not a dropout */
 				g_fxs_dry[_k] += (uint32_t)trk[0].starved + trk[1].starved + trk[2].starved + trk[3].starved;
@@ -10322,6 +10392,10 @@ static void controls_diag(void)
 		for (uint32_t _k = 0; _k < FXS_N; _k++)
 			printk(",%u", (unsigned)g_fxs_aus[_k]);
 		printk("\n");
+		printk("FXO,rvclip=%u", (unsigned)g_rv_clip);   /* POPS-700: over-period blocks per class + the reverb clamp count */
+		for (uint32_t _k = 0; _k < FXS_N; _k++)
+			printk(",%u", (unsigned)g_fxs_over[_k]);
+		printk("\n");
 
 		printk("BTN,lat=%u,max=%u\n",
 		       (unsigned)g_stop_lat_ms, (unsigned)g_stop_lat_max);
@@ -10670,8 +10744,6 @@ static enum vol_btn decode_vol(int v)
                                     * 20 us in-ISR capture-spin failed to boot
                                     * on hardware — this design reuses only
                                     * field-proven mechanisms. */
-#define LED_PWM_TIMER      NRF_TIMER3
-#define LED_PWM_TIMER_IRQn TIMER3_IRQn
 /* every LED pin on each port (leds[]+track_leds[]) — for the OFF phase */
 #define LED_ALL_P0 ((1u<<0)|(1u<<1)|(1u<<29)|(1u<<26))
 #define LED_ALL_P1 ((1u<<13)|(1u<<12)|(1u<<15)|(1u<<14))
@@ -10683,77 +10755,57 @@ static volatile uint8_t  g_led_trk_lvl[4] = { 255u, 255u, 255u, 255u };   /* STA
 static uint32_t g_led_sta_p0, g_led_sta_p1;   /* status-row pins (init-computed) */
 static uint32_t g_led_trk_p0, g_led_trk_p1;   /* track-row pins  (init-computed) */
 
-/* DIRECT ISR (required for IRQ_ZERO_LATENCY): pure register IO, no kernel
- * calls, returns 0 = never asks for a reschedule. */
-ISR_DIRECT_DECLARE(led_pwm_isr)
+/* LEDPWM-710: hardware PWM. PWM2 = the status row, PWM3 = the track row. */
+#define LED_PWM_STA   NRF_PWM2
+#define LED_PWM_TRK   NRF_PWM3
+#define LED_PWM_POL   0x8000u   /* high for `duty` ticks, then low (active-high LEDs) */
+#define LED_PWM_FULL  0x7fffu   /* >= COUNTERTOP: solid high, no edge (what Zephyr's pwm_nrfx uses for 100 %) */
+static uint16_t g_led_sta_duty[4] __attribute__((aligned(4)));   /* EasyDMA: RAM, 16-bit */
+static uint16_t g_led_trk_duty[4] __attribute__((aligned(4)));
+static uint32_t g_led_sta_cc = LED_STATUS_ON_US;                 /* status_level() writes it */
+static uint32_t g_led_trk_cc[4] = { LED_PWM_ON_US, LED_PWM_ON_US, LED_PWM_ON_US, LED_PWM_ON_US };   /* track_level() */
+static void led_hw_refresh(void)
 {
-	if (LED_PWM_TIMER->EVENTS_COMPARE[1]) {         /* period wrap: render shadow */
-		LED_PWM_TIMER->EVENTS_COMPARE[1] = 0;
-		(void)LED_PWM_TIMER->EVENTS_COMPARE[1];
-		static uint32_t gframe;
-		/* M19a-r3: in DIM mode the ghost drops to 1-in-8 frames — at
-		 * 1/5 the muted glow read too close to a playing light there
-		 * (marc); full-brightness mode keeps 1/5, where the contrast
-		 * was already right. 125 Hz refresh, still above flicker. */
-		uint32_t gdiv = g_led_dim ? 8u : LED_GHOST_FRAME_DIV;
-		uint32_t gon = ((++gframe % gdiv) == 0u);
-		uint32_t s0 = g_led_p0_on | (gon ? (g_led_p0_ghost & ~g_led_p0_on) : 0u);
-		uint32_t s1 = g_led_p1_on | (gon ? (g_led_p1_ghost & ~g_led_p1_on) : 0u);
-		NRF_P0->OUTSET = s0;
-		NRF_P0->OUTCLR = LED_ALL_P0 & ~s0;
-		NRF_P1->OUTSET = s1;
-		NRF_P1->OUTCLR = LED_ALL_P1 & ~s1;
+	const uint32_t dim = g_led_dim;
+	for (int i = 0; i < 4; i++) {
+		const uint32_t m = 1u << leds[i].pin;
+		const uint32_t on = (leds[i].port == NRF_P0) ? (g_led_p0_on & m) : (g_led_p1_on & m);
+		const uint32_t gh = (leds[i].port == NRF_P0) ? (g_led_p0_ghost & m) : (g_led_p1_ghost & m);
+		uint32_t d = 0u;
+		if (on)      d = dim ? g_led_sta_cc : LED_PWM_FULL;
+		else if (gh) d = dim ? (g_led_sta_cc >> 3) : (LED_PWM_PERIOD_US / LED_GHOST_FRAME_DIV);
+		g_led_sta_duty[i] = (uint16_t)(LED_PWM_POL | d);
 	}
-	/* STACKA-664 A6: one OFF compare per track LED (0 -> CC[0], 1..3 -> CC[3..5]).
-	 * Dim mode: the pin goes dark at its own on-time. Full mode: only a ghost
-	 * pin or a pin held BELOW full by a page level goes dark (a full-level pin's
-	 * compare sits 1 us before the wrap, invisible). */
-	for (uint32_t _k = 0u; _k < 4u; _k++) {
-		const uint32_t _cc = (_k == 0u) ? 0u : (2u + _k);
-		if (!LED_PWM_TIMER->EVENTS_COMPARE[_cc]) continue;
-		LED_PWM_TIMER->EVENTS_COMPARE[_cc] = 0;
-		(void)LED_PWM_TIMER->EVENTS_COMPARE[_cc];
-		const uint32_t _pm = 1u << track_leds[_k].pin;
-		NRF_GPIO_Type *const _pt = track_leds[_k].port;
-		if (g_led_dim || g_led_trk_lvl[_k] < 255u) {
-			_pt->OUTCLR = _pm;
-		} else {
-			const uint32_t _gh = (_pt == NRF_P0) ? (g_led_p0_ghost & ~g_led_p0_on)
-			                                     : (g_led_p1_ghost & ~g_led_p1_on);
-			if (_gh & _pm) _pt->OUTCLR = _pm;
-		}
+	for (int i = 0; i < 4; i++) {
+		const uint32_t m = 1u << track_leds[i].pin;
+		const uint32_t on = (track_leds[i].port == NRF_P0) ? (g_led_p0_on & m) : (g_led_p1_on & m);
+		const uint32_t gh = (track_leds[i].port == NRF_P0) ? (g_led_p0_ghost & m) : (g_led_p1_ghost & m);
+		const uint32_t cc = g_led_trk_cc[i];
+		uint32_t d = 0u;
+		if (on)      d = (dim || g_led_trk_lvl[i] < 255u) ? cc : LED_PWM_FULL;
+		else if (gh) d = dim ? (cc >> 3) : (cc / LED_GHOST_FRAME_DIV);
+		g_led_trk_duty[i] = (uint16_t)(LED_PWM_POL | d);
 	}
-	if (LED_PWM_TIMER->EVENTS_COMPARE[2]) {         /* status-row on-time up */
-		LED_PWM_TIMER->EVENTS_COMPARE[2] = 0;
-		(void)LED_PWM_TIMER->EVENTS_COMPARE[2];
-		if (g_led_dim) {
-			NRF_P0->OUTCLR = g_led_sta_p0;
-			NRF_P1->OUTCLR = g_led_sta_p1;
-		}
-	}
-	return 0;
 }
-
+static void led_pwm_one(NRF_PWM_Type *pwm, const struct led *l, uint16_t *duty)
+{
+	pwm->ENABLE = 0;
+	for (int i = 0; i < 4; i++)
+		pwm->PSEL.OUT[i] = (l[i].pin & 31u) | ((l[i].port == NRF_P1) ? (1u << 5) : 0u);   /* port bit 5 */
+	pwm->MODE       = PWM_MODE_UPDOWN_Up << PWM_MODE_UPDOWN_Pos;
+	pwm->PRESCALER  = PWM_PRESCALER_PRESCALER_DIV_16 << PWM_PRESCALER_PRESCALER_Pos;   /* 1 MHz: 1 us ticks */
+	pwm->COUNTERTOP = LED_PWM_PERIOD_US;                                                 /* 1 kHz frame, as before */
+	pwm->LOOP       = 1u;
+	pwm->DECODER    = (PWM_DECODER_LOAD_Individual << PWM_DECODER_LOAD_Pos) |
+	                  (PWM_DECODER_MODE_RefreshCount << PWM_DECODER_MODE_Pos);
+	pwm->SEQ[0].PTR = (uint32_t)duty; pwm->SEQ[0].CNT = 4; pwm->SEQ[0].REFRESH = 0; pwm->SEQ[0].ENDDELAY = 0;
+	pwm->SEQ[1].PTR = (uint32_t)duty; pwm->SEQ[1].CNT = 4; pwm->SEQ[1].REFRESH = 0; pwm->SEQ[1].ENDDELAY = 0;
+	pwm->SHORTS     = PWM_SHORTS_LOOPSDONE_SEQSTART0_Msk;   /* forever: the buffer is re-read every period */
+	pwm->ENABLE     = 1;
+	pwm->TASKS_SEQSTART[0] = 1;
+}
 static void led_pwm_init(void)
 {
-	LED_PWM_TIMER->MODE      = TIMER_MODE_MODE_Timer;
-	LED_PWM_TIMER->BITMODE   = TIMER_BITMODE_BITMODE_16Bit;
-	LED_PWM_TIMER->PRESCALER = 4;                    /* 16 MHz/16 = 1 us tick */
-	LED_PWM_TIMER->CC[0]     = LED_PWM_ON_US;        /* -> OFF phase */
-	LED_PWM_TIMER->CC[1]     = LED_PWM_PERIOD_US;    /* -> wrap + ON phase */
-	LED_PWM_TIMER->CC[2]     = LED_STATUS_ON_US;     /* -> status-row OFF */
-	/* STACKA-664 A6: track LEDs 1..3 get their own OFF compare (LED 0 keeps CC[0]),
-	 * so a page can light each lane at its own depth. At rest they equal CC[0]. */
-	LED_PWM_TIMER->CC[3]     = LED_PWM_ON_US;
-	LED_PWM_TIMER->CC[4]     = LED_PWM_ON_US;
-	LED_PWM_TIMER->CC[5]     = LED_PWM_ON_US;
-	LED_PWM_TIMER->SHORTS    = TIMER_SHORTS_COMPARE1_CLEAR_Msk;
-	LED_PWM_TIMER->INTENSET  = TIMER_INTENSET_COMPARE0_Msk |
-				   TIMER_INTENSET_COMPARE1_Msk |
-				   TIMER_INTENSET_COMPARE2_Msk |
-				   TIMER_INTENSET_COMPARE3_Msk |
-				   TIMER_INTENSET_COMPARE4_Msk |
-				   TIMER_INTENSET_COMPARE5_Msk;
 	for (int li = 0; li < NUM_LEDS; li++) {
 		if (leds[li].port == NRF_P0) g_led_sta_p0 |= (1u << leds[li].pin);
 		else                         g_led_sta_p1 |= (1u << leds[li].pin);
@@ -10762,10 +10814,9 @@ static void led_pwm_init(void)
 		if (track_leds[li].port == NRF_P0) g_led_trk_p0 |= (1u << track_leds[li].pin);
 		else                               g_led_trk_p1 |= (1u << track_leds[li].pin);
 	}
-	IRQ_DIRECT_CONNECT(LED_PWM_TIMER_IRQn, 0, led_pwm_isr, IRQ_ZERO_LATENCY);
-	irq_enable(LED_PWM_TIMER_IRQn);
-	LED_PWM_TIMER->TASKS_CLEAR = 1;
-	LED_PWM_TIMER->TASKS_START = 1;
+	led_hw_refresh();
+	led_pwm_one(LED_PWM_STA, leds, g_led_sta_duty);
+	led_pwm_one(LED_PWM_TRK, track_leds, g_led_trk_duty);
 }
 
 /* ---------- LED helpers ---------- */
@@ -10780,11 +10831,13 @@ static void led_on(int i)
 {
 	if (leds[i].port == NRF_P0) g_led_p0_on |= (1u << leds[i].pin);
 	else                        g_led_p1_on |= (1u << leds[i].pin);
+	led_hw_refresh();   /* LEDPWM-710 */
 }
 static void led_off(int i)
 {
 	if (leds[i].port == NRF_P0) g_led_p0_on &= ~(1u << leds[i].pin);
 	else                        g_led_p1_on &= ~(1u << leds[i].pin);
+	led_hw_refresh();
 }
 /* TG-551: set the STATUS row's PWM on-time directly. b is 0..255 of the
  * nominal LED_STATUS_ON_US window. SQUARED on the way in because
@@ -10797,7 +10850,8 @@ static void status_level(uint32_t b)
 	uint32_t cc = (LED_STATUS_ON_US * b * b) / (255u * 255u);
 	if (cc < 1u) cc = 1u;
 	if (cc > LED_PWM_PERIOD_US - 1u) cc = LED_PWM_PERIOD_US - 1u;
-	LED_PWM_TIMER->CC[2] = cc;
+	g_led_sta_cc = cc;   /* LEDPWM-710 */
+	led_hw_refresh();
 }
 
 /* STACKA-664 A6: a track LED's page LEVEL, 0..255 of the row's window (dim: the
@@ -10813,7 +10867,8 @@ static void track_level(int i, uint32_t b)
 	if (cc < 1u) cc = 1u;
 	if (cc > LED_PWM_PERIOD_US - 1u) cc = LED_PWM_PERIOD_US - 1u;
 	g_led_trk_lvl[i] = (uint8_t)b;
-	LED_PWM_TIMER->CC[(i == 0) ? 0 : (2 + i)] = cc;
+	g_led_trk_cc[i] = cc;   /* LEDPWM-710 */
+	led_hw_refresh();
 }
 /* the page views set levels; this hands the row back once no page is showing */
 static void track_level_rest(void)
@@ -10831,6 +10886,7 @@ static void led_ghost(int i)
 	                              g_led_p0_on &= ~(1u << leds[i].pin); }
 	else                        { g_led_p1_ghost |= (1u << leds[i].pin);
 	                              g_led_p1_on &= ~(1u << leds[i].pin); }
+	led_hw_refresh();
 }
 static void led_clear(int i)
 {
@@ -10840,6 +10896,7 @@ static void led_clear(int i)
 	                              g_led_p0_ghost &= ~(1u << leds[i].pin); }
 	else                        { g_led_p1_on &= ~(1u << leds[i].pin);
 	                              g_led_p1_ghost &= ~(1u << leds[i].pin); }
+	led_hw_refresh();
 }
 static void all_off(void)  { for (int i = 0; i < NUM_LEDS; i++) led_clear(i); }
 /* Status row = song indicator, 16 songs via TWO LIGHTS ("scheme E", chosen
@@ -11080,6 +11137,7 @@ static void track_led_on(int i)
 	                                    g_led_p0_ghost &= ~(1u << track_leds[i].pin); }
 	else                              { g_led_p1_on |= (1u << track_leds[i].pin);
 	                                    g_led_p1_ghost &= ~(1u << track_leds[i].pin); }
+	led_hw_refresh();   /* LEDPWM-710 */
 }
 static void track_led_off(int i)
 {
@@ -11087,6 +11145,7 @@ static void track_led_off(int i)
 	                                    g_led_p0_ghost &= ~(1u << track_leds[i].pin); }
 	else                              { g_led_p1_on &= ~(1u << track_leds[i].pin);
 	                                    g_led_p1_ghost &= ~(1u << track_leds[i].pin); }
+	led_hw_refresh();
 }
 /* GHOST: barely-lit = this track HAS content but is muted (sleeping). The
  * fix for "muted and empty look identical" — community request. */
@@ -11096,6 +11155,7 @@ static void track_led_ghost(int i)
 	                                    g_led_p0_on &= ~(1u << track_leds[i].pin); }
 	else                              { g_led_p1_ghost |= (1u << track_leds[i].pin);
 	                                    g_led_p1_on &= ~(1u << track_leds[i].pin); }
+	led_hw_refresh();
 }
 static void track_all_off(void)  { for (int i = 0; i < NUM_TRACK_LEDS; i++) track_led_off(i); }
 /* STACKA-664 A6: a page lane's LED -- dark at 0, else lit at a brightness that
@@ -11138,7 +11198,8 @@ static void page_led_depth(int i, uint32_t amt)
 static void shutdown_leds(void)
 {
 	all_off(); track_all_off();          /* clear the shadow */
-	LED_PWM_TIMER->TASKS_STOP = 1;       /* stop the dimmer */
+	LED_PWM_STA->TASKS_STOP = 1; LED_PWM_TRK->TASKS_STOP = 1;   /* LEDPWM-710: stop the dimmers */
+	LED_PWM_STA->ENABLE = 0;     LED_PWM_TRK->ENABLE = 0;       /* the pins are GPIO again */
 	NRF_P0->OUTCLR = LED_ALL_P0;         /* force every LED pin low */
 	NRF_P1->OUTCLR = LED_ALL_P1;
 }
@@ -11214,7 +11275,7 @@ static void led_service(void)
 	} else if (g_pg_open && g_pg_id == 4u) {
 		/* TAPE-569: PAGE 4 VIEW -- drive / tone / hiss / wobble. */
 		/* A6: depth; tone (A1) is bipolar with a 120..136 deadband; the hiss is 655's */
-		const uint32_t _lv[4] = { g_tp_drive, bipolar_depth(g_tp_tone), g_tp_hiss, g_tp_wob };
+		const uint32_t _lv[4] = { g_tp_drive, bipolar_depth(g_tp_tone), bipolar_depth(g_tp_hiss), g_tp_wob };   /* HISS2-701 */
 		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, (g_sec_led == (uint8_t)(i + 1)) ? (uint32_t)(g_sec_led2 ? g_sec2[(g_pg_id - 1u) & 3u][i] : g_sec[(g_pg_id - 1u) & 3u][i]) : _lv[i]);   /* SEC-695 / SHAPE-696 */
 	} else if (g_pg_open && g_pg_id == 5u) {
 		/* EQ-691: PAGE 5 VIEW -- four bands, LED = |gain| (bipolar, A1's deadband). */
@@ -11614,7 +11675,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 10\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 6\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -11950,7 +12011,7 @@ int main(void)
 			 * report). The early streamer (r6) has the index loaded
 			 * well inside the 600 ms hold. */
 			if (g_meta_loaded)
-				g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u;
+				{ g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u; led_hw_refresh(); }
 			if (pwr_pressed()) {
 				int64_t hnow = k_uptime_get();
 				if (hold_t < 0) hold_t = hnow;
@@ -11992,7 +12053,7 @@ int main(void)
 				 * mode (user report). Apply it here as soon as the
 				 * streamer has the index; idempotent per pass. */
 				if (g_meta_loaded)
-					g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u;
+					{ g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u; led_hw_refresh(); }
 				static const int batt_thr[3] = { 2020, 2140, 2260 };
 				static int bavg = -1;   /* smoothed reading (EMA over ~10 passes) */
 				static int blvl = 0;    /* sticky displayed level (hysteresis) */
@@ -12066,7 +12127,7 @@ int main(void)
 	 * effectively zero. */
 	for (int bw = 0; bw < 100 && !g_meta_loaded; bw++) { feed_wdt(); k_msleep(5); }
 	if (g_meta_loaded)
-		g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u;
+		{ g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u; led_hw_refresh(); }
 
 	/* ---- power-ON indication: sweep the LEDs on, then clear ---- */
 	for (int i = 0; i < NUM_LEDS; i++) {
@@ -12086,7 +12147,7 @@ int main(void)
 		g_play_bpm = (int)(((uint64_t)g_play_speed_q16 * LOOP_BPM_BASE + 32768u) / 65536u);
 		if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
 		if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
-		g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u;   /* restore brightness mode */
+		{ g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u; led_hw_refresh(); }   /* restore brightness mode */
 		g_instant_rec = (uint8_t)(((g_meta.led_full >> 1) & 1u) ? 0u : 1u);   /* M41-r5: bit 1 SET = classic */
 		{	/* M7: current song's persisted chop + effective mode */
 			uint32_t cd, co;
@@ -12163,6 +12224,8 @@ int main(void)
 			k_msleep(20);
 			continue;
 		}
+
+		ladder_scan();   /* ADCSCAN-710: every ladder, once, for this pass */
 
 		/* Print one status line ~twice a second (the 500 ms gate below) for
 		 * monitoring. Only prints when a serial monitor is attached (DTR). */
@@ -13761,7 +13824,7 @@ int main(void)
 						 * sits. A tap that zeroes it outright is the answer. */
 						if (ti == 0) g_tp_drive = 0u;
 						if (ti == 1) g_tp_tone  = 128u;
-						if (ti == 2) g_tp_hiss  = 0u;
+						if (ti == 2) g_tp_hiss  = 128u;   /* HISS2-701: centre = off */
 						if (ti == 3) { g_tp_wob = 0u; g_lane_per[6] = 0u; }   /* WOBTAP-675: the kill also frees the wow (page 3's rule) */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
