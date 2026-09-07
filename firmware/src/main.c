@@ -1768,7 +1768,13 @@ static volatile uint8_t  g_gat_amt;       /* FX2-550: gate threshold,   fader 4 
 static volatile uint8_t g_bcr_amt;         /* bitcrush depth */
 static volatile uint8_t g_swp_amt;         /* auto-pan depth */
 static volatile uint8_t g_trm_amt;         /* tremolo depth */
-static uint32_t g_fx2_lfo;                 /* shared LFO phase, 32-bit wrap */
+static uint32_t g_fx2_lfo;                 /* shared LFO phase, 32-bit wrap (A3: the chorus's; the page-3 lanes have their own below) */
+/* STACKA-664 A3/A4/A5: per-lane clocks and types (runtime only, cleared by the FX reset). */
+static uint32_t          g_lfo_ph[3];              /* A3: phaser / sweep / tremolo phase */
+static volatile uint8_t  g_lfo_div[3] = { 0u, 0u, 2u };   /* A3: 0 = beat, 1 = half, 2 = quarter */
+static volatile uint32_t g_lane_per[6];            /* A4: tapped period in engine frames; 0 = the grid. 0 gate 1 echo 2 phs 3 swp 4 trm 5 chorus */
+static volatile uint64_t g_lane_anc;               /* A4: the gate's tapped downbeat (sample clock) */
+static volatile uint8_t  g_dst_typ;                /* A5: 0 = soft (cubic), 1 = hard, 2 = fold, 3 = OFF */
 static int32_t  g_bcr_hL, g_bcr_hR;        /* sample-and-hold state */
 static uint32_t g_bcr_ph;
 
@@ -3023,6 +3029,10 @@ static void fx_reset_all(void)
          * (569); marc: "FN + T1 + T4 is resetting all the FX except page 4". */
         g_ec_mix = 0u;  g_ec_div = 0u;
         g_tp_drive = 0u;  g_tp_tone = 128u;  g_tp_hiss = 0u;  g_tp_wob = 0u;
+        /* STACKA-664: the reset also clears every tapped rate, division and type */
+        for (int _l = 0; _l < 6; _l++) g_lane_per[_l] = 0u;
+        g_lfo_div[0] = 0u; g_lfo_div[1] = 0u; g_lfo_div[2] = 2u;
+        g_dst_typ = 0u;
         for (int _f = 0; _f < 4; _f++) {
                 g_fx_pick[_f]  = 1;
                 g_fx_lastq[_f] = -1;
@@ -3064,7 +3074,7 @@ static volatile uint8_t  g_mode_pref;              /* M7c: global working prefer
  * Speed is derived exactly: speed = bpm * 65536 / LOOP_BPM_BASE, so 80 BPM is
  * exactly 1.0x — no detent/snap logic needed. Range 40..120 = 0.5x..1.5x. */
 #define BPM_MIN 20    /* RANGE-655: 0.25x (was 40 = 0.5x) */
-#define BPM_MAX 160   /* RANGE-655: 2.0x (was 120 = 1.5x) */
+#define BPM_MAX 120   /* CAP-665: 1.5x again (RANGE-655's 160 = 2x pended until the corner-degradation decision); BPM_MIN stays 20 = 0.25x */
 static volatile int g_play_bpm = 80;
 /* auto-start thresholds (loop-sample domain @ LOOP_RATE) */
 #define SOUND_THRESHOLD  1000              /* int16 level (~ -30 dBFS) */
@@ -3564,20 +3574,27 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		                        ? (1u + (((uint32_t)g_bcr_amt * 15u) >> 8)) : 0u;
 		const int32_t  bcr_mask = (int32_t)(0xFFFFFFFFu <<
 		                          (((uint32_t)g_bcr_amt * 8u) >> 8));
-		const int32_t  swp_d    = (int32_t)g_swp_amt;
-		const int32_t  trm_d    = (int32_t)g_trm_amt;
+		/* STACKA-664 A3/A4: ONE beat for every clocked lane this block -- the grid's
+		 * beat, else the tape BPM's, else 500 ms -- and a tapped period per lane
+		 * that overrides it (0 = follow the beat). Read once, like every page value. */
+		const uint32_t lane_bf = (g_grid_active && g_grid_beat_frames) ? g_grid_beat_frames
+		                       : ((g_play_bpm > 0) ? (48000u * 60u / (uint32_t)g_play_bpm) : 24000u);
+		const uint32_t lane_p0 = g_lane_per[0], lane_p1 = g_lane_per[1];
+		const uint32_t lane_p2 = g_lane_per[2], lane_p3 = g_lane_per[3], lane_p4 = g_lane_per[4], lane_p5 = g_lane_per[5];
+		const int32_t  swp_d    = (g_lfo_div[1] >= 3u) ? 0 : (int32_t)g_swp_amt;   /* 660: division 3 = OFF */
+		const int32_t  trm_d    = (g_lfo_div[2] >= 3u) ? 0 : (int32_t)g_trm_amt;
 		const int      fx2_lfo_on = (swp_d || trm_d) ? 1 : 0;
 		/* PG8-560 FX3 per-block constants. */
 		const int32_t  rng_d    = (int32_t)g_rng_amt;
 		const int32_t  awh_d    = (int32_t)g_awh_amt;
-		const int32_t  phs_d    = (int32_t)g_phs_amt;
+		const int32_t  phs_d    = (g_lfo_div[0] >= 3u) ? 0 : (int32_t)g_phs_amt;   /* 660: division 3 = OFF */
 		/* Ring carrier: ONE fader sets depth and pitch together, 40 Hz at the
 		 * bottom to ~1.2 kHz at the top. Low = growl, high = clangorous metal.
 		 * 2^32 / 48000 = 89478 phase units per Hz. */
 		const uint32_t rng_inc  = 3579139u + (uint32_t)g_rng_amt * 406000u;
 		/* ECHO2-610 per-block constants: the delay in LINE samples, the wet and
 		 * feedback gains, and the engage edge. Decided once per block. */
-		const int32_t  ec_mix = (int32_t)g_ec_mix;
+		const int32_t  ec_mix = (g_ec_div >= 3u) ? 0 : (int32_t)g_ec_mix;   /* 660: the 4th tap state is OFF */
 		int ec_n = 0;
 		uint32_t ec2_d = 0u;             /* delay, 12 kHz line samples */
 		int32_t  ec2_fb = 0, ec2_wet = 0;
@@ -3592,6 +3609,10 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			uint32_t _ed = (g_ec_div == 1u) ? ((_ebf * 3u) >> 3)   /* dotted 1/16 */
 			             : (g_ec_div >= 2u) ? (_ebf >> 1)          /* 1/8 */
 			                                : (_ebf >> 2);         /* 1/16 */
+			if (lane_p1) {   /* A4: the tapped period IS the echo time; halve until it fits the line */
+				_ed = lane_p1;
+				while (_ed > ((EC2_LINE - 1u) << 2)) _ed >>= 1;
+			}
 			ec2_d = (_ed + 2u) >> 2;       /* engine frames -> line samples */
 			/* NO TEMPO MAY SILENCE THE EFFECT (572): shorten to the line
 			 * rather than drop out. 384 ms holds every division to 80 BPM. */
@@ -3625,13 +3646,16 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		/* TUNE2-576: -12 dB. -38 dBFS at full was intrusive against quiet
 		 * loops; real tape hiss sits ~-50 dB below peak. */
 		const int32_t tp_hs = (int32_t)g_tp_hiss >> 3;   /* TUNE3-577: marc: between -- -6 dB from the original */
-		const int32_t tp_tn = (int32_t)g_tp_tone;
+		/* A1: the tone fader has a DEADBAND (120..136 = flat), so the LED that
+		 * lights on 'not 128' and the kernel that engages on 'not 128' agree with
+		 * the hand: a fader parked near the middle is flat and dark. */
+		const int32_t tp_tn = (g_tp_tone >= 120u && g_tp_tone <= 136u) ? 128 : (int32_t)g_tp_tone;
 		const int32_t tp_glo = (tp_tn >= 128) ? (256 - (tp_tn - 128))
 		                                      : (256 + (128 - tp_tn));
 		const int32_t tp_ghi = (tp_tn >= 128) ? (256 + (tp_tn - 128) * 3)
 		                                      : (256 - (128 - tp_tn) * 2);
 		const int      tp_any = (g_tp_drive != 0u) || (g_tp_hiss != 0u)
-		                     || (g_tp_tone != 128u);
+		                     || (tp_tn != 128);
 		/* ONE accumulator serves sweep, tremolo and the phaser. */
 		const int      lfo_on   = (swp_d || trm_d || phs_d) ? 1 : 0;
 		/* FX2-550: both new kernels are read ONCE per block into a local,
@@ -3658,6 +3682,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			                ? (48000u * 60u / (uint32_t)g_play_bpm) : 0u);
 			uint64_t _anc = (g_grid_active && g_grid_beat_frames)
 			              ? g_grid_anchor : 0u;
+			if (lane_p0) { _bf = lane_p0; _anc = g_lane_anc; }   /* A4: the tapped beat, from its first tap */
 			uint32_t _spb = tg_spb[tg_rate];
 			if (_bf && _spb) tg_sf = _bf / _spb;
 			/* r21: pattern slot 4 is OFF -- the fifth tap position. */
@@ -3708,7 +3733,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			if (d == 0) d = (tg > dst_g_s) ? 1 : ((tg < dst_g_s) ? -1 : 0);
 			dst_g_s += d;
 		}
-		const int32_t dst_g = (g_dst_amt == 0u && dst_g_s < 4160) ? 0 : dst_g_s;
+		const int32_t dst_g = ((g_dst_amt == 0u && dst_g_s < 4160) || g_dst_typ >= 3u) ? 0 : dst_g_s;   /* 660: type 3 = OFF */
 		/* DST-548 r2: the trim used to cancel the drive EXACTLY, which
 		 * kept the level honest but also removed the loudness cue that
 		 * makes distortion read as distortion. It now allows up to +6 dB
@@ -3765,7 +3790,15 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 		 * lean loop below (master -> limiter -> store -> VU) is the proven
 		 * 559 loop and now runs unconditionally. */
 		if (fx_any) {
-		const uint32_t lfo_base = g_fx2_lfo;
+		/* A3: per-lane increments from the beat (or the tapped period). Division
+		 * 0 = beat, 1 = half, 2 = quarter. One udiv per ENGAGED lane per block. */
+		uint32_t phs_inc = 0u, swp_inc = 0u, trm_inc = 0u;
+		if (phs_d) { uint32_t _pp = lane_p2 ? lane_p2 : (lane_bf >> g_lfo_div[0]); if (_pp < 64u) _pp = 64u; phs_inc = 0xFFFFFFFFu / _pp + 1u; }
+		if (swp_d) { uint32_t _pp = lane_p3 ? lane_p3 : (lane_bf >> g_lfo_div[1]); if (_pp < 64u) _pp = 64u; swp_inc = 0xFFFFFFFFu / _pp + 1u; }
+		if (trm_d) { uint32_t _pp = lane_p4 ? lane_p4 : (lane_bf >> g_lfo_div[2]); if (_pp < 64u) _pp = 64u; trm_inc = 0xFFFFFFFFu / _pp + 1u; }
+		/* A4 (660): the chorus LFO is tappable too; its default is the 0.68 Hz sweep it always had */
+		const uint32_t chr_inc = lane_p5 ? (0xFFFFFFFFu / (lane_p5 < 64u ? 64u : lane_p5) + 1u) : CHR_LFO_INC;
+		const uint32_t lfo_base = g_fx2_lfo;   /* (A3: no page-3 lane reads this any more; kept for the fold below) */
 		if (tp_hs) {
 			uint32_t _h_g_tp_hsi = g_tp_hsi;
 			uint32_t _h_g_tp_rng = g_tp_rng;
@@ -3828,6 +3861,15 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			int32_t _h_flt_lowR = flt_lowR;
 			int32_t _h_flt_bandR = flt_bandR;
 			const int32_t _h_flt_f = flt_f;
+			/* STACKA-664 THE BAND FILTER (marc: 'only the new dj filter'). The same SVF
+			 * and coefficient path as the LP/HP it replaces; the OUTPUT is the band,
+			 * and it CROSSFADES in from the centre: dry inside the 112..143 bypass
+			 * band, fully wet 32 counts further out. The two halves meet at dry, so
+			 * the high-band / low-band seam the 658 version had at the centre is
+			 * gone. Below centre the band sweeps DOWN from the highs; above it, UP
+			 * from the lows. One filter, two handles (FN + fader 4 drives it too). */
+			const uint32_t _fdc = (g_flt_pos >= 128u) ? ((uint32_t)g_flt_pos - 128u) : (128u - (uint32_t)g_flt_pos);
+			const int32_t  _bpw = (_fdc <= 16u) ? 0 : ((_fdc - 16u) * 8u >= 256u ? 256 : (int32_t)((_fdc - 16u) * 8u));
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				int32_t xL = mix32[f];
 				int32_t xR = mix32R[f];
@@ -3836,11 +3878,11 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 				_h_flt_lowL += (int32_t)(((int64_t)_h_flt_f * _h_flt_bandL) >> 14);
 				int32_t hiL = xL - _h_flt_lowL - _h_flt_bandL;
 				_h_flt_bandL += (int32_t)(((int64_t)_h_flt_f * hiL) >> 14);
-				xL = (flt_mode == 1u) ? _h_flt_lowL : hiL;
+				xL += (int32_t)((((int64_t)(_h_flt_bandL * 2) - xL) * _bpw) >> 8);
 				_h_flt_lowR += (int32_t)(((int64_t)_h_flt_f * _h_flt_bandR) >> 14);
 				int32_t hiR = xR - _h_flt_lowR - _h_flt_bandR;
 				_h_flt_bandR += (int32_t)(((int64_t)_h_flt_f * hiR) >> 14);
-				xR = (flt_mode == 1u) ? _h_flt_lowR : hiR;
+				xR += (int32_t)((((int64_t)(_h_flt_bandR * 2) - xR) * _bpw) >> 8);
 				mix32[f] = xL; mix32R[f] = xR;
 			}
 			flt_lowL = _h_flt_lowL;
@@ -3872,7 +3914,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 					if (_cm < -32767) _cm = -32767;
 					g_chr_buf[_h_g_chr_w & CHR_MASK] = (int16_t)_cm;
 				}
-				_h_g_chr_ph += CHR_LFO_INC;
+				_h_g_chr_ph += chr_inc;   /* A4 (660): tappable */
 				for (int _c = 0; _c < 2; _c++) {
 					uint32_t _ph = _h_g_chr_ph + (_c ? 0x40000000u : 0u);
 					/* triangle: 0..65535 from the top 17 bits */
@@ -3897,6 +3939,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			g_chr_ph = _h_g_chr_ph;
 		}
 		if (dst_g) {
+			const uint32_t _dtyp = g_dst_typ;   /* A5: read once per block */
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				int32_t xL = mix32[f];
 				int32_t xR = mix32R[f];
@@ -3915,10 +3958,20 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 				if (dL < -32767) dL = -32767;
 				if (dR >  32767) dR =  32767;
 				if (dR < -32767) dR = -32767;
-				{ int32_t t = (dL * dL) >> 15;
-				  dL = dL - (((t * dL) >> 15) * 10923 >> 15); }
-				{ int32_t t = (dR * dR) >> 15;
-				  dR = dR - (((t * dR) >> 15) * 10923 >> 15); }
+				if (_dtyp == 0u) {            /* SOFT: the cubic, as shipped (saturates at 2/3 FS) */
+					{ int32_t t = (dL * dL) >> 15;
+					  dL = dL - (((t * dL) >> 15) * 10923 >> 15); }
+					{ int32_t t = (dR * dR) >> 15;
+					  dR = dR - (((t * dR) >> 15) * 10923 >> 15); }
+				} else if (_dtyp == 1u) {     /* HARD (660): a flat clip at 1/3 FS, then x2 -- square-wave buzz */
+					if (dL >  10922) dL =  10922; if (dL < -10922) dL = -10922;
+					if (dR >  10922) dR =  10922; if (dR < -10922) dR = -10922;
+					dL *= 2; dR *= 2;
+				} else {                      /* FOLD (660): reflect at 1/3 FS (one reflection covers +-3T), then x2 -- ring-like harmonics */
+					if (dL >  10922) dL =  21844 - dL; else if (dL < -10922) dL = -21844 - dL;
+					if (dR >  10922) dR =  21844 - dR; else if (dR < -10922) dR = -21844 - dR;
+					dL *= 2; dR *= 2;
+				}
 				xL = (dL * dst_trim) >> 12;
 				xR = (dR * dst_trim) >> 12;
 				mix32[f] = xL; mix32R[f] = xR;
@@ -4054,9 +4107,9 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 				int32_t _t0 = g_phs_yo[_ch * 4 + 0], _t1 = g_phs_yo[_ch * 4 + 1];
 				int32_t _t2 = g_phs_yo[_ch * 4 + 2], _t3 = g_phs_yo[_ch * 4 + 3];
 				int32_t _fb = _ch ? g_phs_fbR : g_phs_fbL;
-				uint32_t _lfo = lfo_base;
+				uint32_t _lfo = g_lfo_ph[0];   /* A3: the phaser's own clock (both channels from the same base) */
 				for (uint32_t f = 0; f < BLK_FRAMES; f++) {
-					_lfo += FX2_LFO_INC;
+					_lfo += phs_inc;
 					uint32_t _pu = _lfo >> 23;
 					int32_t  _pt = (_pu < 256u) ? (int32_t)_pu : (int32_t)(511u - _pu);
 					int32_t  _pa = 700 + ((_pt * 3100) >> 8);   /* Q12 coeff, FXRST-563 range */
@@ -4077,11 +4130,12 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 				if (_ch) g_phs_fbR = _fb; else g_phs_fbL = _fb;
 				_mx = mix32R;
 			}
+			g_lfo_ph[0] += (uint32_t)BLK_FRAMES * phs_inc;   /* A3 */
 		}
 		if (swp_d) {
-			uint32_t _lfo = lfo_base;
+			uint32_t _lfo = g_lfo_ph[1];   /* A3: the sweep's own clock */
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
-				_lfo += FX2_LFO_INC;
+				_lfo += swp_inc;
 				int32_t xL = mix32[f];
 				int32_t xR = mix32R[f];
 				/* ONE triangle LFO drives both sweep and tremolo -- they are
@@ -4097,9 +4151,9 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			}
 		}
 		if (trm_d) {
-			uint32_t _lfo = lfo_base;
+			uint32_t _lfo = g_lfo_ph[2];   /* A3: the tremolo's own clock */
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
-				_lfo += FX2_LFO_INC;
+				_lfo += trm_inc;
 				int32_t xL = mix32[f];
 				int32_t xR = mix32R[f];
 				/* ONE triangle LFO drives both sweep and tremolo -- they are
@@ -4112,7 +4166,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 					 * ~4.8 Hz, a flutter you can hear -- while sweep keeps
 					 * the slow 1.2 Hz drift an auto-pan wants. One
 					 * accumulator, two speeds, one shift. */
-					uint32_t _ts = (_lfo << 2) >> 23;      /* 0..511 */
+					uint32_t _ts = _lfo >> 23;             /* 0..511 (A3: own clock; the x4 became the quarter default) */
 					int32_t  _tt = (_ts < 256u) ? (int32_t)_ts
 					                           : (int32_t)(511u - _ts);
 					int32_t _g = 128 - ((_tt * trm_d) >> 9);
@@ -4159,7 +4213,9 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 			}
 			g_ec2_w = _w;
 		}
-		if (lfo_on) g_fx2_lfo = lfo_base + (uint32_t)BLK_FRAMES * FX2_LFO_INC;   /* PG8-560: advanced ONCE per frame, folded */
+		if (swp_d) g_lfo_ph[1] += (uint32_t)BLK_FRAMES * swp_inc;   /* A3 */
+		if (trm_d) g_lfo_ph[2] += (uint32_t)BLK_FRAMES * trm_inc;   /* A3 */
+		(void)lfo_base; (void)lfo_on;   /* A3: the shared phase is the chorus's now */
 		}
 }
 
@@ -10214,6 +10270,7 @@ static volatile uint32_t g_led_p0_on;   /* P0 LED pins logically lit */
 static volatile uint32_t g_led_p1_on;   /* P1 LED pins logically lit */
 static volatile uint32_t g_led_p0_ghost; /* P0 pins lit at GHOST duty */
 static volatile uint32_t g_led_p1_ghost; /* P1 pins lit at GHOST duty */
+static volatile uint8_t  g_led_trk_lvl[4] = { 255u, 255u, 255u, 255u };   /* STACKA-664 A6: per-pin page level, 255 = the row */
 static uint32_t g_led_sta_p0, g_led_sta_p1;   /* status-row pins (init-computed) */
 static uint32_t g_led_trk_p0, g_led_trk_p1;   /* track-row pins  (init-computed) */
 
@@ -10238,18 +10295,23 @@ ISR_DIRECT_DECLARE(led_pwm_isr)
 		NRF_P1->OUTSET = s1;
 		NRF_P1->OUTCLR = LED_ALL_P1 & ~s1;
 	}
-	if (LED_PWM_TIMER->EVENTS_COMPARE[0]) {         /* track-row on-time up */
-		LED_PWM_TIMER->EVENTS_COMPARE[0] = 0;
-		(void)LED_PWM_TIMER->EVENTS_COMPARE[0];
-		if (g_led_dim) {                        /* dim: track row goes dark;
-		                                         * the status row stays lit
-		                                         * until CC2. Full mode: only
-		                                         * ghost pins go dark. */
-			NRF_P0->OUTCLR = g_led_trk_p0;
-			NRF_P1->OUTCLR = g_led_trk_p1;
+	/* STACKA-664 A6: one OFF compare per track LED (0 -> CC[0], 1..3 -> CC[3..5]).
+	 * Dim mode: the pin goes dark at its own on-time. Full mode: only a ghost
+	 * pin or a pin held BELOW full by a page level goes dark (a full-level pin's
+	 * compare sits 1 us before the wrap, invisible). */
+	for (uint32_t _k = 0u; _k < 4u; _k++) {
+		const uint32_t _cc = (_k == 0u) ? 0u : (2u + _k);
+		if (!LED_PWM_TIMER->EVENTS_COMPARE[_cc]) continue;
+		LED_PWM_TIMER->EVENTS_COMPARE[_cc] = 0;
+		(void)LED_PWM_TIMER->EVENTS_COMPARE[_cc];
+		const uint32_t _pm = 1u << track_leds[_k].pin;
+		NRF_GPIO_Type *const _pt = track_leds[_k].port;
+		if (g_led_dim || g_led_trk_lvl[_k] < 255u) {
+			_pt->OUTCLR = _pm;
 		} else {
-			NRF_P0->OUTCLR = g_led_p0_ghost & ~g_led_p0_on;
-			NRF_P1->OUTCLR = g_led_p1_ghost & ~g_led_p1_on;
+			const uint32_t _gh = (_pt == NRF_P0) ? (g_led_p0_ghost & ~g_led_p0_on)
+			                                     : (g_led_p1_ghost & ~g_led_p1_on);
+			if (_gh & _pm) _pt->OUTCLR = _pm;
 		}
 	}
 	if (LED_PWM_TIMER->EVENTS_COMPARE[2]) {         /* status-row on-time up */
@@ -10271,10 +10333,18 @@ static void led_pwm_init(void)
 	LED_PWM_TIMER->CC[0]     = LED_PWM_ON_US;        /* -> OFF phase */
 	LED_PWM_TIMER->CC[1]     = LED_PWM_PERIOD_US;    /* -> wrap + ON phase */
 	LED_PWM_TIMER->CC[2]     = LED_STATUS_ON_US;     /* -> status-row OFF */
+	/* STACKA-664 A6: track LEDs 1..3 get their own OFF compare (LED 0 keeps CC[0]),
+	 * so a page can light each lane at its own depth. At rest they equal CC[0]. */
+	LED_PWM_TIMER->CC[3]     = LED_PWM_ON_US;
+	LED_PWM_TIMER->CC[4]     = LED_PWM_ON_US;
+	LED_PWM_TIMER->CC[5]     = LED_PWM_ON_US;
 	LED_PWM_TIMER->SHORTS    = TIMER_SHORTS_COMPARE1_CLEAR_Msk;
 	LED_PWM_TIMER->INTENSET  = TIMER_INTENSET_COMPARE0_Msk |
 				   TIMER_INTENSET_COMPARE1_Msk |
-				   TIMER_INTENSET_COMPARE2_Msk;
+				   TIMER_INTENSET_COMPARE2_Msk |
+				   TIMER_INTENSET_COMPARE3_Msk |
+				   TIMER_INTENSET_COMPARE4_Msk |
+				   TIMER_INTENSET_COMPARE5_Msk;
 	for (int li = 0; li < NUM_LEDS; li++) {
 		if (leds[li].port == NRF_P0) g_led_sta_p0 |= (1u << leds[li].pin);
 		else                         g_led_sta_p1 |= (1u << leds[li].pin);
@@ -10319,6 +10389,28 @@ static void status_level(uint32_t b)
 	if (cc < 1u) cc = 1u;
 	if (cc > LED_PWM_PERIOD_US - 1u) cc = LED_PWM_PERIOD_US - 1u;
 	LED_PWM_TIMER->CC[2] = cc;
+}
+
+/* STACKA-664 A6: a track LED's page LEVEL, 0..255 of the row's window (dim: the
+ * 52 us window; full: the whole period). status_level()'s law -- SQUARED for
+ * perceived brightness, clamped to >= 1 us so a lit pin never goes fully dark.
+ * 255 = the row's normal behaviour. The ISR reads g_led_trk_lvl to decide
+ * whether a full-mode pin may go dark at its compare. */
+static void track_level(int i, uint32_t b)
+{
+	if (b > 255u) b = 255u;
+	const uint32_t win = g_led_dim ? LED_PWM_ON_US : (LED_PWM_PERIOD_US - 1u);
+	uint32_t cc = (win * b * b) / (255u * 255u);
+	if (cc < 1u) cc = 1u;
+	if (cc > LED_PWM_PERIOD_US - 1u) cc = LED_PWM_PERIOD_US - 1u;
+	g_led_trk_lvl[i] = (uint8_t)b;
+	LED_PWM_TIMER->CC[(i == 0) ? 0 : (2 + i)] = cc;
+}
+/* the page views set levels; this hands the row back once no page is showing */
+static void track_level_rest(void)
+{
+	for (int i = 0; i < 4; i++)
+		if (g_led_trk_lvl[i] != 255u) track_level(i, 255u);
 }
 
 static void led_ghost(int i)
@@ -10592,6 +10684,39 @@ static void track_led_ghost(int i)
 	                                    g_led_p1_on &= ~(1u << track_leds[i].pin); }
 }
 static void track_all_off(void)  { for (int i = 0; i < NUM_TRACK_LEDS; i++) track_led_off(i); }
+/* STACKA-664 A6: a page lane's LED -- dark at 0, else lit at a brightness that
+ * follows the amount with a 25 % floor (a barely-engaged effect is still
+ * visibly ON). Bipolar lanes pass their distance from centre. */
+static uint32_t bipolar_depth(uint32_t v)
+{
+	if (v >= 120u && v <= 136u) return 0u;
+	return (v > 128u) ? (v - 128u) * 2u : (128u - v) * 2u;
+}
+/* STACKA-664 (marc): a track-button CYCLE answers with quick FLASHES that count the
+ * new index (1 = the first type, 4 = OFF), then the LED goes back to showing the
+ * lane's depth. ~80 ms on / ~80 ms off at the 8 ms LED tick; only the page views
+ * read it, so it costs nothing anywhere else. */
+static uint8_t g_led_fl_n[4], g_led_fl_t[4];   /* flashes left; ticks into the current phase */
+#define LED_FL_TICKS 10u
+static void led_flash_lane(int i, uint32_t count)
+{
+	if (i < 0 || i > 3) return;
+	g_led_fl_n[i] = (uint8_t)(count * 2u);   /* on + off per flash */
+	g_led_fl_t[i] = 0u;
+}
+static void page_led_depth(int i, uint32_t amt)
+{
+	if (g_led_fl_n[i]) {   /* the count overlay owns the LED until it is done */
+		const int _on = (g_led_fl_n[i] & 1u) == 0u;   /* even = on phase first */
+		if (_on) { track_led_on(i); track_level(i, 255u); } else { track_led_off(i); }
+		if (++g_led_fl_t[i] >= LED_FL_TICKS) { g_led_fl_t[i] = 0u; g_led_fl_n[i]--; }
+		return;
+	}
+	if (amt > 255u) amt = 255u;
+	if (amt == 0u) { track_led_off(i); track_level(i, 255u); return; }
+	track_led_on(i);
+	track_level(i, 64u + (amt * 191u) / 255u);
+}
 
 /* Clear BOTH LED rows. Used on power-off so nothing is left lit when SYSTEM_OFF
  * freezes the GPIO levels (the old power_off cleared only the status row, which
@@ -10631,6 +10756,8 @@ static void led_service(void)
 	for (int i = 0; i < NTRK; i++)
 		if (trk[i].state != TS_EMPTY) active = 1;
 
+	if (!(g_pg_open && g_pg_id >= 1u && g_pg_id <= 4u) || g_pg_sweep || g_pg_exit)
+		track_level_rest();   /* STACKA-664 A6: only the four FX pages set levels */
 	if (g_pg_sweep) {
 		show_page_sweep();   /* LED-549 r9: the activation sweep owns the
 		                      * track row until it lands on the page's own
@@ -10639,53 +10766,28 @@ static void led_service(void)
 		show_page_exit();    /* LED-549 r11: and hands it back on close */
 	} else if (g_pg_open && g_pg_id == 2u) {
 		/* LAYOUT-562: PAGE 2 VIEW -- bitcrush / ring mod / auto-wah / [echo]. */
-		uint8_t _b = (g_bcr_amt > 0u) ? 1u : 0u;
-		uint8_t _r = (g_rng_amt > 0u) ? 1u : 0u;
-		uint8_t _a = (g_awh_amt > 0u) ? 1u : 0u;
-		uint8_t _t = (g_ec_mix > 0u) ? 1u : 0u;   /* ECHO-572 */
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
-			uint8_t _on = (i == 0) ? _b : (i == 1) ? _r
-			            : (i == 2) ? _a : _t;
-			if (_on) track_led_on(i); else track_led_off(i);
-		}
+		const uint32_t _lv[4] = { g_bcr_amt, g_rng_amt, g_awh_amt, (g_ec_div >= 3u) ? 0u : (uint32_t)g_ec_mix };   /* A6: depth; OFF dark */
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
 	} else if (g_pg_open && g_pg_id == 1u) {
 		/* FXP-547: THE FX PAGE VIEW -- one LED per effect, lit when
 		 * that effect is ENGAGED (away from neutral). Filter only
 		 * this rung; T2-T4 stay dark until their kernels land. */
-		uint8_t _fon = (g_flt_pos < 112u || g_flt_pos > 143u) ? 1u : 0u;
-		uint8_t _don = (g_dst_amt > 0u) ? 1u : 0u;   /* DST-548 */
-		uint8_t _con = (g_chr_mix > 0u) ? 1u : 0u;   /* FX2-550 */
-		/* r21: LED 4 tracks whether the gate is actually DOING anything,
-		 * which is the fader up AND a pattern selected -- not just the
-		 * fader up. A lit LED for a bypassed effect is a lie. */
-		uint8_t _gon = (g_gat_amt > 0u && g_gat_pat < 2u) ? 1u : 0u;
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
-			uint8_t _on = (i == 0) ? _fon : (i == 1) ? _con
-			            : (i == 2) ? _don : _gon;   /* FX2-550: all four */
-			if (_on) track_led_on(i); else track_led_off(i);
-		}
+		/* A6: depth. The filter is bipolar with the 112..143 bypass band; the gate
+		 * (r21) is dark unless a pattern is selected -- a lit LED for a bypassed
+		 * effect is a lie. */
+		const uint32_t _fl = (g_flt_pos < 112u) ? (uint32_t)(128u - g_flt_pos) * 2u
+		                   : (g_flt_pos > 143u) ? (uint32_t)(g_flt_pos - 128u) * 2u : 0u;
+		const uint32_t _lv[4] = { _fl, g_chr_mix, (g_dst_typ >= 3u) ? 0u : (uint32_t)g_dst_amt, (g_gat_pat < 2u) ? (uint32_t)g_gat_amt : 0u };
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
 	} else if (g_pg_open && g_pg_id == 3u) {
 		/* LAYOUT-562: PAGE 3 VIEW -- phaser / sweep / tremolo / [empty]. */
-		uint8_t _p = (g_phs_amt > 0u) ? 1u : 0u;
-		uint8_t _s = (g_swp_amt > 0u) ? 1u : 0u;
-		uint8_t _m = (g_trm_amt > 0u) ? 1u : 0u;
-		uint8_t _e = 0u;   /* LAYOUT-562: fader 4 EMPTY for now */
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
-			uint8_t _on = (i == 0) ? _p : (i == 1) ? _s
-			            : (i == 2) ? _m : _e;
-			if (_on) track_led_on(i); else track_led_off(i);
-		}
+		const uint32_t _lv[4] = { (g_lfo_div[0] >= 3u) ? 0u : (uint32_t)g_phs_amt, (g_lfo_div[1] >= 3u) ? 0u : (uint32_t)g_swp_amt, (g_lfo_div[2] >= 3u) ? 0u : (uint32_t)g_trm_amt, 0u };   /* A6: depth; OFF dark; fader 4 EMPTY (LAYOUT-562) */
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
 	} else if (g_pg_open && g_pg_id == 4u) {
 		/* TAPE-569: PAGE 4 VIEW -- drive / tone / hiss / wobble. */
-		uint8_t _q1 = (g_tp_drive > 0u)   ? 1u : 0u;
-		uint8_t _q2 = (g_tp_tone != 128u) ? 1u : 0u;
-		uint8_t _q3 = (g_tp_hiss > 0u)    ? 1u : 0u;
-		uint8_t _q4 = (g_tp_wob > 0u)     ? 1u : 0u;
-		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
-			uint8_t _on = (i == 0) ? _q1 : (i == 1) ? _q2
-			            : (i == 2) ? _q3 : _q4;
-			if (_on) track_led_on(i); else track_led_off(i);
-		}
+		/* A6: depth; tone (A1) is bipolar with a 120..136 deadband; the hiss is 655's */
+		const uint32_t _lv[4] = { g_tp_drive, bipolar_depth(g_tp_tone), g_tp_hiss, g_tp_wob };
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, _lv[i]);
 	} else if (g_pg_open && g_pg_id >= 5u && g_pg_id <= 7u) {
 		/* PG8-560: pages 4-7 are RESERVED (tape / EQ / place / take+timing)
 		 * and are not built yet. A reserved page shows a DARK row and
@@ -11084,7 +11186,7 @@ static void power_off(void)
 	 * looper_audio_block. So: the build script measures the mixer's
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
-	__asm__ volatile(".rept 12\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 4\n\tnop\n\t.endr");
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -11171,6 +11273,48 @@ static void enter_dfu(void)
 	__DSB();
 	NVIC_SystemReset();
 	for (;;) { }
+}
+
+/* STACKA-664 A4: FN + track TAP with a page open = tap THAT lane's rate. Lanes:
+ * page 1 T4 gate (0) / page 2 T4 echo (1) / page 3 T1 T2 T3 phaser sweep tremolo
+ * (2 3 4) / page 1 T2 chorus (5). The song tap-tempo's own rules: 200..1500 ms between taps or the run
+ * restarts, two taps give a period, more average it. The period is stored in
+ * engine frames (48 kHz); the first tap of a run is the gate's downbeat. */
+static void lane_tap(uint32_t page, int btn, int64_t t_ms, uint64_t t_s)
+{
+	static int64_t  lt_last = 0, lt_first = 0;
+	static uint64_t lt_first_s = 0;
+	static int      lt_lane = -1, lt_n = 0;
+	int lane = -1;
+	if      (page == 1u && btn == 3) lane = 0;
+	else if (page == 1u && btn == 1) lane = 5;   /* 660: chorus */
+	else if (page == 2u && btn == 3) lane = 1;
+	else if (page == 3u && btn >= 0 && btn <= 2) lane = 2 + btn;
+	if (lane < 0) return;
+	if (lane != lt_lane || lt_n == 0 || t_ms - lt_last > 1500 || t_ms - lt_last < 200) {
+		lt_lane = lane; lt_n = 0; lt_first = t_ms; lt_first_s = t_s;
+	}
+	lt_last = t_ms; lt_n++;
+	if (lt_n >= 2) {
+		int64_t per_ms = (lt_last - lt_first) / (lt_n - 1);
+		if (per_ms < 100) per_ms = 100;
+		if (per_ms > 4000) per_ms = 4000;
+		g_lane_per[lane] = (uint32_t)(per_ms * 48);
+		if (lane == 0) g_lane_anc = lt_first_s;
+	}
+}
+
+/* STACKA-664 (marc 09-05 late): with a page open, FN + PLAY + track = that lane's tapped
+ * rate back to the grid -- the modifier layer's shape (FN + PLAY + VOL- is the chop
+ * reset). The same lane map as lane_tap. */
+static void lane_reset(uint32_t page, int btn)
+{
+	int lane = -1;
+	if      (page == 1u && btn == 3) lane = 0;
+	else if (page == 1u && btn == 1) lane = 5;
+	else if (page == 2u && btn == 3) lane = 1;
+	else if (page == 3u && btn >= 0 && btn <= 2) lane = 2 + btn;
+	if (lane >= 0) g_lane_per[lane] = 0u;
 }
 
 /* Jump to song slot ns (M4b: FUNCTION+Track bank jump, and the tap-advance).
@@ -11552,6 +11696,7 @@ int main(void)
 	int bj_cnt = 0;                  /*   consecutive passes the candidate has held     */
 	int bj_fired = -1;               /*   band already jumped during this FUNCTION press */
 	int64_t pg_t0 = 0;               /* PG-533: when the pending FN+track press began */
+	uint64_t pg_t0_s = 0;   /* STACKA-664 A4 */
 	int pg_pend = -1;                /* PG-533: pressed track -- jump-on-release or page-on-dwell */
 	int64_t fnp_edge = -1;           /* FUNCTION+PLAY dim toggle: last PLAY press edge */
 	int fnp_chain = 0;               /* M13: consecutive PLAY taps (2 = 1.0x snap, 3 = heads) */
@@ -11839,7 +11984,8 @@ int main(void)
 							fnr_trk = rch;
 							fnr_held = 1; combo_fired = 1; fnp_pend_snap = 0;
 							pg_pend = -1; bj_cand = TRK_NONE; bj_cnt = 0;   /* no song switch, no page */
-							if (fnr_pre == 3) { fnr_mode = 2; rev_toggle(rch); }   /* the track landed first */
+							if (g_pg_open)    { fnr_mode = 3; lane_reset((uint32_t)g_pg_id, rch); }   /* STACKA-664: the lane's tempo back to the grid; nothing on release */
+							else if (fnr_pre == 3) { fnr_mode = 2; rev_toggle(rch); }   /* the track landed first */
 							else              { fnr_mode = 1; iso_engage(rch); }  /* PLAY did (or both at once) */
 						}
 					} else if (fnr_cnt >= 2 && ++fnr_off < 2) {
@@ -12017,6 +12163,7 @@ int main(void)
 						 * press is ALWAYS the jump-on-release / page-
 						 * dwell candidate, page open or not. */
 						pg_t0 = k_uptime_get();
+						pg_t0_s = g_sample_clock;   /* A4: the tap's downbeat in the sample clock */
 						pg_pend = (int)tb;
 					}
 					if (pg_pend >= (int)TRK_1 && pg_pend <= (int)TRK_4 &&
@@ -12069,6 +12216,12 @@ int main(void)
 					continue;                /* track held: combo owns the button */
 				}
 				if (pg_pend >= 0) {
+					if (g_pg_open) {
+						/* STACKA-664 A4 (D4): inside a page the track buttons serve the
+						 * page -- FN + track TAP taps that lane's rate. No song switch
+						 * inside a page (marc 09-05). The tap's time is its PRESS. */
+						lane_tap((uint32_t)g_pg_id, pg_pend - (int)TRK_1, pg_t0, pg_t0_s);
+					} else {
 					/* PG-533: the press ended before the dwell -- fire the
 					 * M8a bank jump ON RELEASE, semantics unchanged. */
 					uint32_t bank = (uint32_t)pg_pend * 4u;
@@ -12076,6 +12229,7 @@ int main(void)
 						jump_to_slot(bank + ((g_slot % 4u) + 1u) % 4u);
 					else
 						jump_to_slot(bank);
+					}
 					bj_fired = pg_pend;
 					pg_pend = -1;
 				}
@@ -12572,14 +12726,25 @@ int main(void)
 						/* M8c BEATMATCH: if this song already has
 						 * loops, the tap run means "match THIS" —
 						 * capture their native tempo first. */
+						/* TAPFIX-663: the loops' native tempo AT 1x. The grid follower
+						 * keeps ref_nf * ref_spd = the loops' beat in TAPE samples
+						 * (W301), so that product is the reference whatever the tape
+						 * is doing now; a saved wall tempo is normalised by the speed
+						 * it plays at; an ungridded song's beat is tape-domain already.
+						 * (The old read took the WALL tempo of the last setting -- the
+						 * previous tap's -- so tap 5 retuned to ~1x and undid tap 4.) */
 						uint32_t native_q8 = 0;
 						if (g_loop_len > 0u) {
-							if (g_grid_bpm_q8[g_slot])
-								native_q8 = g_grid_bpm_q8[g_slot];
-							else if (g_beat_samples)
+							if (g_grid_active && g_grid_ref_nf && g_grid_ref_spd) {
+								uint64_t _tb = (uint64_t)g_grid_ref_nf * g_grid_ref_spd;   /* tape samples per beat, Q16 */
+								native_q8 = (uint32_t)((48000ULL * 60u * 256u * 65536u) / _tb);
+							} else if (g_grid_bpm_q8[g_slot] && g_play_speed_q16) {
+								native_q8 = (uint32_t)(((uint64_t)g_grid_bpm_q8[g_slot] << 16) / g_play_speed_q16);
+							} else if (g_beat_samples) {
 								native_q8 = (uint32_t)
 									((48000ULL * 60u * 256u) /
 									 g_beat_samples);
+							}
 						}
 						g_grid_bpm_q8[g_slot] = (uint16_t)bpmq8;
 						g_grid_beat_frames = nf;   /* F9: exact */
@@ -12603,12 +12768,16 @@ int main(void)
 							uint64_t sp = ((uint64_t)bpmq8 << 16) /
 								      native_q8;
 							if (sp < 16384u) sp = 16384u;          /* RANGE-655: 0.25x */
-							else if (sp > 131072u) sp = 131072u;   /* RANGE-655: 2.0x */
+							else if (sp > 98304u) sp = 98304u;     /* CAP-665: 1.5x */
+							/* TAPFIX-663 (marc): the loops are NOT restarted by a tap run any
+							 * more -- they keep playing and the tape glides to the tapped tempo
+							 * (M8c's bar-line restart on the tapped '1' read as the loop
+							 * 'repeating from the beginning before it finishes'). The grid's
+							 * downbeat is still the first tap; the loops keep their own phase. */
 							g_play_speed_q16 = (uint32_t)sp;
 							g_play_bpm = (int)((sp * 80u + 32768u) >> 16);
 							if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
 							if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
-							g_grid_resync_at = g_grid_next_bar;
 						}
 					}
 				}
@@ -13098,7 +13267,7 @@ int main(void)
 						if (ti == 2) g_awh_amt = 0u;
 						/* ECHO-572: T4 cycles the delay division, exactly as the
 						 * trance gate's T4 cycles its pattern. One page, one rule. */
-						if (ti == 3) g_ec_div = (uint8_t)((g_ec_div + 1u) % 3u);
+						if (ti == 3) { g_ec_div = (uint8_t)((g_ec_div + 1u) % 4u); g_lane_per[1] = 0u; led_flash_lane(ti, (g_ec_div < 3u) ? (uint32_t)g_ec_div + 1u : 0u); }   /* A4 (660): 1/16 -> dotted -> 1/8 -> OFF; 661/664: count the division, not OFF */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
 					} else if (g_pg_open && g_pg_id == 1u && g_rec_track < 0 &&
@@ -13107,11 +13276,12 @@ int main(void)
 						 * effect to neutral -- a kill switch you can hit
 						 * blind mid-performance. Only the filter exists
 						 * this rung; the others land with their kernels. */
-						if (ti == 0) g_flt_pos = 128u;   /* bypass */
+						if (ti == 0) g_flt_pos = 128u;   /* bypass -- the fast kill (marc 09-05) */
 						if (ti == 1) g_chr_mix = 0u;     /* FX2-550: dry   */
-						if (ti == 2) g_dst_amt = 0u;     /* DST-548: clean */
+						if (ti == 2) { g_dst_typ = (uint8_t)((g_dst_typ + 1u) % 4u); led_flash_lane(ti, (g_dst_typ < 3u) ? (uint32_t)g_dst_typ + 1u : 0u); }   /* A5 (660): soft -> hard -> fold -> OFF; 661/664: count the type, not OFF */
 						if (ti == 3) {                   /* TG-551: next pattern */
 							g_gat_pat = (uint8_t)((g_gat_pat + 1u) % 3u);
+							led_flash_lane(ti, (g_gat_pat < 2u) ? (uint32_t)g_gat_pat + 1u : 0u);   /* 661/664: count the pattern; OFF just goes dark */
 							g_gat_g = 4096;   /* Q12 unity. The old 256 here was a
 							                   * Q8 constant in a Q12 gain and cut
 							                   * the output by 24 dB on every tap. */
@@ -13120,10 +13290,9 @@ int main(void)
 						tap_deadline[ti] = 0;
 					} else if (g_pg_open && g_pg_id == 3u && g_rec_track < 0 &&
 					    !armed_press[ti]) {
-						/* PG8-560: page 3 tap = kill that effect. */
-						if (ti == 0) g_phs_amt = 0u;
-						if (ti == 1) g_swp_amt = 0u;
-						if (ti == 2) g_trm_amt = 0u;
+						/* A5: page 3 tap = the lane's DIVISION (beat -> half -> quarter) and
+						 * it clears a tapped rate; the fader to the bottom is the kill. */
+						if (ti < 3) { g_lfo_div[ti] = (uint8_t)((g_lfo_div[ti] + 1u) % 4u); g_lane_per[2 + ti] = 0u; led_flash_lane(ti, (g_lfo_div[ti] < 3u) ? (uint32_t)g_lfo_div[ti] + 1u : 0u); }   /* 660: beat -> half -> quarter -> OFF; 661/664: count the division, not OFF */
 						/* LAYOUT-562: track 4 empty -- no-op */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
