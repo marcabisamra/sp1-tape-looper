@@ -1105,6 +1105,7 @@ static uint32_t          g_grid_tick_idx;       /* M22-A: ticks since the base *
  * samples (their product) never changes. The service keeps
  * g_grid_beat_frames = ref_nf * ref_spd / speed as the tape speed moves. */
 static uint32_t          g_grid_ref_nf, g_grid_ref_spd, g_grid_nf_shadow, g_grid_saved_nf;
+static volatile uint32_t g_grid_lock_n;   /* GRIDLOCK-720: blocks that nudged the anchor onto the loop */
 static volatile uint32_t g_grid_follow_n;   /* diag: rescales since boot */
 /* M22b-r2 INSTRUMENTATION (diagnostic only): every quantity the -62 ms bench
  * anomaly could implicate, captured at the moments they are decided. */
@@ -9897,6 +9898,14 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 	 * RUNS and the speed is inside the tape's range -- a pause ramps
 	 * g_cur_speed_q16 to 0 and 625 followed it to a 38-million-frame beat.
 	 * Stopped, the grid is the decks' clock at the setting, as in 616. */
+	if (!g_playing && g_loop_active && g_cur_speed_q16 == 0u) {
+		/* GRIDLOCK-720: the tape is stopped -- the grid stops with it. The anchor
+		 * rides the clock one block a block, so the beat phase the loops paused
+		 * on is the one they resume on. */
+		g_grid_anchor += BLK_FRAMES;
+		g_grid_anchor_e = grid_anchor_eff();
+		return;
+	}
 	const uint32_t s = (g_playing && g_loop_active && g_cur_speed_q16 >= 12288u)   /* RANGE-655: below the 0.25x floor */
 	                 ? g_cur_speed_q16 : g_play_speed_q16;
 	if (!s || !g_grid_ref_spd) return;
@@ -9917,6 +9926,30 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 		/* MIDI ticks: keep the next one where it is, space the rest at the new beat */
 		g_grid_tick_base = g_grid_next_tick; g_grid_tick_base_sync = g_grid_next_tick; g_grid_tick_idx = 0u;
 		g_grid_follow_n++;
+	}
+	/* GRIDLOCK-720: THE PHASE LOCK. At steady speed, with a gridded loop playing and
+	 * nothing recording, the loop's own position is the truth: consume_pos mod the
+	 * take's beat (stored samples) -> wall frames at this speed; the grid's within-
+	 * beat phase is pulled onto it, <= 2 frames a block, dead band 2, and only when
+	 * they agree to within a quarter beat (a deliberate mismatch is not a drift). */
+	if (g_playing && g_loop_active && g_rec_track < 0 && !g_grid_resync_at &&
+	    g_cur_speed_q16 == g_play_speed_q16 && g_gridrec_beat_samps && g_loop_len &&
+	    (g_loop_len % g_gridrec_beat_samps) == 0u &&
+	    g_slot < NUM_SLOTS && g_grid_off_q8[g_slot] == 0) {   /* a page-7 offset is a deliberate shift: the lock stands down */
+		const uint32_t bf = g_grid_beat_frames;
+		const uint64_t f_loop = ((uint64_t)(g_consume_pos % g_gridrec_beat_samps) * 65536u) / s;
+		const uint64_t f_grid = (g_sample_clock - g_grid_anchor) % bf;
+		int64_t err = (int64_t)f_grid - (int64_t)f_loop;   /* + = the grid is ahead */
+		if (err > (int64_t)(bf / 2u)) err -= (int64_t)bf;
+		else if (err < -(int64_t)(bf / 2u)) err += (int64_t)bf;
+		if (err >= 2 || err <= -2) {
+			if (err <= (int64_t)(bf / 4u) && err >= -(int64_t)(bf / 4u)) {
+				const int64_t step = (err > 2) ? 2 : (err < -2) ? -2 : err;
+				g_grid_anchor = (uint64_t)((int64_t)g_grid_anchor + step);
+				g_grid_anchor_e = grid_anchor_eff();
+				g_grid_lock_n++;
+			}
+		}
 	}
 	/* settled at a new speed: the song's saved tempo follows, so a reload lands here */
 	if (g_cur_speed_q16 == g_play_speed_q16 && g_grid_beat_frames != g_grid_saved_nf && g_slot < NUM_SLOTS) {
@@ -10502,8 +10535,8 @@ static void controls_diag(void)
 		       (unsigned)(((uint32_t)g_ec_mix * 166u) >> 8), (unsigned)g_ec2_w,   /* ECHO2-610: fb q8 + line index */
 		       (unsigned)g_pg_route[1], (unsigned)g_pg_route[2], (unsigned)g_pg_route[3], (unsigned)g_pg_route[4],
 		       (unsigned)g_mon_mute, (unsigned)g_in_blk, (unsigned)g_inw_blk);   /* INFX-672 */
-		printk("GF,n=%u,nf=%u,ref=%u,%u\n",   /* GRIDSPD-622: rescales, beat frames now, reference nf/speed */
-		       (unsigned)g_grid_follow_n, (unsigned)g_grid_beat_frames, (unsigned)g_grid_ref_nf, (unsigned)g_grid_ref_spd);
+		printk("GF,n=%u,nf=%u,ref=%u,%u,lock=%u\n",   /* GRIDSPD-622: rescales, beat frames now, reference nf/speed; GRIDLOCK-720: lock nudges */
+		       (unsigned)g_grid_follow_n, (unsigned)g_grid_beat_frames, (unsigned)g_grid_ref_nf, (unsigned)g_grid_ref_spd, (unsigned)g_grid_lock_n);
 		printk("BK,p=%u,s=%u,l=%u,c=%u,b=%u,n=%u\n",   /* BAKE-619/TRUE-621: prints baked, last speed q16, last len (baked blocks), capped, blocks this print, loop chosen at the stop */
 		       (unsigned)g_bk_prints, (unsigned)g_bk_last_spd, (unsigned)g_bk_last_len,
 		       (unsigned)g_bk_capped, (unsigned)g_bk_blocks, (unsigned)g_bk_len);
@@ -13445,17 +13478,17 @@ int main(void)
 							}
 						}
 						g_grid_bpm_q8[g_slot] = (uint16_t)bpmq8;
-						g_grid_beat_frames = nf;   /* F9: exact */
+						/* GRIDLOCK-720: g_grid_beat_frames is published LAST (below), after the
+						 * retune and after the follower's reference pair -- the follower adopts
+						 * (nf, g_play_speed_q16) the moment nf changes, and a stale speed there
+						 * was a grid off by the retune ratio (row 127). */
 						g_dbg_tap_bs = nf;         /* r2 diag */
-						g_dbg_gbf0   = g_grid_beat_frames;   /* r6 */
+						g_dbg_gbf0   = nf;         /* r6 */
 						g_grid_fresh = 1;   /* M20 F1: taps = truth */
-						g_grid_anchor = tap_first_s; g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
+						g_grid_anchor = tap_first_s;
 						g_grid_next_tick = g_sample_clock;
 						g_grid_active = 1;
 						g_grid_save_req = 1;
-						{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
-			  g_grid_next_bar = g_grid_anchor_e +
-				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
 						if (native_q8) {
 							/* retune the tape so the loops play at
 							 * the tapped tempo (vinyl rules: pitch
@@ -13477,6 +13510,14 @@ int main(void)
 							if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
 							if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
 						}
+						/* GRIDLOCK-720: the reference pair, speed first, then the beat goes live. */
+						g_grid_ref_spd = g_play_speed_q16;
+						g_grid_ref_nf = nf; g_grid_nf_shadow = nf; g_grid_saved_nf = nf;
+						g_grid_beat_frames = nf;   /* F9: exact */
+						g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
+						{ uint64_t _bar = (uint64_t)nf * 4u;
+			  g_grid_next_bar = g_grid_anchor_e +
+				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
 					}
 				}
 			}
