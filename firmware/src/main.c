@@ -678,7 +678,7 @@ static void fill_block(int16_t *s)
  * between the host's 48000 Hz send rate and the SP-1's 48000 Hz I2S rate; the
  * explicit-feedback regulator keeps it centred (see feedback_update). */
 #define USB_FRAME_BYTES   4u                 /* 2 ch * 16-bit */
-#define USB_RING_FRAMES   2048u              /* RD-474: was 4096 (~85 ms). This ring buffers the
+#define USB_RING_FRAMES   1024u              /* USBRING-746: was 2048 (RD-474), 4096 before that. This ring buffers the
                                               * host's UAC2 stream, i.e. the RECORD SOURCE.
                                               * The old note warned the 2048 trim "was never
                                               * validated and rode along in every failed build".
@@ -692,11 +692,17 @@ static void fill_block(int16_t *s)
                                               * setpoint and was unreachable when regulated.
                                               * FALSIFIERS: uo>0, ufl climbing, U3B ringhi
                                               * near 2048, or input glitching by ear. Any of
-                                              * those and this goes back to 4096. */
+                                              * those and this goes back to 4096.
+                                              * USBRING-746 (STACK R R2a): 1024 frames, setpoint 512 --
+                                              * still centred, 512 frames of slack each way against
+                                              * the +238 worst excursion ever measured (RD-474), and
+                                              * uo=0 uu=0 on every corner since. The 4,096 B fund the
+                                              * reverb's own line (RVLINE-746). FALSIFIERS: uu>0, uo>0
+                                              * or zp>0 at the corner with USB in -> back to 2048. */
 /* Target ring fill (frames, ~21 ms). Used both as the prebuffer target before
  * the consumer starts draining a freshly-enabled stream, and as the feedback
  * regulator's setpoint, so the hand-off from prebuffering to draining is smooth. */
-#define FB_SETPOINT       1024
+#define FB_SETPOINT       512   /* USBRING-746: half the 1024 ring (was 1024 of 2048) */
 RING_BUF_DECLARE(usb_audio_ring, USB_RING_FRAMES * USB_FRAME_BYTES);
 
 static volatile bool g_usb_streaming;        /* host has enabled the UAC2 terminal */
@@ -1975,10 +1981,16 @@ static volatile uint8_t  g_pg_route[9];              /* per page (1..4 used): RT
 static int16_t           g_live_blk[BLK_FRAMES * 2u]; /* the jack, this block (was the mixer's tmp[]) */
 static volatile uint32_t g_live_got;                  /* frames of it that are real (the rest read as 0) */
 static volatile uint8_t  g_in_on;                     /* the input slot has work (controls thread) */
-static volatile uint8_t  g_mon_mute;                  /* pages mode: the live monitor out of the mix */
+static volatile uint8_t  g_mon_mute;                  /* MUTEANY-738: the live monitor out of the mix, anywhere (session-only) */
 static int32_t           g_mon_g_s = 256;             /* the mute's ramped gain, Q8 */
 static volatile uint8_t  g_rt_flash;                  /* status-row flashes pending (routing feedback) */
 static uint32_t          g_rt_tick;
+static volatile uint8_t  g_mt_flash;                  /* MUTEANY-738 / MUTEFIX-739: the mute's sweep pending (1 = on: down, 2 = off: up) */
+static uint8_t           g_mt_tog, g_mt_rel, g_mt_tap, g_mt_rst, g_mt_sp, g_mt_last;   /* MTDIAG-742: the PLAY-release trap */
+static uint8_t           g_mt_cmb;                    /* MUTEFIX4-743: chord-release mute events */
+static uint16_t          g_mt_tr;                     /* MUTEFIX4-743: the last track-ladder reading while the VOL pair was held (the sag, measured) */
+static uint8_t           g_vol_pair;                  /* MUTEFIX3-741: the VOL pair was consumed under PLAY and has not been released (mirrors _rt_swallow for the track-ladder code) */
+static uint32_t          g_mt_tick;
 #define INW_N 768u                                    /* delay line, frames: > WOB_BASE_SAMP + peaks (672) */
 static int16_t           g_inw_line[INW_N * 2u];      /* 3,072 B: the monitor's wobble */
 static uint32_t          g_inw_w;
@@ -3073,7 +3085,7 @@ static uint32_t g_fxs_aus[FXS_N];   /* WOBCLAMP-681 FXA: worst looper_audio_bloc
 static uint32_t g_fxs_over[FXS_N];  /* POPS-700 FXO: blocks over the 5,333 us period per class (output clicks) */
 static volatile uint32_t g_rv_clip; /* POPS-700: the reverb's line-store clamp engaged (a clip inside the loop) */
 /* POPTRAP-728 (W335): the output discontinuity trap. See pop_trap(). */
-#define POP_TH 12000
+#define POP_TH 6000   /* TRAPLOW-744: was 12000 -- the 18:06 crack sat under it; the 4x isolation rule keeps content out of c= */
 static volatile uint32_t g_pop_n;          /* blocks with a jump >= POP_TH (raw steps: content OR clicks) */
 static volatile uint32_t g_pop_c;          /* POPTRAP2-734: blocks with an ISOLATED step (a click) */
 static uint32_t g_pop_dp2, g_pop_prev_dpp;  /* POPTRAP2-734: the last two frames' packed diffs carry across the block edge */
@@ -3202,7 +3214,7 @@ static inline int32_t tp_pink(int32_t *k0, int32_t *k1, int32_t *k2)
 static volatile uint8_t  g_ec_mix;   /* 0 = dry, and the kernel is skipped */
 static volatile uint8_t  g_ec_div;   /* 0 = 1/16, 1 = dotted-1/16, 2 = 1/8 */
 static volatile uint32_t g_ec_dly;   /* the COMPUTED delay, engine frames */
-#define EC2_LINE 4608u               /* 12 kHz mono samples = 384 ms; 9,216 B */
+#define EC2_LINE 4544u               /* ECHOTRIM-746: was 4608 (384 ms); 378.7 ms still holds the 1/8 at 80 BPM (375 ms); 9,088 B */
 static int16_t  g_ec2_line[EC2_LINE];
 static uint32_t g_ec2_w;             /* line write index, 0..EC2_LINE-1 */
 static uint8_t  g_ec2_live;          /* the line holds CURRENT audio (cleared on engage) */
@@ -3516,7 +3528,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 6\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -3822,22 +3834,23 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
  * gate clock, the echo taps, and the 14 effect-major passes (EFXM-586,
  * bit-identical by harness). Pure code motion from the mixer. */
 static void __attribute__((noinline)) wob_tick_block(void);                                 /* WOBBUS-673 */
-/* ===== REVERB-676 (E1): the Clouds reverb, 12 kHz, IN THE SAME LINE (echo or reverb) =====
+/* ===== REVERB-676 (E1): the Clouds reverb, 12 kHz -- RVLINE-746: IN ITS OWN LINE (echo AND reverb) =====
  * Ten sub-lines end to end: 4 input diffusers, then per loop damping + 2 allpasses + a
  * delay. Lengths are Clouds' at 32 kHz scaled to 12 kHz and then x0.57 to fit 4,608. */
 #define RV_N 10u
 static const uint16_t g_rv_len[RV_N]  = { 28u, 41u, 60u, 100u, 414u, 510u, 855u, 480u, 418u, 1182u };   /* RV2-680: sum 4088 <= 4096 */
 static const uint16_t g_rv_base[RV_N] = { 0u, 28u, 69u, 129u, 229u, 643u, 1153u, 2008u, 2488u, 2906u };
 #define RV_MASK 4095u                 /* RV2-680: one window of the line, one pointer (Clouds' FxEngine) */
+static int16_t  g_rv_line[RV_MASK + 1u];   /* RVLINE-746: the reverb's OWN line (8,192 B) -- echo and reverb run together now */
 static uint32_t g_rv_w;              /* the shared write pointer, decrements per step */
 static int32_t  g_rv_lp1, g_rv_lp2;  /* the two loops' damping states */
 static int32_t  g_rv_pl, g_rv_pr;    /* last group's wet L/R (the interpolation's start) */
 static uint8_t  g_rv_live;           /* the line holds the REVERB (cleared on engage) */
-static inline __attribute__((always_inline)) int32_t rv_rd(uint32_t k) { return g_ec2_line[(g_rv_w + g_rv_base[k] + g_rv_len[k] - 1u) & RV_MASK]; }
+static inline __attribute__((always_inline)) int32_t rv_rd(uint32_t k) { return g_rv_line[(g_rv_w + g_rv_base[k] + g_rv_len[k] - 1u) & RV_MASK]; }   /* RVLINE-746 */
 static inline __attribute__((always_inline)) void rv_wr(uint32_t k, int32_t v)
 {
 	if (v > 32767 || v < -32768) g_rv_clip++;   /* POPS-700: count the clamp -- a clip inside the loop recirculates */
-	g_ec2_line[(g_rv_w + g_rv_base[k]) & RV_MASK] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));   /* RV2-680: clamp, not the knee (the input diffusers only, since 729) */
+	g_rv_line[(g_rv_w + g_rv_base[k]) & RV_MASK] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));   /* RV2-680: clamp, not the knee (the input diffusers only, since 729) */
 }
 /* RVKNEE-729 (W327 mechanism 3, confirmed by the pop trap 09-08 20:34): the LOOP
  * stores take the knee. A hard clamp inside a 0.98 feedback loop pins the loop at
@@ -3847,7 +3860,7 @@ static inline __attribute__((always_inline)) void rv_wr(uint32_t k, int32_t v)
 static inline __attribute__((always_inline)) void rv_wrk(uint32_t k, int32_t v)
 {
 	if (v > 32767 || v < -32768) g_rv_clip++;   /* still counted: the pressure is the diagnostic */
-	g_ec2_line[(g_rv_w + g_rv_base[k]) & RV_MASK] = soft_limit(v);
+	g_rv_line[(g_rv_w + g_rv_base[k]) & RV_MASK] = soft_limit(v);
 }
 /* one 12 kHz step of the Clouds network: in = the mono sum, krt = loop feedback q8 */
 static inline __attribute__((always_inline)) void rv_step(int32_t in, int32_t krt, int32_t klp, int32_t *oL, int32_t *oR)
@@ -3967,7 +3980,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			}
 			ec2_d = (_ed + 2u) >> 2;       /* engine frames -> line samples */
 			/* NO TEMPO MAY SILENCE THE EFFECT (572): shorten to the line
-			 * rather than drop out. 384 ms holds every division to 80 BPM. */
+			 * rather than drop out. 378.7 ms (ECHOTRIM-746) holds every division to 80 BPM. */
 			if (ec2_d < 1u) ec2_d = 1u;
 			if (ec2_d > EC2_LINE - 1u) ec2_d = EC2_LINE - 1u;
 			g_ec_dly = ec2_d << 2;         /* publish what was ACTUALLY used, engine frames */
@@ -3980,16 +3993,15 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 				/* engage edge: an old tail must never play back */
 				memset(g_ec2_line, 0, sizeof(g_ec2_line));
 				g_ec2_w = 0u;
-				g_ec2_live = 1u;
-				g_rv_live = 0u;   /* REVERB-676: the line is the echo's now */
+				g_ec2_live = 1u;   /* RVLINE-746: the reverb keeps its own line */
 			}
 			ec_n = 1;
 		} else if (rp2) {
 			g_ec2_live = 0u;   /* INFX-672: only the pass that owns the echo may disengage it */
 		}
-		/* REVERB-676 per-block constants: the echo (page 2 fader 4, not OFF) owns the line in
-		 * WHICHEVER pass it runs, so the gate reads the global, not this pass's ec_mix. */
-		const int32_t rv_mix = (!rp3 || (g_ec_mix != 0u && g_ec_div < 3u)) ? 0 : (int32_t)g_rv_mix;
+		/* REVERB-676 per-block constants -- RVLINE-746: the reverb has its own line, so the echo no
+		 * longer gates it; echo (page 2) into reverb (page 3), in series, whenever both are up. */
+		const int32_t rv_mix = !rp3 ? 0 : (int32_t)g_rv_mix;
 		int rv_n = 0;
 		int32_t rv_krt = 0, rv_wet = 0;
 		const int32_t rv_klp = (g_sec[2][3] < 32u) ? 32 : (g_sec[2][3] > 250u) ? 250 : (int32_t)g_sec[2][3];   /* SEC-695: damping (default 179 = 0.7) */
@@ -4012,11 +4024,10 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			rv_krt = 128 + ((rv_mix * 122) >> 8);   /* 0.5 (a room) .. 0.98 (a hall that barely dies) */
 			rv_wet = rv_mix >> 1;                    /* wet tops out at -6 dB, like the echo */
 			if (!g_rv_live) {
-				memset(g_ec2_line, 0, sizeof(g_ec2_line));
+				memset(g_rv_line, 0, sizeof(g_rv_line));   /* RVLINE-746: its own line */
 				g_rv_w = 0u;   /* RV2-680 */
 				g_rv_lp1 = 0; g_rv_lp2 = 0; g_rv_pl = 0; g_rv_pr = 0;
 				g_rv_live = 1u;
-				g_ec2_live = 0u;   /* the echo must clear when it comes back */
 			}
 			rv_n = 1;
 		} else if (rp3) {
@@ -4820,7 +4831,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 	/* monitor mute (pages mode): a gain on the live pair only, ramped over
 	 * ~4 blocks so the toggle never clicks; the recorder never sees it */
 	{
-		const int32_t tg = (g_mon_mute && g_pg_open) ? 0 : 256;
+		const int32_t tg = g_mon_mute ? 0 : 256;   /* MUTEANY-738: anywhere */
 		int32_t g = g_mon_g_s;
 		if (g != tg || g != 256) {
 			const int32_t g0 = g;
@@ -6681,9 +6692,10 @@ static uint8_t g_xfer_dirty[NUM_SLOTS][NTRK];
  * mid-session would persist exactly the corruption this repairs. Runs from the
  * streamer while g_xfer_mode is still set (audio is silenced), so the
  * bus-blocking flush has nothing live to starve. */
+static int16_t p14s_scr[994];   /* RAMR1A-738: forward (tentative) -- defined with the decoders below */
 static void xfer_commit(void)
 {
-	static uint8_t mblk[X3_NBLK * EMMC_BLOCK_SIZE] __aligned(4);   /* X3RELOAD-677: 3 blocks (was META_BLOCKS) */
+	uint8_t *const mblk = (uint8_t *)p14s_scr;   /* RAMR1A-738: the streamer's decode scratch (1,988 B >= 3 blocks), idle while g_xfer_mode holds the loop -- was a private 1,536 B static */
 	if (g_emmc_ready && emmc_read_blocks(META_BLOCK, mblk, META_BLOCKS)) {
 		struct meta_blk *m = (struct meta_blk *)mblk;
 		if (m->magic == META_MAGIC && m->cur_slot < NUM_SLOTS) {
@@ -6719,7 +6731,7 @@ static void xfer_commit(void)
 					else   /* M7-r4: freshly uploaded audio is audible */
 						g_meta.song_mode[s] &= (uint8_t)~(uint8_t)(0x10u << t);
 			if (memcmp(mblk, &g_meta, sizeof(g_meta)) != 0) {
-				memset(mblk, 0, sizeof(mblk));
+				memset(mblk, 0, X3_NBLK * EMMC_BLOCK_SIZE);
 				memcpy(mblk, &g_meta, sizeof(g_meta));
 				(void)meta_write_blocks(mblk);
 			}
@@ -10709,6 +10721,8 @@ static void controls_diag(void)
 
 		printk("BTN,lat=%u,max=%u\n",
 		       (unsigned)g_stop_lat_ms, (unsigned)g_stop_lat_max);
+		printk("MT,b=743,mute=%u,tog=%u,rel=%u,tap=%u,rst=%u,sp=%u,last=%u,play=%u,cmb=%u,tr=%u\n",   /* MTDIAG-742 / MUTEFIX4-743: the PLAY-release trap (last = spent|pair<<1|held<<2), the chord-release mutes, the sagged PLAY reading */
+		       (unsigned)g_mon_mute, (unsigned)g_mt_tog, (unsigned)g_mt_rel, (unsigned)g_mt_tap, (unsigned)g_mt_rst, (unsigned)g_mt_sp, (unsigned)g_mt_last, (unsigned)g_playing, (unsigned)g_mt_cmb, (unsigned)g_mt_tr);
 
 
 		printk("W4P,pk=%u,pb=%u,sq=%u,tq=%u\n",
@@ -11401,7 +11415,7 @@ static void show_page_number(void)
 		 * opening a page starts bright and breathes out, then in. ~3.5 s
 		 * period; the floor keeps it clearly lit at its dimmest. */
 		{
-			if (g_mon_mute) {   /* INFX-672: MUTED -- the number BLINKS (~2 Hz) instead of breathing */
+			if (g_mon_mute) {   /* INFX-672 / MUTEANY-738: MUTED -- inside a page the number BLINKS (~2 Hz) instead of breathing */
 				status_level((((uint32_t)g_pg_cnt / 31u) & 1u) ? 255u : 40u);
 				g_pg_cnt++;
 			} else {
@@ -11557,6 +11571,13 @@ static void led_service(void)
 		if (++g_rt_tick >= 16u) { g_rt_tick = 0u; g_rt_flash--; }
 		status_level(255u);
 		for (int i = 0; i < NUM_LEDS; i++) { if (_on) led_on(i); else led_clear(i); }
+	} else if (g_mt_flash) {   /* MUTEFIX-739: the mute's word is a SWEEP, one LED at a time (never the row dark):
+		                            * on (1) = down 4-3-2-1, off (2) = up 1-2-3-4, ~100 ms a step */
+		uint32_t _st = g_mt_tick / 12u;             /* 0..3 */
+		int _lit = (g_mt_flash == 1u) ? (int)(NUM_LEDS - 1u - _st) : (int)_st;
+		if (++g_mt_tick >= 12u * NUM_LEDS) { g_mt_tick = 0u; g_mt_flash = 0u; }
+		status_level(255u);
+		for (int i = 0; i < NUM_LEDS; i++) { if (i == _lit) led_on(i); else led_clear(i); }
 	} else
 	if (g_pg_open)            show_page_number();   /* LED-549 r11; LEDS-725: at once, FN held or not (a page walked with FN + VOL showed its number only on the release) */
 	else if (g_fn_held)       show_song_leds();
@@ -12912,7 +12933,7 @@ int main(void)
 							}
 							g_chop_req = 1;
 							g_dip_req = 1;
-						} else if (g_rec_track < 0) {   /* the octave; tempo locked mid-take */
+						} else if (g_rec_track < 0 && (fvb == VOL_TEMPO_UP || fvb == VOL_TEMPO_DOWN)) {   /* the octave (the ROCKER only -- MUTEFIX-739: VOL_BOTH fell in here as an octave down); tempo locked mid-take */
 							int b = g_play_bpm, nb = b;
 							if (fvb == VOL_TEMPO_UP) {
 								nb = (fv_oct_from && b == fv_oct_from / 2) ? fv_oct_from : b * 2;
@@ -13146,12 +13167,9 @@ int main(void)
 					if (vb == cp_cand) { if (cp_cnt < 1000) cp_cnt++; }
 					else { cp_cand = vb; cp_cnt = 1; }
 					if (vb == VOL_BOTH) {
-						/* INFX-672: FN + both VOL = MONITOR MUTE, pages mode only
-						 * (D6); outside a page the pair is swallowed. */
-						if (cp_cnt == 3) {
-							combo_seen = 1;
-							if (g_pg_open) g_mon_mute = (uint8_t)!g_mon_mute;
-						}
+						/* MUTEANY-738: FN + both VOL is swallowed (the mute moved to
+						 * PLAY + both VOL); combo_seen so the press is not a power-off. */
+						if (cp_cnt == 3) combo_seen = 1;
 					} else if (g_pg_open && (vb == VOL_UP || vb == VOL_DOWN)) {
 						if (cp_cnt == 3) {   /* PF-549 r12: WALK THE PAGE LIST */
 							uint32_t _n = (uint32_t)g_pg_id;
@@ -13798,6 +13816,15 @@ int main(void)
 			 * 1823) held ~1.2 s -> reset into the bootloader for reflashing. Checked
 			 * BEFORE the normal decode so the combo isn't mistaken for a Track-4 press. */
 			int trk_raw = ladder_read(&adc_ladder[LAD_TRACKS]);
+			{	/* MUTEFIX4-743 (W341): with BOTH VOL buttons down the shared rail sags and PLAY
+				 * (~1807) reads inside the ALL4 chord band (1713-1773); the chord's release then
+				 * muted every track. While the VOL ladder reads the pair, anything from the 3+4
+				 * band up to PLAY's floor IS PLAY (a real track chord under both VOL is no gesture). */
+				if (ladder_read(&adc_ladder[LAD_VOL]) >= 1910) {
+					if (trk_raw >= 1509) g_mt_tr = (uint16_t)trk_raw;
+					if (trk_raw >= 1509 && trk_raw < 1840) trk_raw = 1823;
+				}
+			}
 			static int64_t combo14_t = -1;     /* when the 1+4 band was first seen */
 			enum trk_btn raw;
 			/* This DFU check runs BEFORE ctl_flush is consumed below, so clear
@@ -13947,6 +13974,7 @@ int main(void)
 						}
 					}
 					if (g_slot < NUM_SLOTS) g_meta_save_req = 1;  /* mutes persist */
+					g_mt_cmb++;   /* MUTEFIX4-743 */
 					combo_held = 0;
 					suppress_play = 1;
 				}
@@ -14068,7 +14096,7 @@ int main(void)
 				ep_since = tnow;
 				if (committed != TRK_NONE) {
 					ep_open = 1;
-					if (before == TRK_NONE) ep_play_spent = 0;   /* BNC-597: a fresh episode */
+					if (before == TRK_NONE) ep_play_spent = g_vol_pair;   /* BNC-597: a fresh episode -- MUTEFIX3-741: unless the VOL pair is still held (a rail flicker must not un-spend PLAY) */
 					for (int k = TRK_1; k < (int)committed; k++)
 						ep_time[k] = 0;  /* below = up-sweep transit */
 					/* M44-r2 ARM MIGRATION: with instant empty arms, an
@@ -14372,13 +14400,14 @@ int main(void)
 					 * the instant the hold-restart fired (a hold is not a
 					 * tap). Ignored while a take is in progress: stopping
 					 * would freeze the recording mid-take. */
-					if (ep_play_spent) {
-						/* BNC-597: PLAY was the bounce modifier -- spent */
+					g_mt_rel++; g_mt_last = (uint8_t)((ep_play_spent ? 1u : 0u) | (g_vol_pair ? 2u : 0u) | (ep_play_held ? 4u : 0u));   /* MTDIAG-742 */
+					if (ep_play_spent || g_vol_pair) {   /* MUTEFIX3-741: a PLAY released with the pair held is the chord's release, never a tap */
+						g_mt_sp++;   /* BNC-597: PLAY was the bounce modifier -- spent */
 					} else if (ep_play_held) {
 						/* BNC-570 B1a: the hold DISPATCHES here now. */
-						g_restart_req = 1;
+						g_restart_req = 1; g_mt_rst++;
 					} else if (g_rec_track < 0) {
-						g_playing = !g_playing;
+						g_playing = !g_playing; g_mt_tap++;
 						if (g_playing) g_midi_start_pending = 1;
 						else           g_midi_stop_pending  = 1;
 					}
@@ -14848,25 +14877,45 @@ int main(void)
 			 * master volume is suppressed while PLAY is down. */
 			int _rt_hold = 0;
 			static int64_t _rt_last_t;   /* INFX-672: the previous VOL press under PLAY (double-click = BOTH) */
+			static enum vol_btn _rt_pend = VOL_NONE;   /* MUTEANY-738: a single VOL press waiting out the grace window */
+			static int64_t _rt_pend_t;
+			static uint8_t _rt_swallow;               /* MUTEANY-738: after the pair, singles are the release -- ignored until VOL_NONE */
 			if (committed == TRK_PLAY) {   /* anywhere -- the routing is GLOBAL */
 				_rt_hold = 1;
-				if (vcommit != vbefore && (vcommit == VOL_DOWN || vcommit == VOL_UP)) {
-					int64_t _tn = k_uptime_get();
-					uint8_t nr = (_rt_last_t != 0 && _tn - _rt_last_t <= 350) ? RT_BOTH
-					           : (vcommit == VOL_DOWN) ? RT_IN : RT_TRK;
-					_rt_last_t = (nr == RT_BOTH) ? 0 : _tn;   /* a double-click closes the pair */
-					for (int _p = 1; _p <= 4; _p++) g_pg_route[_p] = nr;   /* all four pages */
+				int64_t _tn = k_uptime_get();
+				if (vcommit == VOL_NONE) _rt_swallow = 0;
+				if (vcommit == VOL_BOTH) {
+					/* MUTEANY-738: PLAY + both VOL = the monitor mute, anywhere. The pending
+					 * single (the first thumb) is forgotten; the singles on the way out are
+					 * swallowed. One toggle per pair (the sticky commit edges once). */
+					if (!_rt_swallow) {   /* MUTEFIX2-740: by STATE, not by edge -- the pair may have landed before PLAY */
+						g_mon_mute = (uint8_t)!g_mon_mute; g_mt_tog++;   /* MTDIAG-742 */
+						g_mt_flash = g_mon_mute ? 1u : 2u;
+						g_mt_tick  = 0u;
+						ep_play_spent = 1;
+					}
+					_rt_pend = VOL_NONE; _rt_swallow = 1; _rt_last_t = 0;
+				} else if (!_rt_swallow && vcommit != vbefore && (vcommit == VOL_DOWN || vcommit == VOL_UP)) {
+					_rt_pend = vcommit; _rt_pend_t = _tn;   /* MUTEANY-738: wait for the other thumb */
 					ep_play_spent = 1;
-					g_rt_flash = (nr == RT_IN) ? 1u : (nr == RT_TRK) ? 2u : 3u;
-					g_rt_tick  = 0u;
 				}
-			} else {
-				_rt_last_t = 0;   /* PLAY lifted: the next press starts fresh */
 			}
-			if (!g_pg_open) g_mon_mute = 0u;   /* INFX-672: the mute lives in pages mode only */
+			if (_rt_pend != VOL_NONE && (committed != TRK_PLAY || k_uptime_get() - _rt_pend_t >= 100)) {
+				/* the window closed without the pair (or PLAY lifted): the route fires as before */
+				uint8_t nr = (_rt_last_t != 0 && _rt_pend_t - _rt_last_t <= 350) ? RT_BOTH
+				           : (_rt_pend == VOL_DOWN) ? RT_IN : RT_TRK;
+				_rt_last_t = (nr == RT_BOTH) ? 0 : _rt_pend_t;   /* a double-click closes the pair */
+				for (int _p = 1; _p <= 4; _p++) g_pg_route[_p] = nr;   /* all four pages */
+				g_rt_flash = (nr == RT_IN) ? 1u : (nr == RT_TRK) ? 2u : 3u;
+				g_rt_tick  = 0u;
+				_rt_pend = VOL_NONE;
+			}
+			if (committed != TRK_PLAY) _rt_last_t = 0;   /* PLAY lifted: the next press starts fresh (MUTEFIX2-740: the swallow clears on VOL_NONE only) */
+			if (vcommit == VOL_NONE) _rt_swallow = 0;
+			g_vol_pair = _rt_swallow;   /* MUTEFIX3-741 */
 			{
 				static int64_t vrep_t = -1, vrep_last;
-				int vdir = _rt_hold ? 0 : (vcommit == VOL_UP) ? 1 : (vcommit == VOL_DOWN) ? -1 : 0;
+				int vdir = (_rt_hold || _rt_swallow) ? 0 : (vcommit == VOL_UP) ? 1 : (vcommit == VOL_DOWN) ? -1 : 0;   /* MUTEFIX2-740: a pair's release is not a volume press */
 				int vstep = 0;
 				if (vdir != 0) {
 					int64_t tnow = k_uptime_get();
