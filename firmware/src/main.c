@@ -1989,6 +1989,10 @@ static volatile uint8_t  g_mt_flash;                  /* MUTEANY-738 / MUTEFIX-7
 static uint8_t           g_mt_tog, g_mt_rel, g_mt_tap, g_mt_rst, g_mt_sp, g_mt_last;   /* MTDIAG-742: the PLAY-release trap */
 static uint8_t           g_mt_cmb;                    /* MUTEFIX4-743: chord-release mute events */
 static uint16_t          g_mt_tr;                     /* MUTEFIX4-743: the last track-ladder reading while the VOL pair was held (the sag, measured) */
+static uint8_t           g_br_on, g_br_n, g_br_free0, g_br_m0[2];   /* BEATREP-749: the beat repeat is live; engages; the saved free-window flag; the saved chop bytes */
+static uint32_t          g_br_div0, g_br_off0;         /* BEATREP-749: the chop pair to restore at the release */
+static volatile uint8_t  g_br_live;                   /* BRWIN-754: the streamer maps through g_br_w/g_br_b */
+static volatile uint32_t g_br_w[NTRK], g_br_b[NTRK];   /* BRWIN-754: per track, in its own blocks: the window and its storage base (w = 0: not repeated) */
 static uint8_t           g_vol_pair;                  /* MUTEFIX3-741: the VOL pair was consumed under PLAY and has not been released (mirrors _rt_swallow for the track-ladder code) */
 static uint32_t          g_mt_tick;
 #define INW_N 768u                                    /* delay line, frames: > WOB_BASE_SAMP + peaks (672) */
@@ -3528,7 +3532,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 6\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 4\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -9408,6 +9412,11 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 						    (bool)g_win_rev;
 					if (hrev) c = (cyc - 1u) - c;
 					uint32_t loop_blk = (c / win) * wper + wbase + (c % win);
+					if (g_br_live && !hrev && !head_active(i) && g_br_w[i]) {   /* BRWIN-754: the beat repeat's window, per track, storage-relative, wrapping */
+						win = g_br_w[i]; cyc = win; wper = gb; wbase = g_br_b[i];
+						c = pwb % win;
+						loop_blk = (wbase + c) % gb;
+					}
 					uint32_t n = budget;
 					if (n > (RING_SAMPLES / _spb) - 1u) n = (RING_SAMPLES / _spb) - 1u;
 					/* VARIABLE TOP-UP: fill to ~full (keep a 1-block
@@ -9431,6 +9440,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 								n = loop_blk - wstart + 1u;
 						}
 					}
+					if (g_br_live && !hrev && !head_active(i) && g_br_w[i] && n > win - c) n = win - c;   /* BRWIN-754: the run ends at the window's edge, wrap-safe */
 					/* SILENCE PAD: the loop length can exceed the recorded
 					 * content (fixed mode). [content, gb) was never written
 					 * to flash — read it as synthesised zeros instead of
@@ -10721,8 +10731,8 @@ static void controls_diag(void)
 
 		printk("BTN,lat=%u,max=%u\n",
 		       (unsigned)g_stop_lat_ms, (unsigned)g_stop_lat_max);
-		printk("MT,b=743,mute=%u,tog=%u,rel=%u,tap=%u,rst=%u,sp=%u,last=%u,play=%u,cmb=%u,tr=%u\n",   /* MTDIAG-742 / MUTEFIX4-743: the PLAY-release trap (last = spent|pair<<1|held<<2), the chord-release mutes, the sagged PLAY reading */
-		       (unsigned)g_mon_mute, (unsigned)g_mt_tog, (unsigned)g_mt_rel, (unsigned)g_mt_tap, (unsigned)g_mt_rst, (unsigned)g_mt_sp, (unsigned)g_mt_last, (unsigned)g_playing, (unsigned)g_mt_cmb, (unsigned)g_mt_tr);
+		printk("MT,b=758,mute=%u,tog=%u,rel=%u,tap=%u,rst=%u,sp=%u,last=%u,play=%u,cmb=%u,tr=%u,br=%u,brd=%u\n",   /* MTDIAG-742 / MUTEFIX4-743 / BEATREP-749: the PLAY-release trap, the chord-release mutes, the sagged PLAY reading, the repeat's engages + live div */
+		       (unsigned)g_mon_mute, (unsigned)g_mt_tog, (unsigned)g_mt_rel, (unsigned)g_mt_tap, (unsigned)g_mt_rst, (unsigned)g_mt_sp, (unsigned)g_mt_last, (unsigned)g_playing, (unsigned)g_mt_cmb, (unsigned)g_mt_tr, (unsigned)g_br_n, (unsigned)(g_br_on ? g_chop_div : 0u));
 
 
 		printk("W4P,pk=%u,pb=%u,sq=%u,tq=%u\n",
@@ -11019,6 +11029,60 @@ static enum trk_btn decode_tracks(int v)
 	if (v <  950) return TRK_3;     /* ~733  */
 	if (v < 1500) return TRK_4;     /* ~1220 */
 	return TRK_PLAY;                /* ~1823 */
+}
+
+/* BEATREP-749: the beat repeat = the chop window pointed at one beat. Controls thread only. */
+/* BRWIN-754: the per-track geometry of a window `div` of the loop, ONE back from the playhead. */
+static void __attribute__((noinline)) br_geom(uint32_t div)
+{
+	g_br_live = 0;
+	for (int i = 0; i < NTRK; i++) {
+		struct looptrk *t = &trk[i];
+		g_br_w[i] = 0u;
+		if (t->state != TS_PLAY || head_active(i) || !t->len_blocks || !div) continue;
+		const uint32_t spb = TSPB(t), gb = t->len_blocks;
+		uint32_t w = gb / div; if (w < 1u) w = 1u;
+		const uint32_t pwbc = g_consume_pos / spb, phi = pwbc % w;
+		int64_t b = ((int64_t)pwbc - (int64_t)phi - (int64_t)w - (int64_t)(t->start_blk % gb)) % (int64_t)gb;
+		if (b < 0) b += (int64_t)gb;
+		g_br_b[i] = (uint32_t)b; g_br_w[i] = w;
+	}
+	g_br_live = 1;
+}
+static void __attribute__((noinline)) br_click(int down)   /* BRDIR-757: `down` = SHRINK = the rocker UP (the chop's convention) */
+{
+	if (!g_br_on) {
+		if (!g_playing || (g_rec_track >= 0 && !g_bnc_on) || !g_loop_active || !g_loop_len) return;   /* BRBNC-758: a repeat may start during a bounce (not during a plain take) */
+		uint32_t n = (g_slot < NUM_SLOTS) ? (uint32_t)g_grid_n[g_slot] : 0u;
+		if (n == 0u || n > CHOP_DIV_MAX / 2u) n = 8u;   /* ungridded: eighths of the loop */
+		g_br_div0 = g_chop_div; g_br_off0 = g_chop_off; g_br_free0 = g_win_free;
+		if (g_slot < NUM_SLOTS) { g_br_m0[0] = g_meta.chop[g_slot][0]; g_br_m0[1] = g_meta.chop[g_slot][1]; }
+		if (!down && n > 1u && (n & 1u) == 0u) n /= 2u;   /* BRBEAT-755 / BRDIR-757: UP first = ONE beat; DOWN first = TWO beats */
+		uint32_t k = (uint32_t)(((uint64_t)(g_consume_pos % g_loop_len) * n) / g_loop_len);   /* the window playing now */
+		g_win_free = 0;
+		g_chop_off = (k + n - 1u) % n; g_chop_div = n;   /* BRPREV-753: the window BEFORE the one playing (the LED display; the streamer maps through br_geom) */
+		br_geom(n);   /* BRWIN-754 */
+		g_br_on = 1; g_br_n++;
+	} else {
+		uint32_t d = g_chop_div, o = g_chop_off;
+		if (down) { if (d * 2u <= CHOP_DIV_MAX) { d *= 2u; o *= 2u; } }          /* half the window */
+		else      { if (d > 1u && (d & 1u) == 0u) { d /= 2u; o /= 2u; } }         /* double it */
+		g_chop_off = (d > 1u) ? (o % d) : 0u; g_chop_div = d;
+		br_geom(d);   /* BRWIN-754: a resize re-anchors one (new) window back from now */
+	}
+	g_chop_req = 1; g_dip_req = 1;
+}
+static void __attribute__((noinline)) br_release(void)
+{
+	if (!g_br_on) return;
+	g_br_live = 0;   /* BRWIN-754: the streamer's ordinary mapping is back before the chop request */
+	g_br_on = 0;
+	g_chop_div = g_br_div0; g_chop_off = g_br_off0; g_win_free = g_br_free0;
+	if (g_slot < NUM_SLOTS && (g_meta.chop[g_slot][0] != g_br_m0[0] || g_meta.chop[g_slot][1] != g_br_m0[1])) {
+		g_meta.chop[g_slot][0] = g_br_m0[0]; g_meta.chop[g_slot][1] = g_br_m0[1];   /* an FN edit during the repeat is undone */
+		g_meta_save_req = 1;
+	}
+	g_chop_req = 1; g_dip_req = 1;
 }
 
 static enum vol_btn decode_vol(int v)
@@ -13820,7 +13884,7 @@ int main(void)
 				 * (~1807) reads inside the ALL4 chord band (1713-1773); the chord's release then
 				 * muted every track. While the VOL ladder reads the pair, anything from the 3+4
 				 * band up to PLAY's floor IS PLAY (a real track chord under both VOL is no gesture). */
-				if (ladder_read(&adc_ladder[LAD_VOL]) >= 1910) {
+				if (ladder_read(&adc_ladder[LAD_VOL]) >= 200) {   /* BEATREP-749: ANY VOL-ladder press (was the pair only, >= 1910): the rocker rides the same rail */
 					if (trk_raw >= 1509) g_mt_tr = (uint16_t)trk_raw;
 					if (trk_raw >= 1509 && trk_raw < 1840) trk_raw = 1823;
 				}
@@ -14096,7 +14160,7 @@ int main(void)
 				ep_since = tnow;
 				if (committed != TRK_NONE) {
 					ep_open = 1;
-					if (before == TRK_NONE) ep_play_spent = g_vol_pair;   /* BNC-597: a fresh episode -- MUTEFIX3-741: unless the VOL pair is still held (a rail flicker must not un-spend PLAY) */
+					if (before == TRK_NONE) ep_play_spent = (uint8_t)(g_vol_pair || g_br_on);   /* BNC-597: a fresh episode -- MUTEFIX3-741 / BRSPENT-753: unless the VOL pair is still held or a repeat is live (a rail flicker must not un-spend PLAY) */
 					for (int k = TRK_1; k < (int)committed; k++)
 						ep_time[k] = 0;  /* below = up-sweep transit */
 					/* M44-r2 ARM MIGRATION: with instant empty arms, an
@@ -14401,7 +14465,7 @@ int main(void)
 					 * tap). Ignored while a take is in progress: stopping
 					 * would freeze the recording mid-take. */
 					g_mt_rel++; g_mt_last = (uint8_t)((ep_play_spent ? 1u : 0u) | (g_vol_pair ? 2u : 0u) | (ep_play_held ? 4u : 0u));   /* MTDIAG-742 */
-					if (ep_play_spent || g_vol_pair) {   /* MUTEFIX3-741: a PLAY released with the pair held is the chord's release, never a tap */
+					if (ep_play_spent || g_vol_pair || g_br_on) {   /* MUTEFIX3-741 / BRSPENT-753: a PLAY released with the pair held or a repeat live is the chord's release, never a tap and never the restart */
 						g_mt_sp++;   /* BNC-597: PLAY was the bounce modifier -- spent */
 					} else if (ep_play_held) {
 						/* BNC-570 B1a: the hold DISPATCHES here now. */
@@ -14880,6 +14944,7 @@ int main(void)
 			static enum vol_btn _rt_pend = VOL_NONE;   /* MUTEANY-738: a single VOL press waiting out the grace window */
 			static int64_t _rt_pend_t;
 			static uint8_t _rt_swallow;               /* MUTEANY-738: after the pair, singles are the release -- ignored until VOL_NONE */
+			static int64_t _br_rep_t;                 /* BRHOLD-756: the next auto-step of a held rocker (0 = none) */
 			if (committed == TRK_PLAY) {   /* anywhere -- the routing is GLOBAL */
 				_rt_hold = 1;
 				int64_t _tn = k_uptime_get();
@@ -14898,7 +14963,15 @@ int main(void)
 				} else if (!_rt_swallow && vcommit != vbefore && (vcommit == VOL_DOWN || vcommit == VOL_UP)) {
 					_rt_pend = vcommit; _rt_pend_t = _tn;   /* MUTEANY-738: wait for the other thumb */
 					ep_play_spent = 1;
+				} else if (!_rt_swallow && vcommit != vbefore && (vcommit == VOL_TEMPO_UP || vcommit == VOL_TEMPO_DOWN)) {
+					br_click(vcommit == VOL_TEMPO_UP);   /* BRDIR-757: UP = shorter, DOWN = longer, as FN + rocker */   /* BEATREP-749: PLAY + rocker = the beat repeat (engage / resize) */
+					ep_play_spent = 1;
+					_br_rep_t = _tn + 450;   /* BRHOLD-756: hold the rocker = repeat the step at FN + rocker's cadence */
+				} else if (g_br_on && _br_rep_t && vcommit == vbefore && (vcommit == VOL_TEMPO_UP || vcommit == VOL_TEMPO_DOWN) && _tn >= _br_rep_t) {
+					br_click(vcommit == VOL_TEMPO_UP);   /* BRDIR-757: UP = shorter, DOWN = longer, as FN + rocker */   /* BRHOLD-756: the held rocker keeps halving / doubling, ~375 ms a step */
+					_br_rep_t = _tn + 375;
 				}
+				if (vcommit != VOL_TEMPO_UP && vcommit != VOL_TEMPO_DOWN) _br_rep_t = 0;   /* BRHOLD-756: the rocker lifted */
 			}
 			if (_rt_pend != VOL_NONE && (committed != TRK_PLAY || k_uptime_get() - _rt_pend_t >= 100)) {
 				/* the window closed without the pair (or PLAY lifted): the route fires as before */
@@ -14911,6 +14984,7 @@ int main(void)
 				_rt_pend = VOL_NONE;
 			}
 			if (committed != TRK_PLAY) _rt_last_t = 0;   /* PLAY lifted: the next press starts fresh (MUTEFIX2-740: the swallow clears on VOL_NONE only) */
+			if (g_br_on && (committed != TRK_PLAY || !g_playing || g_slot_switch_req)) br_release();   /* BEATREP-749 / BRBNC-758: PLAY lifted (or the song stopped / a song switch) = release; a recording (a bounce of the stutter) does NOT end it */
 			if (vcommit == VOL_NONE) _rt_swallow = 0;
 			g_vol_pair = _rt_swallow;   /* MUTEFIX3-741 */
 			{
@@ -14948,7 +15022,7 @@ int main(void)
 				static uint32_t dclick_base;    /* the speed BEFORE that click */
 				/* tempo LOCKED while a take is in flight: a mid-take speed
 				 * glide records the warp into the loop (tape-bend artifact) */
-				int dir = (g_rec_track >= 0) ? 0 :
+				int dir = (g_rec_track >= 0 || _rt_hold) ? 0 :   /* BEATREP-749: the rocker under PLAY is the repeat, not the tempo */
 					  (vcommit == VOL_TEMPO_UP) ? 1 :
 					  (vcommit == VOL_TEMPO_DOWN) ? -1 : 0;
 				int step = 0;
