@@ -1038,6 +1038,25 @@ struct grid_ext {
 };
 BUILD_ASSERT(sizeof(struct grid_ext) <= 512, "grid ext must fit one block");
 static volatile uint16_t g_grid_bpm_q8[NUM_SLOTS];
+/* GRIDCORE-733: THE GRID FROM THE CORE. A song with a loop has NO anchor: its beat
+ * is one n-th of the loop and its "1" is the loop sample O, both persisted (block
+ * 2 tail, GRD3). Everything musical is a function of g_consume_pos -- see
+ * grid_follow_tape() (the service, kept under its old name for the gates). The
+ * tapped clock (g_grid_anchor / g_grid_beat_frames as set by the tap) is only the
+ * grid of an EMPTY song; the first take converts it. */
+static volatile uint8_t  g_grid_n[NUM_SLOTS];  /* beats in the master loop; 0 = no tape grid */
+static volatile uint32_t g_grid_o[NUM_SLOTS];  /* the loop sample the bar starts on, < loop_len */
+static uint32_t          g_grid_p_lo;          /* the last g_consume_pos seen (32-bit) ... */
+static uint64_t          g_grid_p64;           /* ... and its 64-bit shadow (no 2^32 wrap) */
+static uint32_t          g_grid_tick_prev;     /* the tape tick index at the last block */
+static uint8_t           g_grid_tick_ok;       /* tick_prev is valid (same regime, no jump) */
+static uint8_t           g_grid_src;           /* 0 none, 1 tape-derived, 2 tapped clock (diag + regime edge) */
+static volatile uint8_t  g_grid_punch_k;       /* beat-in-bar of the scheduled punch line (first take -> O) */
+static volatile uint64_t g_grid_o_req_w;       /* controls thread: "the 1 is at this wall frame" (a tap) */
+static volatile uint8_t  g_grid_o_req;         /* ... pending; the service converts it with coherent (W, P) */
+static volatile uint32_t g_grid_lap_tk;        /* diag: ticks emitted in the last completed lap (must read 24n) */
+static uint32_t          g_grid_lap_acc;       /* ... the running count */
+static void __attribute__((noinline)) grid_adopt_loop(uint32_t beats, uint32_t start_samps, uint32_t k);   /* the first take's stop calls it (defined with the service) */
 static volatile uint64_t g_grid_anchor;       /* sample-clock frame of a downbeat */
 static volatile uint32_t g_grid_beat_frames;  /* I2S frames per grid beat (current song) */
 /* STACKT-716: page 7 TAKE & TIMING, per song. */
@@ -1050,13 +1069,15 @@ static volatile uint32_t g_grid_dirty_ms;           /* last page-7 move (|1); 0 
 static volatile uint64_t g_grid_anchor_e;           /* THE EFFECTIVE ANCHOR every reader uses: raw + the offset */
 static uint64_t grid_anchor_eff(void)
 {
+	/* GRIDCORE-733: the TAPPED clock's effective anchor (an empty song). The readers
+	 * subtract it from g_sample_clock in uint64, so the offset is applied as plain
+	 * modular arithmetic -- no "bar back" trick. A song with a loop never reads this:
+	 * the service publishes g_grid_anchor_e from the tape (its offset is in samples). */
 	const uint64_t a = g_grid_anchor;
 	const uint32_t bf = g_grid_beat_frames;
 	const int32_t q = (g_slot < NUM_SLOTS) ? (int32_t)g_grid_off_q8[g_slot] : 0;
 	if (!q || !bf) return a;
-	const int64_t o = ((int64_t)q * (int64_t)bf) >> 8;
-	const uint64_t back = (o > 0) ? ((uint64_t)bf * 4u - (uint64_t)o) : (uint64_t)(-o);   /* a bar back, then forward */
-	return (a >= back) ? a - back : a;
+	return a + (uint64_t)(((int64_t)q * (int64_t)bf) >> 8);
 }
 #define GRID_EXT2_OFF   256u
 #define GRID_EXT2_MAGIC 0x32445247u   /* 'GRD2' */
@@ -1068,6 +1089,25 @@ struct grid_ext2 {
 	uint16_t sum;                 /* over off_q8 .. nudge */
 };
 BUILD_ASSERT(GRID_EXT2_OFF + sizeof(struct grid_ext2) <= 512, "grid ext2 must fit block 2's tail");
+/* GRIDCORE-733: the tape grid per song -- n beats in the loop, O the "1" (samples). */
+#define GRID_EXT3_OFF   368u
+#define GRID_EXT3_MAGIC 0x33445247u   /* 'GRD3' */
+struct grid_ext3 {
+	uint32_t magic;
+	uint8_t  n[NUM_SLOTS];
+	uint32_t o[NUM_SLOTS];
+	uint16_t sum;                 /* over n .. o */
+};
+BUILD_ASSERT(GRID_EXT2_OFF + sizeof(struct grid_ext2) <= GRID_EXT3_OFF, "grid ext3 must follow ext2");
+BUILD_ASSERT(GRID_EXT3_OFF + sizeof(struct grid_ext3) <= 512, "grid ext3 must fit block 2's tail");
+static uint16_t grid_ext3_sum(const struct grid_ext3 *e)
+{
+	const uint8_t *b = (const uint8_t *)&e->n[0];
+	const size_t nb = (size_t)((const uint8_t *)&e->sum - b);
+	uint16_t sum = 0;
+	for (size_t i = 0; i < nb; i++) sum = (uint16_t)(sum + b[i]);
+	return sum;
+}
 static uint16_t grid_ext2_sum(const struct grid_ext2 *e)
 {
 	const uint8_t *b = (const uint8_t *)&e->off_q8[0];
@@ -1086,6 +1126,13 @@ static void __attribute__((noinline)) grid_ext2_store(uint8_t *blk)
 		for (int k = 0; k < NTRK; k++) e->nudge[i][k] = g_trk_nudge[i][k];
 	}
 	e->sum = grid_ext2_sum(e);
+	{	/* GRIDCORE-733: GRD3 */
+		struct grid_ext3 *e3 = (struct grid_ext3 *)(blk + GRID_EXT3_OFF);
+		memset(e3, 0, sizeof(*e3));
+		e3->magic = GRID_EXT3_MAGIC;
+		for (uint32_t i = 0; i < NUM_SLOTS; i++) { e3->n[i] = g_grid_n[i]; e3->o[i] = g_grid_o[i]; }
+		e3->sum = grid_ext3_sum(e3);
+	}
 }
 static void __attribute__((noinline)) grid_ext2_load(const uint8_t *blk)
 {
@@ -1096,67 +1143,19 @@ static void __attribute__((noinline)) grid_ext2_load(const uint8_t *blk)
 		g_take_preset[i] = (e->preset[i] == 1u || e->preset[i] == 2u || e->preset[i] == 4u || e->preset[i] == 8u) ? e->preset[i] : 0u;
 		for (int k = 0; k < NTRK; k++) g_trk_nudge[i][k] = e->nudge[i][k];
 	}
+	{	/* GRIDCORE-733: GRD3 (an older card: all zero -> migrated at the song load) */
+		const struct grid_ext3 *e3 = (const struct grid_ext3 *)(blk + GRID_EXT3_OFF);
+		if (e3->magic == GRID_EXT3_MAGIC && grid_ext3_sum(e3) == e3->sum)
+			for (uint32_t i = 0; i < NUM_SLOTS; i++) { g_grid_n[i] = e3->n[i]; g_grid_o[i] = e3->o[i]; }
+	}
 }
 static volatile uint64_t g_grid_next_tick;
 static uint64_t          g_grid_tick_base;      /* M22-A: exact tick schedule base */
 static uint64_t          g_grid_tick_base_sync; /* M22-A: last value WE wrote to next_tick */
 static uint32_t          g_grid_tick_idx;       /* M22-A: ticks since the base */
-/* GRIDSPD-622 (W301): the grid's definition -- a beat is g_grid_ref_nf wall
- * frames when the tape runs at g_grid_ref_spd; the loop's beat in tape
- * samples (their product) never changes. The service keeps
- * g_grid_beat_frames = ref_nf * ref_spd / speed as the tape speed moves. */
-static uint32_t          g_grid_ref_nf, g_grid_ref_spd, g_grid_nf_shadow, g_grid_saved_nf;
-static volatile uint32_t g_grid_lock_n;   /* GRIDLOCK-720: blocks that nudged the anchor onto the loop */
-static volatile uint32_t g_grid_follow_n;   /* diag: rescales since boot */
-/* M22b-r2 INSTRUMENTATION (diagnostic only): every quantity the -62 ms bench
- * anomaly could implicate, captured at the moments they are decided. */
-static volatile uint32_t g_dbg_tap_bs;     /* stored beat at tap commit (frames=samples at 1.0x) */
-static volatile uint32_t g_dbg_rf;         /* F8's refined beat (0 = declined) */
-static volatile uint32_t g_dbg_bf;         /* g_grid_beat_frames after the stop */
-static volatile uint32_t g_dbg_lens;       /* len_samps the take got */
-static volatile uint32_t g_dbg_lenb;       /* len_blocks the take got */
-static volatile int32_t  g_dbg_punch_ph;   /* punch phase vs grid, frames (should be ~0) */
-static volatile uint32_t g_dbg_punch_sp;   /* start_samps at punch */
-/* M25-r5: the anchor decision, exactly as it is made. The stored anchor is
- * consume_pos MINUS the pre-roll backfill, and the suspicion is that those two
- * do not leave it on a grid line even when pph says the punch did. Printing
- * all three settles it without another guess: cp = consume_pos at the trigger,
- * bkf = samples reached back, and the anchor's own phase against the beat,
- * which should read the SAME for every take if the anchors are beat-aligned. */
-static volatile uint32_t g_dbg_anc_cp;     /* consume_pos at the trigger */
-static volatile uint32_t g_dbg_anc_bkf;    /* pre_backfill applied */
-static volatile uint32_t g_dbg_anc_mod;    /* start_samps % beat */
-/* M25-r9: the overdub anchors read 264 and 336 samples EARLY against the beat
- * while pph says the punch landed exactly on the line. Both cannot be right —
- * but "early against a grid line" and "early against an origin that was never
- * on one" are indistinguishable in the log without the anchor to measure from.
- * Low 32 bits is plenty: the question is a phase, not an absolute. */
-static volatile uint32_t g_dbg_ganc;       /* g_grid_anchor_e at the punch */
-static volatile uint32_t g_dbg_pat;        /* g_grid_punch_at at the punch */
-/* M25-r6 THE CHAIN. bf ended at 22504 while rf measured 22612 — the loop was
- * built on one beat and the grid ran on another, 0.48% apart, which walks the
- * first take ~290 ms/min away from everything recorded after it. At the punch
- * the two are tied by an identity at 1.0x speed, and refine calls grid_retune,
- * so bf SHOULD come out equal to rf. It does not. These three snapshots bracket
- * the whole path so the step that moves it is visible instead of deduced. */
-static volatile uint32_t g_dbg_gbf0;       /* grid beat at TAP commit */
-static volatile uint32_t g_dbg_grs0;       /* rec beat at the PUNCH */
-static volatile uint32_t g_dbg_gbf1;       /* grid beat AFTER refine's retune */
-static volatile uint32_t g_dbg_speed;      /* speed_q16 at punch */
-/* M22c CONVERGENCE: the tempo TRUTH accrues with observation time. One take
- * of 8 beats bounds F8 at +-10-20 samples/beat (detector jitter over a short
- * span). But every gridded take leaves a fixed landmark — its first onset, at
- * an absolute stored position — and the music runs at ONE tempo through all
- * of them. Two landmarks a minute apart measure the beat to <1 sample. At
- * each gridded stop the drift between the newest landmark and the session's
- * first is folded into a per-beat correction, the grid retunes, and (the door
- * Phase B opened) every gridded track's len_samps rescales with it — the
- * loops CONVERGE onto the source instead of freezing the first estimate. */
-static uint32_t g_cnv_ref;                 /* first landmark, absolute stored samples */
-static uint8_t  g_cnv_set;
-static uint32_t g_cnv_speed;               /* speed the landmark was laid at */
-static volatile int32_t  g_dbg_cnv_beats;  /* diag: baseline length, beats */
-static volatile int32_t  g_dbg_cnv_corr;   /* diag: per-beat correction applied */
+/* GRIDCORE-733: the reference pair, the lock, the rescale counter are gone -- the state sits with g_grid_bpm_q8. */
+/* DIAGDEL-733: the M22b-r2 / M25 / M22c grid instrumentation (18 diag words + the
+ * convergence landmark) is gone -- RAM for GRIDCORE's per-song n and O. */
 /* M43 GRID FREEZE. A grid is a trust contract: loose punches are absorbed
  * by a FIXED clock. Once set — tapped, rounded, or detected — the grid
  * does not move; re-tap to change it. 0 gates the two CONTENT-CHASING
@@ -1281,9 +1280,8 @@ static uint32_t grid_len_blocks(uint32_t nbeats, uint32_t spb)   /* GP-518 */
 /* M8c: performance layer. Mute/unmute WAITS for the bar line on gridded songs
  * (launch quantize); a tap run over EXISTING loops beatmatches (retunes the
  * tape + resyncs the loop start to the tapped downbeat at the next bar). */
-static volatile uint64_t g_grid_next_bar;      /* next bar line, sample-clock domain */
-static volatile uint32_t g_grid_snap_n;        /* LOCKSNAP-729: anchor snaps at a beat derive (GF snap=) */
-static volatile uint64_t g_grid_resync_at;     /* pending loop-restart at this bar (0 = none) */
+/* GRIDCORE-733: the bar line (only the dead beatmatch resync read it), the snap
+ * counter and the resync (never set since TAPFIX-663) are gone. */
 /* PASS 2 forensics (printed + zeroed each diag window): blocks delivered per
  * track, dead-history snaps per track, and round aborts (rec yield / read fail). */
 static volatile uint32_t g_p2blk[4];
@@ -3076,12 +3074,25 @@ static uint32_t g_fxs_over[FXS_N];  /* POPS-700 FXO: blocks over the 5,333 us pe
 static volatile uint32_t g_rv_clip; /* POPS-700: the reverb's line-store clamp engaged (a clip inside the loop) */
 /* POPTRAP-728 (W335): the output discontinuity trap. See pop_trap(). */
 #define POP_TH 12000
-static volatile uint32_t g_pop_n;          /* blocks with a jump >= POP_TH (events) */
+static volatile uint32_t g_pop_n;          /* blocks with a jump >= POP_TH (raw steps: content OR clicks) */
+static volatile uint32_t g_pop_c;          /* POPTRAP2-734: blocks with an ISOLATED step (a click) */
+static uint32_t g_pop_dp2, g_pop_prev_dpp;  /* POPTRAP2-734: the last two frames' packed diffs carry across the block edge */
+#define POP_ISO_SHIFT 2u                   /* a click is >= 4x its neighbours' steps */
 static volatile uint32_t g_pop_blkn;       /* blocks watched */
 static volatile uint8_t  g_pop_pend;       /* a latched event waits for the diag */
-static uint32_t g_pop_ms, g_pop_cus, g_pop_hi, g_pop_got, g_pop_spd;
-static int32_t  g_pop_jmp, g_pop_pk, g_pop_av[NTRK];
-static uint16_t g_pop_at, g_pop_fade[NTRK];
+static uint32_t g_pop_ms, g_pop_cus, g_pop_got, g_pop_spd;   /* POPLOG-730: hi (the EMMC48 line has it) and av/fade (the tags cover them) dropped for the floor */
+static int16_t  g_pop_jmp, g_pop_pk;   /* POPTRAP2-734: int16 (both <= 32767) -- 4 B for the floor */
+static uint16_t g_pop_at;
+/* POPLOG-730 (STACK G): the transition census. See pop_trap(). */
+struct pop_snap { uint32_t cpos, spd, w0, w1, snap; uint16_t vol[NTRK]; };
+static struct pop_snap g_pop_ps[2];               /* [0] = the last block, [1] = the one before */
+struct pop_ev { uint32_t ms, tags; uint16_t jmp; uint8_t at, ch; uint8_t ctl, age; };
+#define POPL_N 4u
+static struct pop_ev g_pop_log[POPL_N];
+static uint8_t  g_pop_logn;                       /* events logged (saturates at POPL_N per print) */
+static volatile uint8_t  g_pop_ctl;               /* last helper stamp: 1 fx_reset 2 rev_toggle 3 iso_engage 4 iso_release */
+static volatile uint32_t g_pop_ctl_ms;
+static inline void pop_stamp(uint8_t code) { g_pop_ctl = code; g_pop_ctl_ms = k_uptime_get_32(); }
 static uint8_t  g_pop_ch, g_pop_stv, g_pop_pl, g_pop_usb;
 static int16_t  g_pop_prev[2];
 static uint32_t g_fxs_prev;
@@ -3281,6 +3292,7 @@ static inline __attribute__((always_inline)) void eq_peak_pair(int32_t *m, int32
  * its parameter straight back up to wherever the fader happens to sit. */
 static void fx_reset_all(void)
 {
+	pop_stamp(1u);   /* POPLOG-730 */
         g_flt_pos = 128u;   /* bypass, not zero -- the filter is bipolar */
         g_chr_mix = 0u;  g_dst_amt = 0u;  g_gat_amt = 0u;
         g_bcr_amt = 0u;  g_rng_amt = 0u;  g_awh_amt = 0u;
@@ -3504,7 +3516,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 2\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -3629,9 +3641,6 @@ static void beat_set(uint32_t nf)
 		g_grid_bpm_q8[g_slot] = (uint16_t)((48000ULL * 60u * 256u) / nf);
 		g_grid_save_req = 1;
 	}
-	{ uint64_t _bar = (uint64_t)nf * 4u;
-	  g_grid_next_bar = g_grid_anchor_e +
-		(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
 }
 
 /* Convert a RECORDING-domain beat to grid domain and hand it to beat_set. The
@@ -5074,7 +5083,6 @@ static void __attribute__((noinline)) pa_armed(int rt_i, int16_t lsamp, uint32_t
 			if (back <= reach && need &&
 			    need <= _pre_val) {
 				pre_backfill = need;
-				g_dbg_anc_bkf = need;   /* r6: ANY take */
 				g_grid_punch_at = prev;
 				trigger = 1;
 			}
@@ -5183,12 +5191,6 @@ static void __attribute__((noinline)) pa_armed(int rt_i, int16_t lsamp, uint32_t
 				rt->start_blk = (sp + TSPB(rt) / 2u)
 				              / TSPB(rt);
 				rt->start_samps = sp;   /* M22-B: exact */
-				g_dbg_anc_cp  = _cpos;
-				g_dbg_anc_bkf = pre_backfill;
-				g_dbg_anc_mod = g_grid_beat_frames
-					      ? (sp % g_grid_beat_frames) : 0u;
-				g_dbg_ganc = (uint32_t)g_grid_anchor;
-				g_dbg_pat  = (uint32_t)g_grid_punch_at;
 				rt->len_samps = 0;
 			}
 		}
@@ -5211,32 +5213,21 @@ static void __attribute__((noinline)) pa_armed(int rt_i, int16_t lsamp, uint32_t
 			rt->r_w = 0; rt->r_r = 0; rt->rec_count = 0;
 		}
 		_pre_val = 0;   /* the ring belongs to the take now */
-		{	/* r2 diag: where did this punch land on
-			 * the grid? (frames past the nearest
-			 * line; ~0 = exact) */
-			uint64_t nowp = g_sample_clock + f;
-			if (g_grid_beat_frames &&
-			    nowp > g_grid_anchor_e) {
-				uint64_t ph = (nowp - g_grid_anchor_e)
-					% g_grid_beat_frames;
-				int32_t sp2 = (ph > g_grid_beat_frames / 2u)
-					? (int32_t)ph - (int32_t)g_grid_beat_frames
-					: (int32_t)ph;
-				g_dbg_punch_ph = pre_backfill
-					? 0 - (int32_t)pre_backfill : sp2;
-			}
-			g_dbg_punch_sp = rt->start_samps;
-			g_dbg_speed = g_cur_speed_q16;
-		}
 		rt->rec_silence = 0;
 		if (g_grid_active && g_grid_beat_frames && g_grid_punch_at) {
 			/* M8b: beat length in STORED samples at
 			 * the punch-in tape speed (recording
 			 * follows the tape). */
-			g_gridrec_beat_samps = (uint32_t)
-				(((uint64_t)g_grid_beat_frames *
-				  g_cur_speed_q16) >> 16);
-			g_dbg_grs0 = g_gridrec_beat_samps;   /* r6 */
+			/* GRIDCORE-733: with a loop the beat IS loop_len / n (exact); only the
+			 * first take of a tapped song derives it from the clock. The punch line's
+			 * beat-in-bar is kept: the first take's stop turns it into the "1". */
+			if (g_loop_len && g_slot < NUM_SLOTS && g_grid_n[g_slot])
+				g_gridrec_beat_samps = (g_loop_len + g_grid_n[g_slot] / 2u) / g_grid_n[g_slot];
+			else
+				g_gridrec_beat_samps = (uint32_t)
+					(((uint64_t)g_grid_beat_frames *
+					  g_cur_speed_q16) >> 16);
+			g_grid_punch_k = (uint8_t)(((g_grid_punch_at - g_grid_anchor_e) / g_grid_beat_frames) & 3u);
 			g_gridrec = 1;
 			if (g_loop_len == 0u && !g_grid_fresh) {
 				/* M8b-r2: your first loop IS the
@@ -5246,9 +5237,7 @@ static void __attribute__((noinline)) pa_armed(int rt_i, int16_t lsamp, uint32_t
 				 * the punch already landed on it) */
 				g_grid_anchor = g_grid_punch_at + (g_grid_anchor - g_grid_anchor_e);   /* STACKT-716: punch_at came from the effective anchor */
 				g_grid_anchor_e = g_grid_punch_at;
-				{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
-  g_grid_next_bar = g_grid_anchor_e +
-(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
+				g_grid_punch_k = 0u;   /* GRIDCORE-733: your take IS the 1 */
 			}
 		} else {
 			g_gridrec = 0;
@@ -5524,7 +5513,6 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 						 * retune the grid to match. */
 						uint32_t rf =
 							tempo_refine(g_gridrec_beat_samps);
-						g_dbg_rf = rf;             /* r2 diag */
 						/* M43: measured, recorded, NOT applied —
 						 * the tapped/snapped grid is the clock. */
 						if (SP1_GRID_FOLLOW && rf) {
@@ -5535,7 +5523,6 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 							 * from the grid. Re-assigning it here is
 							 * exactly what let the two come apart. */
 						}
-						g_dbg_gbf1 = g_grid_beat_frames;   /* r6 */
 					}
 					gbb = (g_gridrec_beat_samps + TSPBI(i) / 2u)
 					      / TSPBI(i);
@@ -5597,10 +5584,13 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 					 * elsewhere; 120 BPM was one of only 12 tempos in
 					 * 60-200 that could not show it). Blocks stay what
 					 * the flash reads; samples are what the loop IS. */
-					if (glen && gbeats && g_gridrec_beat_samps)
+					if (glen && gbeats && g_gridrec_beat_samps) {
 						g_loop_len = gbeats * g_gridrec_beat_samps;
-					else
+						grid_adopt_loop(gbeats, trk[i].start_samps, g_grid_punch_k);   /* GRIDCORE-733 */
+					} else {
 						g_loop_len = base * TSPBI(i);
+						if (g_slot < NUM_SLOTS) { g_grid_n[g_slot] = 0u; g_grid_o[g_slot] = 0u; }   /* GRIDCORE-733: an ungridded loop */
+					}
 					g_loop_blocks = base;
 					if (glen && gbb) {
 						/* the TAPPED grid defines the beat — exact
@@ -5743,108 +5733,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				trk[i].len_samps = (glen && gbeats && g_gridrec_beat_samps)
 						 ? gbeats * g_gridrec_beat_samps
 						 : len * TSPBI(i);
-				g_dbg_lens = trk[i].len_samps;         /* r2 diag */
-				g_dbg_lenb = len;
-				g_dbg_bf   = g_grid_beat_frames;
-				/* M22c CONVERGENCE (gridded takes with an onset only) */
-				if (glen && gbeats && g_gridrec_beat_samps &&
-				    g_tempo.first_onset) {
-					uint32_t abs_k = trk[i].start_samps +
-							 g_tempo.first_onset;
-					if (!g_cnv_set) {
-						g_cnv_ref = abs_k;
-						g_cnv_speed = g_cur_speed_q16;
-						g_cnv_set = 1;
-						g_dbg_cnv_beats = 0; g_dbg_cnv_corr = 0;
-					} else if (g_cur_speed_q16 == g_cnv_speed &&
-						   abs_k > g_cnv_ref) {
-						uint32_t bs2 = g_gridrec_beat_samps;
-						uint32_t el = abs_k - g_cnv_ref;
-						uint32_t nb = (el + bs2 / 2u) / bs2;
-						g_dbg_cnv_beats = (int32_t)nb;
-						g_dbg_cnv_corr = 0;
-						if (nb >= 16u) {
-							int64_t dev = (int64_t)el -
-								(int64_t)nb * bs2;
-							int32_t corr = (int32_t)
-								((dev >= 0 ? dev + (int64_t)nb / 2
-								           : dev - (int64_t)nb / 2)
-								 / (int64_t)nb);
-							if (corr > 16) corr = 16;
-							if (corr < -16) corr = -16;
-							uint32_t nbs = corr
-								? (uint32_t)((int32_t)bs2 + corr)
-								: bs2;
-							/* M43: measured, recorded, NOT applied. */
-							if (SP1_GRID_FOLLOW && nbs != bs2) {
-								grid_retune(bs2, nbs);   /* r7: sole writer */
-								g_det_bpm = (int)(((uint64_t)LOOP_RATE *
-									60u + nbs / 2u) / nbs);
-								/* rescale every gridded loop —
-								 * the lengths are just numbers
-								 * now (Phase B), and they are
-								 * all N x the beat */
-								for (int k2 = 0; k2 < NTRK; k2++) {
-									uint32_t Lk = trk[k2].len_samps;
-									if (!Lk) continue;
-									uint32_t Nk = (Lk + bs2 / 2u) / bs2;
-									if (!Nk) continue;
-									uint32_t Ln = Nk * nbs;
-									/* M25-r8: this used to clamp to
-									 * content_blocks * 256. content is
-									 * the RECORDED AUDIO; len_samps is
-									 * the MUSICAL length, and on a
-									 * gridded take those differ on
-									 * purpose — the stop rounds to the
-									 * nearest beat and pads out to the
-									 * line, so the loop is legitimately
-									 * longer than the audio in it. That
-									 * pad is up to HALF A BEAT, and the
-									 * clamp threw it away in one step
-									 * the first time convergence
-									 * retuned — i.e. at the SECOND
-									 * take's stop, which is exactly
-									 * where marc heard track 1 jump.
-									 * It guarded nothing: the rescale is
-									 * proportional and corr is capped at
-									 * +/-16 per beat, so Ln cannot run
-									 * past the allocation. Sanity-bound
-									 * the CHANGE instead; refuse absurd
-									 * ones rather than truncating. */
-									uint32_t dL = (Ln > Lk) ? (Ln - Lk)
-											        : (Lk - Ln);
-									if (Ln && (uint64_t)dL * 16u <=
-									          (uint64_t)Lk)
-										trk[k2].len_samps = Ln;
-									/* C-r2: the wrap MOVED — the ring
-									 * still holds audio fetched under
-									 * the old length, and playing it
-									 * across the new seam is a hard
-									 * splice (marc heard it). Same
-									 * cure as every chop edit: drop
-									 * the read-ahead, refill under
-									 * the new geometry, boundary-fade
-									 * covers the joint. */
-									if (trk[k2].state == TS_PLAY)
-										trk[k2].p_w =
-											(g_consume_pos / TSPBI(k2))
-											* TSPBI(k2);
-								}
-								g_dip_req = 1;   /* C-r2: declick, like
-								                  * every chop edit */
-								{	/* master follows the base */
-									uint32_t Nb = (g_loop_len + bs2 / 2u) / bs2;
-									if (Nb) g_loop_len = Nb * nbs;
-									if (g_slot < NUM_SLOTS) {
-										g_meta.slot[g_slot].loop_len = g_loop_len;
-										g_meta_save_req = 1;
-									}
-								}
-								g_dbg_cnv_corr = (int32_t)nbs - (int32_t)bs2;
-							}
-						}
-					}
-				}
+				/* DIAGDEL-733: the M22c convergence (dead under SP1_GRID_FOLLOW 0 since M43) and its diag are gone. */
 				trk[i].rec_target     = bnc_bake_target(i, tgt, sil);   /* TRUE-621: a bake stops on a whole baked block */
 				/* end the live phrase. When padding (immediate stops), the
 				 * pad used to be hard zeros — a click baked into the seam;
@@ -6499,10 +6388,13 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 					continue;
 				}
 			} else if (avail < 2) {
-				trk[i].starved = 1; g_starve_cnt[i]++; STV_BUMP();
-				continue;
+				if (trk[i].fade == 0u) {   /* STARVEDUCK-735: silent only once the gain reached 0 */
+					trk[i].starved = 1; g_starve_cnt[i]++; STV_BUMP();
+					continue;
+				}
+				cpos = trk[i].p_w - 1u; avail = 0;   /* dry with gain up: hold the last frame under the falling gain */
 			}
-			uint32_t frac = fracb[f];
+			uint32_t frac = (avail > 0) ? fracb[f] : 0u;
 			uint32_t _b0 = (cpos & RING_MASK) * 2u;               /* M63a frame */
 			int16_t aL = pr[_b0], aR = pr[_b0 + 1u];
 			int16_t sv, svR2;
@@ -6518,16 +6410,18 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				svR2 = (int16_t)((int32_t)aR +
 					(int32_t)(((bR - aR) * (int32_t)((frac) >> 1)) >> 15));
 			}
-			/* BOUNDARY FADE (unchanged): fade out over the last ~5 ms as
-			 * the ring drains, fade in after recovery — dropouts duck
-			 * instead of clicking. */
+			/* BOUNDARY FADE -- STARVEDUCK-735: the applied gain is a STATE (trk.fade,
+			 * 0..256) with a bounded slew, never a function of the write pointer:
+			 * down <= 2 a frame toward the ring's edge (a smooth drain is followed
+			 * exactly), up 1 a frame (a refill mid-fade or a re-arm ramps back over
+			 * ~5 ms instead of snapping to full -- the step that popped at the
+			 * corner). Dropouts duck instead of clicking, in both directions. */
 			{
-				int32_t g = 256;
-				if (avail < 256) g = avail;
-				if (trk[i].fade < 256u) {
-					if ((int32_t)trk[i].fade < g) g = (int32_t)trk[i].fade;
-					trk[i].fade++;
-				}
+				int32_t g = (int32_t)trk[i].fade;
+				const int32_t tgt = (avail < 256) ? avail : 256;
+				if (tgt < g) { g -= 2; if (g < tgt) g = tgt; }
+				else if (g < 256) g++;
+				trk[i].fade = (uint16_t)g;
 				if (g < 256) {
 					sv   = (int16_t)(((int32_t)sv * g) >> 8);
 					svR2 = (int16_t)(((int32_t)svR2 * g) >> 8);
@@ -6637,48 +6531,8 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		}
 	}
 	g_sample_clock += BLK_FRAMES;
-	/* TAPPED GRID: MIDI clock in wall (I2S) time, produced block-wise, even
-	 * with the transport stopped — the grid is the decks' clock, not the
-	 * tape's. Bounded catch-up: a block is ~5 ms, ticks are >=10 ms. */
-	if (g_grid_active && g_grid_beat_frames) {
-		/* M22-A: EXACT tick schedule. beat/24 truncates (937.5 -> 937 at
-		 * 128 BPM), and the old += accumulated that truncation forever:
-		 * always fast, ~32 ms/min at 128 — marc heard it against his gear
-		 * before the code review found it. Ticks now come from an index
-		 * against a fixed base, so the error is bounded at ±1 frame no
-		 * matter how long the session runs. The base re-arms whenever
-		 * anything resets g_grid_next_tick (tap, retune, song load): the
-		 * first tick of a fresh base fires AT the base, like before. */
-		if (g_grid_next_tick != g_grid_tick_base_sync) {
-			/* someone else wrote next_tick (tap-commit, retune, song
-			 * load, beatmatch): that value is the new base */
-			g_grid_tick_base = g_grid_next_tick;
-			g_grid_tick_base_sync = g_grid_next_tick;
-			g_grid_tick_idx = 0;
-		}
-		while (g_sample_clock >= g_grid_next_tick) {
-			g_grid_tick_idx++;
-			g_grid_next_tick = g_grid_tick_base +
-				(uint64_t)(((uint64_t)g_grid_tick_idx *
-					    g_grid_beat_frames) / 24u);
-			g_grid_tick_base_sync = g_grid_next_tick;
-			g_midi_clk_produced++;
-		}
-		/* M8c: BAR-LINE service — launch-quantized mutes apply here, and a
-		 * pending beatmatch resync restarts the loops on the tapped "1".
-		 * Bars are ~2 s and blocks ~5 ms: one crossing per block, max.
-		 * (v2.0.0: launch-quantized MUTES were removed after live testing —
-		 * a bar is up to ~5 s of felt lag; mutes are instant everywhere
-		 * now, like 1.x. The bar service keeps only the beatmatch resync;
-		 * recording punch-ins stay bar-quantized via g_grid_punch_at.) */
-		if (g_grid_next_bar && g_sample_clock >= g_grid_next_bar) {
-			if (g_grid_resync_at && g_sample_clock >= g_grid_resync_at) {
-				g_grid_resync_at = 0;
-				g_restart_req = 1;      /* loops from the top, ON the "1" */
-			}
-			g_grid_next_bar += (uint64_t)g_grid_beat_frames * 4u;
-		}
-	}
+	/* GRIDCORE-733: the MIDI clock and the bar service moved to grid_follow_tape()
+	 * (audio_thread, after the mixer) -- the ticks come from the tape position. */
 	/* Beat-phase display computed ONCE per block now (was per loop-sample). It
 	 * only feeds the LED + MIDI-grid diag, so block granularity (~5 ms) is plenty
 	 * -- this lifts three runtime divides off the per-sample hot path. */
@@ -9872,132 +9726,144 @@ static void midi_thread(void *a, void *b, void *c)
 	}
 }
 
-/* GRIDSPD-622 (W301): THE TAPPED GRID FOLLOWS THE TAPE SPEED. Once per
- * block, after the mixer (which owns the smoothed speed). A gridded song's
- * clock lives in wall time; the rocker changed the music's tempo and left
- * the clock alone (marc: "the grid metronome light doesnt speed up or slow
- * down with the tape speed"), so the lights, the punch lines, the bar
- * service, the MIDI clock and the trance gate all fell off the loops, and
- * a take punched at 1.5x was rounded to beats 1.5x too long (the punch
- * derives its beat as nf * speed). Now: any writer that redefines the grid
- * (tap, snap/retune, song load) is adopted as the reference at the
- * SETTING; when the smoothed speed differs, nf is re-derived from that
- * fixed reference and the anchor moved so the beat index and the fraction
- * inside the beat are preserved (no jump, the bar count stays); the bar
- * line and the tick base follow; the saved tempo follows once settled.
- * Stands aside while a tap's beatmatch resync is pending (the grid IS the
- * external clock then); with the transport stopped the setting is the
- * speed. At a constant speed this does nothing. */
+/* GRIDCORE-733: THE GRID SERVICE. Once a block, after the mixer (never inside it, W291).
+ *
+ * A song with a loop: the tape is the clock.
+ *   L = loop_len, P = consume_pos (64-bit shadow), n = beats in the loop, O = the "1"
+ *   (+ the page-7 offset, in samples):  q = ((P - Oe) mod L) * n
+ *   beat = q / L, bar = beat / 4, phase = (q mod L) / L, MIDI tick = q * 24 / L.
+ * Published for the readers: g_grid_beat_frames = the wall beat at this block's speed
+ * (L * 65536 / (n * s)), g_grid_anchor_e = now - (beat_in_bar * bf + phase_frames), in
+ * modular uint64 so every "(now - anchor_e)" idiom reads the phase exactly. Nothing is
+ * integrated block to block, so nothing can drift: the phase is recomputed from P.
+ * The MIDI ticks are counted from q: exactly 24n a lap. With the tape stopped P is
+ * frozen and the phase with it (the LEDs hold); the ticks then run on the wall clock
+ * at the set speed's tempo (marc 09-10: keep ticking) and re-derive on PLAY.
+ *
+ * An empty song: the tapped clock (g_grid_anchor, nf) as before; ticks on the wall
+ * scheduler (M22-A's exact index schedule, moved here from the mixer). */
+static uint32_t grid_o_eff(uint32_t L, uint32_t n)
+{
+	/* the "1" plus the page-7 offset (+-1/2 beat, in samples), mod L */
+	uint32_t o = (g_slot < NUM_SLOTS) ? g_grid_o[g_slot] : 0u;
+	const int32_t q = (g_slot < NUM_SLOTS) ? (int32_t)g_grid_off_q8[g_slot] : 0;
+	if (q && n) {
+		const int64_t d = ((int64_t)q * (int64_t)(L / n)) >> 8;
+		o = (uint32_t)(((int64_t)o + d + (int64_t)L) % (int64_t)L);
+	}
+	return (L && o >= L) ? o % L : o;
+}
+static void __attribute__((noinline)) grid_adopt_loop(uint32_t beats, uint32_t start_samps, uint32_t k)
+{
+	/* the first take stopped: the loop IS the grid from here. O = the take's start
+	 * minus k beats (the punch line was beat k of its bar), n = the take's beats.
+	 * Persisted (GRD3); bpm_q8 is rewritten as the loop's 1x tempo (the hint an
+	 * old firmware or a migration reads). */
+	if (g_slot >= NUM_SLOTS || !g_loop_len || !beats || beats > 255u) return;
+	const uint32_t L = g_loop_len, B = (L + beats / 2u) / beats;
+	const uint32_t back = (uint32_t)(((uint64_t)(k & 3u) * B) % L);
+	g_grid_n[g_slot] = (uint8_t)beats;
+	g_grid_o[g_slot] = (start_samps % L + L - back) % L;
+	g_grid_bpm_q8[g_slot] = (uint16_t)((48000ULL * 60u * 256u * beats) / L);
+	g_grid_active = 1;
+	g_grid_save_req = 1;
+}
 static void __attribute__((noinline)) grid_follow_tape(void)
 {
+	const uint32_t L = g_loop_len;
+	const uint32_t n = (g_slot < NUM_SLOTS) ? g_grid_n[g_slot] : 0u;
+	uint32_t moved;
+	{	/* the 64-bit shadow of the playhead: the 2^32 wrap (24.8 h) is a small
+		 * forward step and disappears; a BACKWARD step is a reset (restart, first
+		 * take, song switch -- all to 0) and the shadow restarts with it, so
+		 * (shadow mod L) == (P mod L) always. */
+		const uint32_t pl = g_consume_pos;
+		const int32_t d = (int32_t)(pl - g_grid_p_lo);
+		if (d >= 0) g_grid_p64 += (uint32_t)d; else g_grid_p64 = pl;
+		moved = (pl != g_grid_p_lo) ? 1u : 0u;
+		g_grid_p_lo = pl;
+	}
+	if (!g_grid_active) { g_grid_src = 0u; g_grid_tick_ok = 0u; g_grid_o_req = 0u; return; }
+	const uint32_t s_now = (g_playing && g_loop_active && g_cur_speed_q16 >= 12288u)   /* RANGE-655: the 0.25x floor */
+	                     ? g_cur_speed_q16 : g_play_speed_q16;
+	if (L && n && s_now) {
+		/* ---- the tape is the clock (stopped: P is frozen, so is the phase) ---- */
+		if (g_grid_o_req && g_slot < NUM_SLOTS) {
+			/* a tap said "the 1 is at wall frame W": convert with THIS block's
+			 * coherent (W, P) -- the taps happened at the speed still in
+			 * g_cur_speed_q16 (the retune is a ramp). */
+			const uint64_t ago = g_sample_clock - g_grid_o_req_w;   /* frames since the tap */
+			const uint32_t back = moved ? (uint32_t)(((ago * g_cur_speed_q16) >> 16) % L) : 0u;   /* a stopped tape: the 1 is where it resumes */
+			g_grid_o[g_slot] = ((g_consume_pos % L) + L - back) % L;
+			g_grid_o_req = 0u;
+			g_grid_save_req = 1;
+		}
+		const uint32_t Oe = grid_o_eff(L, n);
+		const uint32_t pl = (uint32_t)((g_grid_p64 + (uint64_t)L - Oe) % L);   /* (P - Oe) mod L */
+		const uint64_t q = (uint64_t)pl * n;
+		const uint32_t beat = (uint32_t)(q / L);
+		const uint64_t frac = q % L;                                    /* /L = the phase in the beat */
+		const uint64_t ns64 = (uint64_t)n * s_now;
+		const uint32_t bf = (uint32_t)(((uint64_t)L * 65536u + ns64 / 2u) / ns64);   /* wall frames a beat at this speed */
+		const uint32_t phf = (uint32_t)((frac * bf) / L);                /* wall frames into the beat */
+		g_grid_beat_frames = bf;
+		g_grid_anchor_e = g_sample_clock - ((uint64_t)(beat & 3u) * bf + phf);   /* modular: (now - anchor_e) = the bar phase */
+		g_gridrec_beat_samps = (L + n / 2u) / n;
+		g_beat_samples = g_gridrec_beat_samps;
+		g_midi_div = g_gridrec_beat_samps / 24u;
+		/* MIDI: tick index from q, exactly 24n a lap; a jump (restart, song
+		 * switch, regime change) re-bases silently -- no burst, the Start
+		 * message carries the transport. Stopped: the wall scheduler below. */
+		const uint32_t tk = (uint32_t)((q * 24u) / L), tkn = 24u * n;
+		g_grid_src = 1u;
+		if (g_grid_tick_ok) {
+			/* every tick the tape crossed since the last block, whatever the
+			 * transport did in between (a stop freezes P: d = 0); a jump of more
+			 * than a few ticks is a reset and re-bases silently */
+			const uint32_t d = (tk + tkn - g_grid_tick_prev) % tkn;
+			if (d <= 4u) {
+				g_midi_clk_produced += d; g_grid_lap_acc += d;
+				if (d && tk < g_grid_tick_prev) { g_grid_lap_tk = g_grid_lap_acc - (tk + 1u); g_grid_lap_acc = tk + 1u; }   /* diag: the lap just closed (ticks 0..tk are the new lap's) */
+			} else {
+				g_grid_lap_acc = tk + 1u;
+			}
+		}
+		g_grid_tick_prev = tk; g_grid_tick_ok = 1u;
+		if (moved || (g_playing && g_cur_speed_q16 >= 12288u)) {
+			g_grid_next_tick = g_sample_clock;   /* the wall scheduler below re-bases here when the tape sits still */
+			return;
+		}
+		goto wall_ticks;   /* the tape sits still: the clock keeps ticking at the set tempo (marc 09-10) */
+	}
+	/* ---- the tapped clock (an empty song, or a loop without a beat count) ---- */
+	if (g_grid_src == 1u) {
+		/* the loop went away under a tape grid (all tracks deleted): carry the
+		 * phase into the clock so the metronome does not jump */
+		g_grid_anchor = g_grid_anchor_e - (uint64_t)((((int64_t)((g_slot < NUM_SLOTS) ? g_grid_off_q8[g_slot] : 0)) * (int64_t)g_grid_beat_frames) >> 8);
+		g_grid_tick_ok = 0u;
+	}
+	g_grid_o_req = 0u;
+	g_grid_src = 2u;
 	g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716: once a block, for every reader */
-	const uint32_t nf = g_grid_beat_frames;
-	if (!g_grid_active || !nf) return;
-	if (nf != g_grid_nf_shadow) {   /* someone redefined the grid: that is the new reference */
-		g_grid_ref_nf = nf; g_grid_ref_spd = g_play_speed_q16; g_grid_nf_shadow = nf; g_grid_saved_nf = nf;
-	}
-	if (g_grid_resync_at) {         /* a tap is retuning the tape to this grid: hands off */
-		g_grid_ref_nf = nf; g_grid_ref_spd = g_play_speed_q16;
-		return;
-	}
-	/* GRIDFIX-626 (W303): follow the smoothed speed only while the transport
-	 * RUNS and the speed is inside the tape's range -- a pause ramps
-	 * g_cur_speed_q16 to 0 and 625 followed it to a 38-million-frame beat.
-	 * Stopped, the grid is the decks' clock at the setting, as in 616. */
-	if (!g_playing && g_loop_active && g_cur_speed_q16 == 0u) {
-		/* GRIDLOCK-720: the tape is stopped -- the grid stops with it. The anchor
-		 * rides the clock one block a block, so the beat phase the loops paused
-		 * on is the one they resume on. */
-		g_grid_anchor += BLK_FRAMES;
-		g_grid_anchor_e = grid_anchor_eff();
-		return;
-	}
-	const uint32_t s = (g_playing && g_loop_active && g_cur_speed_q16 >= 12288u)   /* RANGE-655: below the 0.25x floor */
-	                 ? g_cur_speed_q16 : g_play_speed_q16;
-	if (!s || !g_grid_ref_spd) return;
-	uint32_t want = (uint32_t)(((uint64_t)g_grid_ref_nf * g_grid_ref_spd + s / 2u) / s);
-	if (want < 1u) want = 1u;
-	if (want != nf) {
-		const uint64_t ph = g_sample_clock - g_grid_anchor;
-		const uint64_t k = ph / nf;
-		const uint64_t f = ph % nf;
-		const uint64_t f2 = (f * want + nf / 2u) / nf;
-		g_grid_anchor = g_sample_clock - (k * want + f2);
-		g_grid_beat_frames = want;
-		g_grid_nf_shadow = want;
-		g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716: the new beat, the new effective anchor */
-		{	const uint64_t bar = (uint64_t)want * 4u;
-			const uint64_t ph2 = g_sample_clock - g_grid_anchor_e;
-			g_grid_next_bar = g_grid_anchor_e + ((ph2 / bar) + 1u) * bar; }
-		/* MIDI ticks: keep the next one where it is, space the rest at the new beat */
-		g_grid_tick_base = g_grid_next_tick; g_grid_tick_base_sync = g_grid_next_tick; g_grid_tick_idx = 0u;
-		g_grid_follow_n++;
-	}
-	/* GRIDLOCK-720: THE PHASE LOCK. At steady speed, with a gridded loop playing and
-	 * nothing recording, the loop's own position is the truth: consume_pos mod the
-	 * take's beat (stored samples) -> wall frames at this speed; the grid's within-
-	 * beat phase is pulled onto it, <= 2 frames a block, dead band 2, and only when
-	 * they agree to within a quarter beat (a deliberate mismatch is not a drift). */
-	if (!g_gridrec_beat_samps && g_loop_active && g_loop_len && g_rec_track < 0 &&
-	    g_cur_speed_q16 == g_play_speed_q16 && s) {
-		/* LOCKLOAD-725 (W332): a loaded song has no stored beat until a punch-in,
-		 * so the lock below never ran after a power-cycle. Derive it from the loop:
-		 * the wall beat at this speed in stored samples, rounded to what divides
-		 * the loop exactly (loops are whole beats of the true beat, M20 F7). */
-		const uint32_t _rse = (uint32_t)(((uint64_t)nf * s) >> 16);
-		if (_rse) {
-			const uint32_t _bts = (g_loop_len + _rse / 2u) / _rse;
-			if (_bts && (g_loop_len % _bts) == 0u) {
-				const uint32_t _rs = g_loop_len / _bts;
-				const uint32_t _d = (_rs > _rse) ? (_rs - _rse) : (_rse - _rs);
-				if ((uint64_t)_d * 100u <= _rse) {
-					g_gridrec_beat_samps = _rs;   /* within 1 %: this loop is on this grid */
-					/* LOCKSNAP-729 (GRIDLOCK-2 hole 1): the lock below only pulls within a
-					 * quarter beat, <= 2 frames a block, so a boot whose grid phase happens to
-					 * sit further from the loop never locks (lock=0 after 373 s on 09-08). Once,
-					 * here, snap the raw anchor onto the loop by the whole error; the bar line
-					 * follows as the rescale path does. */
-					const uint64_t _fl = ((uint64_t)(g_consume_pos % _rs) * 65536u) / s;
-					const uint64_t _fg = (g_sample_clock - g_grid_anchor) % nf;
-					int64_t _err = (int64_t)_fg - (int64_t)_fl;   /* + = the grid is ahead */
-					if (_err > (int64_t)(nf / 2u)) _err -= (int64_t)nf;
-					else if (_err < -(int64_t)(nf / 2u)) _err += (int64_t)nf;
-					if (_err) {
-						g_grid_anchor = (uint64_t)((int64_t)g_grid_anchor + _err);
-						g_grid_anchor_e = grid_anchor_eff();
-						const uint64_t _bar = (uint64_t)nf * 4u;
-						const uint64_t _ph2 = g_sample_clock - g_grid_anchor_e;
-						g_grid_next_bar = g_grid_anchor_e + ((_ph2 / _bar) + 1u) * _bar;
-						g_grid_snap_n++;
-					}
-				}
-			}
-		}
-	}
-	if (g_playing && g_loop_active && g_rec_track < 0 && !g_grid_resync_at &&
-	    g_cur_speed_q16 == g_play_speed_q16 && g_gridrec_beat_samps && g_loop_len &&
-	    (g_loop_len % g_gridrec_beat_samps) == 0u &&
-	    g_slot < NUM_SLOTS && g_grid_off_q8[g_slot] == 0) {   /* a page-7 offset is a deliberate shift: the lock stands down */
+	if (!g_grid_beat_frames) return;
+wall_ticks:
+	{	/* M22-A: EXACT tick schedule. beat/24 truncates (937.5 -> 937 at 128 BPM) and
+		 * a += would accumulate that forever (~32 ms/min at 128 -- marc heard it);
+		 * ticks come from an index against a fixed base, error bounded at +-1 frame.
+		 * The base re-arms whenever anything else wrote next_tick (tap, load, the
+		 * tape path above): the first tick of a fresh base fires AT the base. */
 		const uint32_t bf = g_grid_beat_frames;
-		const uint64_t f_loop = ((uint64_t)(g_consume_pos % g_gridrec_beat_samps) * 65536u) / s;
-		const uint64_t f_grid = (g_sample_clock - g_grid_anchor) % bf;
-		int64_t err = (int64_t)f_grid - (int64_t)f_loop;   /* + = the grid is ahead */
-		if (err > (int64_t)(bf / 2u)) err -= (int64_t)bf;
-		else if (err < -(int64_t)(bf / 2u)) err += (int64_t)bf;
-		if (err >= 2 || err <= -2) {
-			if (err <= (int64_t)(bf / 4u) && err >= -(int64_t)(bf / 4u)) {
-				const int64_t step = (err > 2) ? 2 : (err < -2) ? -2 : err;
-				g_grid_anchor = (uint64_t)((int64_t)g_grid_anchor + step);
-				g_grid_anchor_e = grid_anchor_eff();
-				g_grid_lock_n++;
-			}
+		if (g_grid_next_tick != g_grid_tick_base_sync) {
+			g_grid_tick_base = g_grid_next_tick;
+			g_grid_tick_base_sync = g_grid_next_tick;
+			g_grid_tick_idx = 0;
 		}
-	}
-	/* settled at a new speed: the song's saved tempo follows, so a reload lands here */
-	if (g_cur_speed_q16 == g_play_speed_q16 && g_grid_beat_frames != g_grid_saved_nf && g_slot < NUM_SLOTS) {
-		g_grid_bpm_q8[g_slot] = (uint16_t)((48000ULL * 60u * 256u) / g_grid_beat_frames);
-		g_grid_save_req = 1;
-		g_grid_saved_nf = g_grid_beat_frames;
+		while (g_sample_clock >= g_grid_next_tick) {
+			g_grid_tick_idx++;
+			g_grid_next_tick = g_grid_tick_base + (uint64_t)(((uint64_t)g_grid_tick_idx * bf) / 24u);
+			g_grid_tick_base_sync = g_grid_next_tick;
+			g_midi_clk_produced++;
+		}
 	}
 }
 
@@ -10023,6 +9889,13 @@ static inline uint32_t pop_max2(uint32_t a, uint32_t b)
 	return __SEL(a, b);
 }
 #define pop_dif2(a, b) __QSUB16((a), (b))
+static inline uint32_t pop_min2(uint32_t a, uint32_t b)
+{
+	(void)__USUB16(a, b);            /* GE per half: a >= b */
+	return __SEL(b, a);
+}
+#define pop_usub2(a, b) __UQSUB16((a), (b))
+#define pop_uadd2(a, b) __UQADD16((a), (b))
 #else
 static inline uint32_t pop_abs2(uint32_t d)
 {
@@ -10039,6 +9912,24 @@ static inline uint32_t pop_max2(uint32_t a, uint32_t b)
 	uint32_t hi = (a >> 16) > (b >> 16) ? (a >> 16) : (b >> 16);
 	return (hi << 16) | lo;
 }
+static inline uint32_t pop_min2(uint32_t a, uint32_t b)
+{
+	uint32_t lo = (a & 0xFFFFu) < (b & 0xFFFFu) ? (a & 0xFFFFu) : (b & 0xFFFFu);
+	uint32_t hi = (a >> 16) < (b >> 16) ? (a >> 16) : (b >> 16);
+	return (hi << 16) | lo;
+}
+static inline uint32_t pop_usub2(uint32_t a, uint32_t b)
+{
+	uint32_t lo = (a & 0xFFFFu) > (b & 0xFFFFu) ? (a & 0xFFFFu) - (b & 0xFFFFu) : 0u;
+	uint32_t hi = (a >> 16) > (b >> 16) ? (a >> 16) - (b >> 16) : 0u;
+	return (hi << 16) | lo;
+}
+static inline uint32_t pop_uadd2(uint32_t a, uint32_t b)
+{
+	uint32_t lo = (a & 0xFFFFu) + (b & 0xFFFFu); if (lo > 0xFFFFu) lo = 0xFFFFu;
+	uint32_t hi = (a >> 16) + (b >> 16); if (hi > 0xFFFFu) hi = 0xFFFFu;
+	return (hi << 16) | lo;
+}
 static inline uint32_t pop_dif2(uint32_t a, uint32_t b)
 {
 	int32_t lo = (int16_t)(a & 0xFFFFu) - (int16_t)(b & 0xFFFFu), hi = (int16_t)(a >> 16) - (int16_t)(b >> 16);
@@ -10049,56 +9940,147 @@ static inline uint32_t pop_dif2(uint32_t a, uint32_t b)
 	return ((uint32_t)hi << 16) | ((uint32_t)lo & 0xFFFFu);
 }
 #endif
+/* POPLOG-730: the machine state the trap can see from outside the mixer, packed. */
+static void pop_snapshot(struct pop_snap *o)
+{
+	uint32_t w0 = (g_slot & 15u) | ((g_live_got ? 1u : 0u) << 4);
+	uint32_t w1 = (g_pg_open ? 1u : 0u) | ((uint32_t)(g_pg_id & 15u) << 1) | ((g_heads_mode ? 1u : 0u) << 5)
+	            | ((uint32_t)(g_head_src & 3u) << 6) | ((g_playing ? 1u : 0u) << 8) | ((g_bnc_on ? 1u : 0u) << 9)
+	            | ((uint32_t)((g_rec_track + 1) & 7) << 10) | ((g_mon_mute ? 1u : 0u) << 13) | (((trk[0].starved | trk[1].starved | trk[2].starved | trk[3].starved) ? 1u : 0u) << 14)   /* POPTRAP2-734: any track starved (was RESYNC) */
+	            | ((g_win_rev ? 1u : 0u) << 15) | ((((g_chop_div * 31u) + g_chop_off) & 0x3FFu) << 16);
+	uint32_t sn = g_p2snap[0] + g_p2snap[1] + g_p2snap[2] + g_p2snap[3];
+	for (int i = 0; i < NTRK; i++) {
+		w0 |= ((uint32_t)(trk[i].state & 7u)) << (5 + 3 * i);      /* bits 5..16 */
+		w0 |= ((uint32_t)(trk[i].muted ? 1u : 0u)) << (17 + i);     /* 17..20 */
+		w0 |= ((uint32_t)(g_pg_route[i + 1] & 3u)) << (21 + 2 * i);  /* 21..28 */
+		w1 |= ((uint32_t)(g_head_rev[i] ? 1u : 0u)) << (26 + i);     /* 26..29 */
+		if (g_head_blip[i]) w1 |= 1u << 30;
+		o->vol[i] = trk[i].vol_now;
+	}
+	w0 |= ((g_ec2_live ? 1u : 0u) << 29) | ((g_rv_live ? 1u : 0u) << 30);
+	o->cpos = g_consume_pos; o->spd = g_cur_speed_q16; o->w0 = w0; o->w1 = w1; o->snap = sn;
+}
+/* tag bits: 0 CPOS jump  1 SLOT  2 LIVE edge  3 track STATE  4 MUTE  5 ROUTE  6 ECHO/REVERB owner
+ * 7 REV  8 CHOP  9 PAGE  10 HEADS  11 SNAP  12 BLIP  13 PLAY  14 SPEED  15 VOL step  16 BOUNCE
+ * 17 REC track  18 MONITOR mute  19 STARVE edge (POPTRAP2-734; was RESYNC) */
+static uint32_t pop_tags(const struct pop_snap *a, const struct pop_snap *b)   /* what changed a -> b */
+{
+	uint32_t t = 0u;
+	{
+		const uint32_t exp = (a->w1 & (1u << 8)) ? (uint32_t)(((uint64_t)BLK_FRAMES * a->spd) >> 16) : 0u;
+		int32_t d = (int32_t)(b->cpos - a->cpos) - (int32_t)exp;
+		if (d > 8 || d < -8) t |= 1u << 0;
+	}
+	const uint32_t x0 = a->w0 ^ b->w0, x1 = a->w1 ^ b->w1;
+	if (x0 & 15u) t |= 1u << 1;
+	if (x0 & (1u << 4)) t |= 1u << 2;
+	if (x0 & (0xFFFu << 5)) t |= 1u << 3;
+	if (x0 & (15u << 17)) t |= 1u << 4;
+	if (x0 & (0xFFu << 21)) t |= 1u << 5;
+	if (x0 & (3u << 29)) t |= 1u << 6;
+	if ((x1 & (15u << 26)) || (x1 & (1u << 15))) t |= 1u << 7;
+	if (x1 & (0x3FFu << 16)) t |= 1u << 8;
+	if (x1 & 31u) t |= 1u << 9;
+	if (x1 & (7u << 5)) t |= 1u << 10;
+	if (a->snap != b->snap) t |= 1u << 11;
+	if (x1 & (1u << 30)) t |= 1u << 12;
+	if (x1 & (1u << 8)) t |= 1u << 13;
+	{ int32_t ds = (int32_t)(b->spd - a->spd); if (ds > 512 || ds < -512) t |= 1u << 14; }
+	for (int i = 0; i < NTRK; i++) { int32_t dv = (int32_t)b->vol[i] - (int32_t)a->vol[i]; if (dv > 32 || dv < -32) t |= 1u << 15; }
+	if (x1 & (1u << 9)) t |= 1u << 16;
+	if (x1 & (7u << 10)) t |= 1u << 17;
+	if (x1 & (1u << 13)) t |= 1u << 18;
+	if (x1 & (1u << 14)) t |= 1u << 19;
+	return t;
+}
+/* POPTRAP2-734: the click's position, found only on an event (cold). d[k] = |x[k]-x[k-1]|;
+ * the click is the first k with d[k] >= TH and d[k] >= 4*max(d[k-1], d[k+1]); k = -1
+ * (the block edge) reports as frame 0. */
+static void pop_find_click(const int16_t *s, uint32_t prev0, uint32_t *at, uint8_t *ch)
+{
+	for (uint32_t c = 0; c < 2u; c++) {
+		int32_t x_1 = (int16_t)((c ? (prev0 >> 16) : prev0) & 0xFFFFu);
+		uint32_t dpp = (c ? (g_pop_prev_dpp >> 16) : g_pop_prev_dpp) & 0xFFFFu;
+		uint32_t dp  = (c ? (g_pop_dp2 >> 16) : g_pop_dp2) & 0xFFFFu;
+		for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+			const int32_t x = s[2u * f + c];
+			int32_t dd = x - x_1; if (dd < 0) dd = -dd; if (dd > 32767) dd = 32767;
+			const uint32_t d = (uint32_t)dd, nb = (dpp > d) ? dpp : d;
+			if (dp >= (uint32_t)POP_TH && dp >= (nb << POP_ISO_SHIFT)) { *at = f ? f - 1u : 0u; *ch = (uint8_t)c; return; }
+			dpp = dp; dp = d; x_1 = x;
+		}
+	}
+	*at = 0u; *ch = 0u;
+}
 static void __attribute__((optimize("O2"), noinline)) pop_trap(const int16_t *s, uint32_t cus)
 {
 	const uint32_t *w = (const uint32_t *)s;   /* BLK_FRAMES packed frames (the I2S block is 4-aligned) */
 	uint32_t prev = ((uint32_t)(uint16_t)g_pop_prev[1] << 16) | (uint16_t)g_pop_prev[0];
 	const uint32_t prev0 = prev;
-	uint32_t jmp2 = 0u, pk2 = 0u;
+	uint32_t jmp2 = 0u, pk2 = 0u, clk2 = 0u;
+	uint32_t dpp = g_pop_prev_dpp, dp = g_pop_dp2;   /* POPTRAP2-734: d[f-2], d[f-1] carried across the block edge */
+	const uint32_t th2 = ((uint32_t)(POP_TH - 1) << 16) | (uint32_t)(POP_TH - 1);   /* >= TH  <=>  d - (TH-1) > 0 */
+	const uint32_t one2 = 0x00010001u;
 	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 		const uint32_t cur = w[f];
-		jmp2 = pop_max2(jmp2, pop_abs2(pop_dif2(cur, prev)));
+		const uint32_t d = pop_abs2(pop_dif2(cur, prev));
+		jmp2 = pop_max2(jmp2, d);
 		pk2  = pop_max2(pk2, pop_abs2(cur));
+		{	/* POPTRAP2-734: is d[f-1] an ISOLATED step? >= TH and >= 4x max(d[f-2], d[f]) */
+			uint32_t nb = pop_max2(dpp, d);
+			nb = pop_uadd2(nb, nb); nb = pop_uadd2(nb, nb);
+			clk2 = pop_max2(clk2, pop_min2(pop_usub2(dp, th2), pop_usub2(dp, pop_usub2(nb, one2))));   /* dp >= TH && dp >= 4nb, both inclusive */
+		}
+		dpp = dp; dp = d;
 		prev = cur;
 	}
+	const uint32_t dpp_out = dpp, dp_out = dp;   /* published at the end: the finder needs the values from before this block */
 	g_pop_prev[0] = (int16_t)(prev & 0xFFFFu); g_pop_prev[1] = (int16_t)(prev >> 16);
 	g_pop_blkn++;
 	const uint32_t jl = jmp2 & 0xFFFFu, jh = jmp2 >> 16;
 	const uint32_t jmp = (jl > jh) ? jl : jh;
-	if (jmp < (uint32_t)POP_TH) return;
-	g_pop_n++;
-	if (g_pop_pend) return;
+	const uint32_t cl = clk2 & 0xFFFFu, ch2 = clk2 >> 16;
+	const uint32_t clk = ((cl > ch2) ? cl : ch2) ? 1u : 0u;   /* POPTRAP2-734: a click somewhere in the block (or its first frame) */
+	if (jmp >= (uint32_t)POP_TH) g_pop_n++;
+	{	/* POPLOG-730: the state now; the last two blocks stay for the tags */
+		struct pop_snap now; pop_snapshot(&now);
+		if (clk && g_pop_logn < POPL_N) {   /* POPTRAP2-734: clicks only */
+			struct pop_ev *e = &g_pop_log[g_pop_logn++];
+			const uint32_t ms = k_uptime_get_32();
+			uint32_t at = 0u; uint8_t ch = 0u;
+			{	int32_t pl = (int16_t)(prev0 & 0xFFFFu), pr = (int16_t)(prev0 >> 16);
+				pop_find_click(s, prev0, &at, &ch);   /* POPTRAP2-734 */
+			}
+			e->ms = ms; e->jmp = (uint16_t)jmp; e->at = (uint8_t)at; e->ch = ch;
+			e->tags = pop_tags(&g_pop_ps[0], &now) | pop_tags(&g_pop_ps[1], &g_pop_ps[0]);
+			e->ctl = g_pop_ctl;
+			{ uint32_t age = ms - g_pop_ctl_ms; e->age = (uint8_t)(g_pop_ctl ? ((age > 250u) ? 250u : age) : 255u); }
+		}
+		g_pop_ps[1] = g_pop_ps[0]; g_pop_ps[0] = now;
+	}
+	if (!clk) { g_pop_prev_dpp = dpp_out; g_pop_dp2 = dp_out; return; }
+	g_pop_c++;
+	if (g_pop_pend) { g_pop_prev_dpp = dpp_out; g_pop_dp2 = dp_out; return; }
 	/* an event: find its first frame + channel (only now -- the hot loop above tracks no position) */
 	{
 		int32_t pl = (int16_t)(prev0 & 0xFFFFu), pr = (int16_t)(prev0 >> 16);
 		uint32_t at = 0u; uint8_t ch = 0u;
-		for (uint32_t f = 0; f < BLK_FRAMES; f++) {
-			const int32_t l = s[2u * f], r = s[2u * f + 1u];
-			int32_t dl = l - pl, dr = r - pr;
-			if (dl < 0) dl = -dl;
-			if (dr < 0) dr = -dr;
-			if (dl >= POP_TH) { at = f; ch = 0u; break; }
-			if (dr >= POP_TH) { at = f; ch = 1u; break; }
-			pl = l; pr = r;
-		}
+		pop_find_click(s, prev0, &at, &ch);   /* POPTRAP2-734 */
 		g_pop_at = (uint16_t)at; g_pop_ch = ch;
 	}
 	const uint32_t pl2 = pk2 & 0xFFFFu, ph2 = pk2 >> 16;
 	g_pop_ms = (uint32_t)k_uptime_get(); g_pop_cus = cus;
-	g_pop_jmp = (int32_t)jmp; g_pop_pk = (int32_t)((pl2 > ph2) ? pl2 : ph2);
+	g_pop_jmp = (int16_t)jmp; g_pop_pk = (int16_t)((pl2 > ph2) ? pl2 : ph2);
 	{
-		const uint32_t cp = g_consume_pos; uint8_t sb = 0u;
-		for (int i = 0; i < NTRK; i++) {
+		uint8_t sb = 0u;
+		for (int i = 0; i < NTRK; i++)
 			if (trk[i].starved) sb |= (uint8_t)(1u << i);
-			g_pop_fade[i] = trk[i].fade;
-			g_pop_av[i] = (int32_t)(trk[i].p_w - cp);
-		}
 		g_pop_stv = sb;
 	}
 	g_pop_pl = g_playing ? 1u : 0u; g_pop_spd = g_cur_speed_q16;
 	g_pop_usb = g_usb_streaming ? 1u : 0u; g_pop_got = g_live_got;
-	g_pop_hi = emmc_dbg_hpi_fires;
 	g_pop_pend = 1u;
+	g_pop_prev_dpp = dpp_out; g_pop_dp2 = dp_out;
 }
 
 static void audio_thread(void *a, void *b, void *c)
@@ -10678,8 +10660,9 @@ static void controls_diag(void)
 		       (unsigned)(((uint32_t)g_ec_mix * 166u) >> 8), (unsigned)g_ec2_w,   /* ECHO2-610: fb q8 + line index */
 		       (unsigned)g_pg_route[1], (unsigned)g_pg_route[2], (unsigned)g_pg_route[3], (unsigned)g_pg_route[4],
 		       (unsigned)g_mon_mute, (unsigned)g_in_blk, (unsigned)g_inw_blk);   /* INFX-672 */
-		printk("GF,n=%u,nf=%u,ref=%u,%u,lock=%u,snap=%u\n",   /* GRIDSPD-622: rescales, beat frames now, reference nf/speed; GRIDLOCK-720: lock nudges */
-		       (unsigned)g_grid_follow_n, (unsigned)g_grid_beat_frames, (unsigned)g_grid_ref_nf, (unsigned)g_grid_ref_spd, (unsigned)g_grid_lock_n, (unsigned)g_grid_snap_n);
+		printk("GR,src=%u,n=%u,o=%u,L=%u,bf=%u,tk=%u,lap=%u\n",   /* GRIDCORE-733: 1 = the tape is the clock, 2 = the tapped clock; beats in the loop; the 1; loop_len; the wall beat now; tick index; ticks in the last lap (= 24n) */
+		       (unsigned)g_grid_src, (unsigned)((g_slot < NUM_SLOTS) ? g_grid_n[g_slot] : 0u), (unsigned)((g_slot < NUM_SLOTS) ? g_grid_o[g_slot] : 0u),
+		       (unsigned)g_loop_len, (unsigned)g_grid_beat_frames, (unsigned)g_grid_tick_prev, (unsigned)g_grid_lap_tk);
 		printk("BK,p=%u,s=%u,l=%u,c=%u,b=%u,n=%u\n",   /* BAKE-619/TRUE-621: prints baked, last speed q16, last len (baked blocks), capped, blocks this print, loop chosen at the stop */
 		       (unsigned)g_bk_prints, (unsigned)g_bk_last_spd, (unsigned)g_bk_last_len,
 		       (unsigned)g_bk_capped, (unsigned)g_bk_blocks, (unsigned)g_bk_len);
@@ -10708,16 +10691,21 @@ static void controls_diag(void)
 			printk(",%u", (unsigned)g_fxs_over[_k]);
 		printk("\n");
 		/* POPTRAP-728 (W335): events / blocks watched, then the first latched event since the last print */
-		printk("POP,n=%u,blk=%u", (unsigned)g_pop_n, (unsigned)g_pop_blkn);
+		printk("POP,n=%u,c=%u,blk=%u", (unsigned)g_pop_n, (unsigned)g_pop_c, (unsigned)g_pop_blkn);
 		if (g_pop_pend) {
-			printk(",ms=%u,jmp=%d,pk=%d,at=%u,ch=%u,cus=%u,stv=%x,fade=%u/%u/%u/%u,av=%d/%d/%d/%d,pl=%u,spd=%u,usb=%u,got=%u,hi=%u",
+			printk(",ms=%u,jmp=%d,pk=%d,at=%u,ch=%u,cus=%u,stv=%x,pl=%u,spd=%u,usb=%u,got=%u",
 			       (unsigned)g_pop_ms, (int)g_pop_jmp, (int)g_pop_pk, (unsigned)g_pop_at, (unsigned)g_pop_ch, (unsigned)g_pop_cus,
-			       (unsigned)g_pop_stv, (unsigned)g_pop_fade[0], (unsigned)g_pop_fade[1], (unsigned)g_pop_fade[2], (unsigned)g_pop_fade[3],
-			       (int)g_pop_av[0], (int)g_pop_av[1], (int)g_pop_av[2], (int)g_pop_av[3],
-			       (unsigned)g_pop_pl, (unsigned)g_pop_spd, (unsigned)g_pop_usb, (unsigned)g_pop_got, (unsigned)g_pop_hi);
+			       (unsigned)g_pop_stv, (unsigned)g_pop_pl, (unsigned)g_pop_spd, (unsigned)g_pop_usb, (unsigned)g_pop_got);
 			g_pop_pend = 0u;
 		}
 		printk("\n");
+		/* POPLOG-730: the census ring -- up to 4 events since the last print: ms:jump:frame:ch:tags(hex):ctl:age */
+		printk("POPL,n=%u", (unsigned)g_pop_logn);
+		for (uint32_t _k = 0; _k < g_pop_logn && _k < POPL_N; _k++)
+			printk(",%u:%u:%u:%u:%x:%u:%u", (unsigned)g_pop_log[_k].ms, (unsigned)g_pop_log[_k].jmp, (unsigned)g_pop_log[_k].at,
+			       (unsigned)g_pop_log[_k].ch, (unsigned)g_pop_log[_k].tags, (unsigned)g_pop_log[_k].ctl, (unsigned)g_pop_log[_k].age);
+		printk("\n");
+		g_pop_logn = 0u;
 
 		printk("BTN,lat=%u,max=%u\n",
 		       (unsigned)g_stop_lat_ms, (unsigned)g_stop_lat_max);
@@ -10885,7 +10873,7 @@ static void controls_diag(void)
 		phz[_i] = trk[_i].len_samps
 			? (trk[_i].start_samps % trk[_i].len_samps) : 0u;
 	printk("LOOPER %dHz song=%d %s hp=%d hpin=%d usb=%d chg=%d batt=%d bpm=%d detbpm=%d vol=%d "
-	       "trk[%s %s %s %s] rec=%d mut=%u%u%u%u ovr=%u rerr=%u werr=%u marg=[%d %d %d %d]ms stv=[%u %u %u %u] len=[%u %u %u %u] st=[%u %u %u %u] spim=%d cache=%d ckb=%u wbi=%u chop=%u/%u ph=[%u %u %u %u] anc[cp=%u bkf=%u mod=%u] chain[gbf0=%u grs0=%u gbf1=%u ganc=%u pat=%u] m22[tap=%u rf=%u bf=%u Ls=%u Lb=%u pph=%d sp=%u v=%u cnv=%d/%d snap=%u/%u]\n",
+	       "trk[%s %s %s %s] rec=%d mut=%u%u%u%u ovr=%u rerr=%u werr=%u marg=[%d %d %d %d]ms stv=[%u %u %u %u] len=[%u %u %u %u] st=[%u %u %u %u] spim=%d cache=%d ckb=%u wbi=%u chop=%u/%u ph=[%u %u %u %u] snap=%u/%u\n",
 	       (int)LOOP_RATE, (int)g_slot, g_playing ? "PLAY" : "STOP", g_hp_on, g_hp_in,
 	       usb_present() ? 1 : 0, charging() ? 1 : 0, batt,
 	       g_play_bpm, g_det_bpm, g_master_vol_q8,
@@ -10903,13 +10891,6 @@ static void controls_diag(void)
 	       emmc_spim_active() ? 1 : 0, g_cache_on ? 1 : 0, (unsigned)g_cache_kb, (unsigned)emmc_dbg_wr_busy_max,
 	       (unsigned)g_chop_div, (unsigned)g_chop_off,
 	       (unsigned)phz[0], (unsigned)phz[1], (unsigned)phz[2], (unsigned)phz[3],
-	       (unsigned)g_dbg_anc_cp, (unsigned)g_dbg_anc_bkf, (unsigned)g_dbg_anc_mod,
-	       (unsigned)g_dbg_gbf0, (unsigned)g_dbg_grs0, (unsigned)g_dbg_gbf1,
-	       (unsigned)g_dbg_ganc, (unsigned)g_dbg_pat,
-	       (unsigned)g_dbg_tap_bs, (unsigned)g_dbg_rf, (unsigned)g_dbg_bf,
-	       (unsigned)g_dbg_lens, (unsigned)g_dbg_lenb,
-	       (int)g_dbg_punch_ph, (unsigned)g_dbg_punch_sp, (unsigned)g_dbg_speed,
-	       (int)g_dbg_cnv_beats, (int)g_dbg_cnv_corr,
 	       (unsigned)g_snap_took, (unsigned)g_snap_took);
 	{
 		/* CPU= per-thread share of the last window, in percent: audio,
@@ -11850,6 +11831,7 @@ static void feed_wdt(void);
  * follows (the recorder writes forward by construction, row 59). */
 static void __attribute__((noinline)) rev_toggle(int ti)
 {
+	pop_stamp(2u);   /* POPLOG-730 */
 	if (ti < 0 || ti >= NTRK || (trk[ti].state == TS_EMPTY && !head_active(ti))) return;   /* ISO2-643: a head counts */
 	g_head_rev[ti] = (uint8_t)!g_head_rev[ti];
 	if (trk[ti].state == TS_PLAY || head_active(ti)) {
@@ -11868,6 +11850,7 @@ static void __attribute__((noinline)) rev_toggle(int ti)
 static uint8_t g_iso_on, g_iso_mask;
 static void __attribute__((noinline)) iso_engage(int ti)
 {
+	pop_stamp(3u);   /* POPLOG-730 */
 	if (g_iso_on || ti < 0 || ti >= NTRK || (trk[ti].state == TS_EMPTY && !head_active(ti))) return;
 	g_iso_mask = 0;
 	for (int k = 0; k < NTRK; k++) {
@@ -11879,6 +11862,7 @@ static void __attribute__((noinline)) iso_engage(int ti)
 }
 static void __attribute__((noinline)) iso_release(void)
 {
+	pop_stamp(4u);   /* POPLOG-730 */
 	if (!g_iso_on) return;
 	for (int k = 0; k < NTRK; k++) trk[k].muted = (uint8_t)((g_iso_mask >> k) & 1u);
 	g_iso_on = 0;
@@ -12209,6 +12193,41 @@ static void lane_reset(uint32_t page, int btn)
  * Saves the current song's BPM, loads the target's, signals the audio thread
  * to reload that slot's tracks. Refuses while a take is armed/recording/
  * flushing — the reload would trample the take and strand unflushed audio. */
+/* GRIDCORE-733: a song's grid at load. With a loop and a beat count the tape is
+ * the clock (the service derives everything); a loop without a count on an old
+ * card gets its count from the saved tempo ONCE (nearest whole number of beats --
+ * robust to the wall/speed mismatch that broke 09-10) and is rewritten; an empty
+ * tapped song keeps the clock grid, its phase provisional until a tap. */
+static void __attribute__((noinline)) grid_load_song(uint32_t ns)
+{
+	if (ns >= NUM_SLOTS) { g_grid_active = 0; return; }
+	const uint32_t L = g_meta.slot[ns].loop_len;
+	if (L && !g_grid_n[ns] && g_grid_bpm_q8[ns]) {
+		const uint32_t nf = (uint32_t)((48000ULL * 60u * 256u) / g_grid_bpm_q8[ns]);
+		const uint32_t sp = g_meta.slot[ns].speed_q16 ? g_meta.slot[ns].speed_q16 : 65536u;
+		const uint64_t bs = ((uint64_t)nf * sp) >> 16;   /* the saved beat in samples IF the saved speed was the one */
+		uint32_t nb = bs ? (uint32_t)(((uint64_t)L + bs / 2u) / bs) : 0u;
+		if (nb < 1u) nb = 1u;
+		if (nb > 255u) nb = 255u;
+		g_grid_n[ns] = (uint8_t)nb; g_grid_o[ns] = 0u;
+		g_grid_bpm_q8[ns] = (uint16_t)((48000ULL * 60u * 256u * nb) / L);
+		g_grid_save_req = 1;
+	}
+	if (L && g_grid_n[ns]) {
+		g_grid_active = 1;   /* the service publishes bf / anchor_e from the tape next block */
+		g_grid_beat_frames = (uint32_t)(((uint64_t)L * 65536u) / ((uint64_t)g_grid_n[ns] * (g_play_speed_q16 ? g_play_speed_q16 : 65536u)));
+		if (!g_grid_beat_frames) g_grid_beat_frames = 1u;
+		g_grid_anchor = g_sample_clock; g_grid_anchor_e = g_grid_anchor;
+		g_grid_next_tick = g_sample_clock;
+	} else if (g_grid_bpm_q8[ns]) {
+		g_grid_beat_frames = (uint32_t)((48000ULL * 60u * 256u) / g_grid_bpm_q8[ns]);
+		g_grid_anchor = g_sample_clock; g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
+		g_grid_next_tick = g_sample_clock;
+		g_grid_active = 1;
+	} else {
+		g_grid_active = 0;
+	}
+}
 static void jump_to_slot(uint32_t ns)
 {
 	if (!g_meta_loaded || g_slot_switch_req) return;    /* ignore until the last switch lands */
@@ -12233,25 +12252,9 @@ static void jump_to_slot(uint32_t ns)
 		g_chop_div = cd; g_chop_off = co;
 		g_fixed_len = (g_meta.song_mode[ns] & 0x0Fu)
 			    ? ((g_meta.song_mode[ns] & 0x0Fu) == 2u ? 1u : 0u) : g_mode_pref;
-		/* M8a: the song's grid tempo follows it; phase re-anchors
-		 * provisionally to "now" (a fresh tap run re-anchors properly). */
-		if (g_grid_bpm_q8[ns]) {
-			g_grid_beat_frames = (uint32_t)((48000ULL * 60u * 256u) /
-			                                g_grid_bpm_q8[ns]);
-			g_grid_anchor = g_sample_clock; g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
-			g_grid_next_tick = g_sample_clock;
-			g_grid_active = 1;
-			{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
-			  g_grid_next_bar = g_grid_anchor_e +
-				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
-		} else {
-			g_grid_active = 0;
-			g_grid_next_bar = 0;
-		}
-		g_grid_resync_at = 0;
+		grid_load_song(ns);   /* GRIDCORE-733 */
 	}
 	g_grid_fresh = 0;  /* M20 F1: a persisted grid's phase is provisional */
-	g_cnv_set = 0;     /* M22c: landmarks do not survive a song switch */
 	g_grid_base_beats = 0; g_grid_base_blocks = 0;   /* M20 F7 */
 	g_gridrec_beat_samps = 0;   /* LOCKLOAD-725: the stored beat belongs to the song that punched it */
 	g_win_free = 0;     /* M16: the free window is session performance state */
@@ -12554,16 +12557,7 @@ int main(void)
 			g_fixed_len = (g_meta.song_mode[g_slot] & 0x0Fu)
 				    ? ((g_meta.song_mode[g_slot] & 0x0Fu) == 2u ? 1u : 0u)
 				    : g_mode_pref;
-			if (g_grid_bpm_q8[g_slot]) {   /* M8a: boot grid tempo */
-				g_grid_beat_frames = (uint32_t)((48000ULL * 60u * 256u) /
-				                                g_grid_bpm_q8[g_slot]);
-				g_grid_anchor = g_sample_clock; g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
-				g_grid_next_tick = g_sample_clock;
-				g_grid_active = 1;
-				{ uint64_t _bar = (uint64_t)g_grid_beat_frames * 4u;
-			  g_grid_next_bar = g_grid_anchor_e +
-				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
-			}
+			grid_load_song(g_slot);   /* GRIDCORE-733: boot */
 		}
 		g_slot_switch_req = 1;
 	}
@@ -13461,11 +13455,11 @@ int main(void)
 					 * tapping a tempo and then holding gives you
 					 * at any sane BPM (469 ms at 128). */
 					g_grid_bpm_q8[g_slot] = 0;
+					g_grid_n[g_slot] = 0u; g_grid_o[g_slot] = 0u;   /* GRIDCORE-733: the tape grid goes with it */
 					g_grid_off_q8[g_slot] = 0;   /* NUDGE-717: the offset goes with the grid (the tail rides the same save) */
 					g_gridrec_beat_samps = 0;    /* LOCKLOAD-725: no grid, no stored beat */
 					g_grid_active = 0;
 					g_grid_fresh = 0;
-					g_cnv_set = 0;
 					g_grid_save_req = 1;
 					tap_n = 0;
 					fast_pair = 0;
@@ -13486,7 +13480,24 @@ int main(void)
 					 * then everything behaves exactly as normal.
 					 * Nothing to remember, nothing to turn off,
 					 * no state to read off the panel afterwards. */
-					if (g_grid_active && g_grid_beat_frames) {
+					if (g_grid_active && g_grid_beat_frames && g_loop_len && g_slot < NUM_SLOTS && g_grid_n[g_slot]) {
+						/* GRIDCORE-733: a loaded song snaps by its SPEED -- the loop is
+						 * untouched (n beats in L samples is the tempo), so the snap is
+						 * exact and reversible. bf = the wall beat now; nb = the wall
+						 * beat of the nearest whole BPM; speed *= bf / nb. */
+						uint32_t nb = bpm_snap(g_grid_beat_frames);
+						g_snap_took = (nb && nb != g_grid_beat_frames);
+						if (g_snap_took) {
+							uint64_t sp = ((uint64_t)g_play_speed_q16 * g_grid_beat_frames + nb / 2u) / nb;
+							if (sp < 16384u) sp = 16384u;
+							else if (sp > 98304u) sp = 98304u;
+							g_play_speed_q16 = (uint32_t)sp;
+							g_play_bpm = (int)((sp * 80u + 32768u) >> 16);
+							if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
+							if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
+							g_det_bpm = (int)(((uint64_t)LOOP_RATE * 60u + nb / 2u) / nb);
+						}
+					} else if (g_grid_active && g_grid_beat_frames) {
 						uint32_t nb = bpm_snap(g_grid_beat_frames);
 						g_snap_took = (nb && nb != g_grid_beat_frames);
 						if (g_snap_took) {
@@ -13646,9 +13657,8 @@ int main(void)
 						 * previous tap's -- so tap 5 retuned to ~1x and undid tap 4.) */
 						uint32_t native_q8 = 0;
 						if (g_loop_len > 0u) {
-							if (g_grid_active && g_grid_ref_nf && g_grid_ref_spd) {
-								uint64_t _tb = (uint64_t)g_grid_ref_nf * g_grid_ref_spd;   /* tape samples per beat, Q16 */
-								native_q8 = (uint32_t)((48000ULL * 60u * 256u * 65536u) / _tb);
+							if (g_grid_n[g_slot]) {   /* GRIDCORE-733: n beats in L samples, at 1x */
+								native_q8 = (uint32_t)((48000ULL * 60u * 256u * g_grid_n[g_slot]) / g_loop_len);
 							} else if (g_grid_bpm_q8[g_slot] && g_play_speed_q16) {
 								native_q8 = (uint32_t)(((uint64_t)g_grid_bpm_q8[g_slot] << 16) / g_play_speed_q16);
 							} else if (g_beat_samples) {
@@ -13662,8 +13672,6 @@ int main(void)
 						 * retune and after the follower's reference pair -- the follower adopts
 						 * (nf, g_play_speed_q16) the moment nf changes, and a stale speed there
 						 * was a grid off by the retune ratio (row 127). */
-						g_dbg_tap_bs = nf;         /* r2 diag */
-						g_dbg_gbf0   = nf;         /* r6 */
 						g_grid_fresh = 1;   /* M20 F1: taps = truth */
 						g_grid_anchor = tap_first_s;
 						g_grid_next_tick = g_sample_clock;
@@ -13690,14 +13698,25 @@ int main(void)
 							if (g_play_bpm < BPM_MIN) g_play_bpm = BPM_MIN;
 							if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
 						}
-						/* GRIDLOCK-720: the reference pair, speed first, then the beat goes live. */
-						g_grid_ref_spd = g_play_speed_q16;
-						g_grid_ref_nf = nf; g_grid_nf_shadow = nf; g_grid_saved_nf = nf;
-						g_grid_beat_frames = nf;   /* F9: exact */
-						g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
-						{ uint64_t _bar = (uint64_t)nf * 4u;
-			  g_grid_next_bar = g_grid_anchor_e +
-				(((g_sample_clock - g_grid_anchor_e) / _bar) + 1u) * _bar; }
+						if (g_loop_len > 0u) {
+							/* GRIDCORE-733: a loaded song. The loop keeps n (the tape was
+							 * retuned to the taps above); an ungridded loop gets its count
+							 * from the taps; the "1" moves to the first tap -- the service
+							 * converts that wall frame to a loop sample with a coherent (W, P).
+							 * bpm_q8 = the loop's 1x tempo (speed-invariant). */
+							if (!g_grid_n[g_slot]) {
+								uint64_t bs = ((uint64_t)nf * g_play_speed_q16) >> 16;
+								uint32_t nb = bs ? (uint32_t)(((uint64_t)g_loop_len + bs / 2u) / bs) : 0u;
+								if (nb < 1u) nb = 1u;
+								if (nb > 255u) nb = 255u;
+								g_grid_n[g_slot] = (uint8_t)nb;
+							}
+							g_grid_bpm_q8[g_slot] = (uint16_t)((48000ULL * 60u * 256u * g_grid_n[g_slot]) / g_loop_len);
+							g_grid_o_req_w = tap_first_s; g_grid_o_req = 1u;
+						} else {
+							g_grid_beat_frames = nf;   /* F9: exact (the clock grid of an empty song) */
+							g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716 */
+						}
 					}
 				}
 			}
