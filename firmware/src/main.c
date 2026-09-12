@@ -1514,6 +1514,8 @@ struct looptrk {
 	volatile uint8_t  muted;             /* tap-to-mute: track silenced but kept */
 	volatile uint8_t  starved;           /* ring underran; silent until half-refilled */
 	uint16_t          fade;              /* starve-recovery fade-in position (256 = full; mixer-only) */
+	uint8_t           held;              /* HOLDFADE-787: the last frame is being held (dry, gain up); a refill finishes the duck on it first (mixer-only) */
+	uint32_t          hold_pos;          /* HOLDFADE-787: the held frame's position (mixer-only) */
 	uint16_t          vol_now;           /* gain actually applied last block (mixer-only; ramps toward fader/mute target) */
 	uint8_t           rec_fade;          /* stop-pad fade-down remaining, of 128 (recorder-only) */
 	uint8_t           rec_fstep;         /* fade decrement per sample (fits the fade inside the pad) */
@@ -1613,6 +1615,7 @@ static volatile uint32_t g_stv_up;   /* high speed, NOT recording     */
 static volatile uint32_t g_stv_cx;   /* high speed AND recording      */
 static volatile uint32_t g_stv_pf;   /* a take still flushing         */
 static volatile uint32_t g_stv_re;   /* RA-491: starve DURING fade-in */
+static volatile uint32_t g_stv_hr;   /* HOLDFADE-787: hold-resumes (a refill landed before the duck reached 0) */
 #define STV_BUMP() do { \
         if (trk[i].fade < 256u) g_stv_re++;   /* RA-491 thrash */ \
         if (g_cur_speed_q16 < CX_SPEED_MIN) g_stv_lo++; \
@@ -3129,6 +3132,20 @@ static volatile uint8_t  g_pop_pend;       /* a latched event waits for the diag
 /* POPWHO-779: the readback of the latched event -- see pop_who() */
 static uint16_t g_pw_t[NTRK], g_pw_mon;    /* the largest 1-frame step around the click frame: each ring (raw), the jack */
 static uint16_t g_pw_av[NTRK], g_pw_fd[NTRK];   /* each track's room (frames, clamped) and gain at the readback */
+static uint16_t g_pw_bo[NTRK]; static uint32_t g_pw_so[NTRK];   /* BLKOFF-784: the click position inside its codec block / inside the loop (blocks) */
+/* RUNLOG-785: the ring's shape around the click, the run's ends, and who wrote it */
+#define RL_N 6u
+struct rl_ent { uint32_t ms; uint16_t s, n; uint8_t p; };
+static struct rl_ent g_rl_log[NTRK][RL_N]; static uint8_t g_rl_idx[NTRK];   /* per track, the last RL_N decodes */
+static int16_t  g_rl_rv[24]; static uint16_t g_rl_rl, g_rl_rls, g_rl_rb, g_rl_rbs; static uint8_t g_rl_wt;
+static struct rl_ent g_rl_out[RL_N];   /* the worst track's log, copied at the readback */
+static void __attribute__((noinline)) rl_add(int trk, uint32_t start, uint32_t n, uint8_t path)
+{
+	if ((unsigned)trk >= NTRK) return;
+	struct rl_ent *e = &g_rl_log[trk][g_rl_idx[trk]];
+	g_rl_idx[trk] = (uint8_t)((g_rl_idx[trk] + 1u) % RL_N);
+	e->ms = k_uptime_get_32(); e->s = (uint16_t)start; e->n = (uint16_t)((n > 65535u) ? 65535u : n); e->p = path;
+}
 static uint8_t  g_pw_st, g_pw_done;        /* starved bits; the readback ran for the held event */
 static uint32_t g_pw_ecd, g_pw_ecd_step;   /* the echo delay last block; its change on the event's block */
 static uint32_t g_pop_ms, g_pop_cus, g_pop_got, g_pop_spd;   /* POPLOG-730: hi (the EMMC48 line has it) and av/fade (the tags cover them) dropped for the floor */
@@ -3140,7 +3157,8 @@ static struct pop_snap g_pop_ps[2];               /* [0] = the last block, [1] =
 struct pop_ev { uint32_t ms, tags; uint16_t jmp; uint8_t at, ch; uint8_t ctl, age; };
 #define POPL_N 4u
 static struct pop_ev g_pop_log[POPL_N];
-static uint8_t  g_pop_logn;                       /* events logged (saturates at POPL_N per print) */
+static uint8_t  g_pop_logn;                       /* events logged (POPSTICKY-788: saturates at POPL_N, the ring rolls) */
+static uint8_t  g_pop_logi;                       /* POPSTICKY-788: the next slot */
 static volatile uint8_t  g_pop_ctl;               /* last helper stamp: 1 fx_reset 2 rev_toggle 3 iso_engage 4 iso_release */
 static volatile uint32_t g_pop_ctl_ms;
 static inline void pop_stamp(uint8_t code) { g_pop_ctl = code; g_pop_ctl_ms = k_uptime_get_32(); }
@@ -3606,7 +3624,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 14\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 2\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -5248,6 +5266,49 @@ static void __attribute__((noinline)) bnc_postpass(int32_t *mL, int32_t *mR, con
  * hoisted locals come in through the context and the two it writes go back. The
  * body is the loop's own text, unchanged (the harness gate proves it bit-exact). */
 struct pa_ctx { uint32_t cpos, pre_w, pre_val, pphase, fsince; int64_t dec_acc, dec_accR; };
+/* PASSA2-786: PASS A's frame loop for the IDLE transport (a loop playing, nothing armed / recording /
+ * flushing / bouncing): the same arithmetic, the block-constant reads hoisted, the accumulators 32-bit.
+ * Entry guard (the caller's): g_loop_active, g_rec_track < 0, !g_done_pending, step >= 4096 (an emit
+ * every <= 16 frames, so fsince never reaches the int64 divide branch), fsince < 0x8000. Host-proven
+ * bit-exact against the original loop (this build's harness). Its own function: W291. */
+struct pa_idle { uint32_t pphase, fsince, pre_w, pre_val, cpos; int64_t dec_acc, dec_accR; };
+static void __attribute__((optimize("O2"), noinline)) pa_idle_block(const int16_t *tmp, uint32_t got, uint32_t step,
+										  uint32_t *posb, uint16_t *fracb, struct pa_idle *st)
+{
+	uint32_t pphase = st->pphase, cpos = st->cpos, pre_w = st->pre_w, pre_val = st->pre_val, fs = st->fsince;
+	uint32_t acc = (uint32_t)st->dec_acc, accR = (uint32_t)st->dec_accR;   /* the low 32 bits: every consumer truncates there first */
+	int32_t hL = g_cd_holdL, hR = g_cd_holdR;
+	const uint32_t mdiv = (!g_grid_active && g_midi_div) ? g_midi_div : 0u;   /* both written below this thread's priority: block constants */
+	uint32_t mcnt = g_midi_cnt, mprod = 0u;
+	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+		const int32_t liveL = (f < got) ? (int32_t)tmp[2u * f]      : 0;
+		const int32_t liveR = (f < got) ? (int32_t)tmp[2u * f + 1u] : 0;
+		mix32[f] = liveL; mix32R[f] = liveR;
+		posb[f] = cpos; fracb[f] = (uint16_t)(pphase & 0xFFFFu);
+		acc += (uint32_t)liveL; accR += (uint32_t)liveR; fs++;
+		pphase += step;
+		while (pphase >= 65536u) {
+			pphase -= 65536u;
+			int16_t lsamp, rsamp;
+			if (fs == 0u)      { lsamp = (int16_t)liveL; rsamp = (int16_t)liveR; }
+			else if (fs == 1u) { lsamp = (int16_t)acc;   rsamp = (int16_t)accR; }
+			else { lsamp = (int16_t)((int32_t)acc / (int32_t)fs); rsamp = (int16_t)((int32_t)accR / (int32_t)fs); }   /* hw SDIV, as before */
+			acc = 0u; accR = 0u; fs = 0u;
+			if ((pre_w & 1u) == 0u) { hL = lsamp; hR = rsamp; }   /* CD-463: the 24k pre-roll store, same pair grid */
+			else { const uint32_t fi = ((pre_w >> 1) & RRING_MASK);
+			       g_rring[fi * 2u]      = (int16_t)((hL + (int32_t)lsamp + 1) >> 1);
+			       g_rring[fi * 2u + 1u] = (int16_t)((hR + (int32_t)rsamp + 1) >> 1); }
+			pre_w++;
+			if (pre_val < PREROLL_MAX) pre_val++;
+			cpos++;
+			if (mdiv && ++mcnt >= mdiv) { mcnt = 0u; mprod++; }
+		}
+	}
+	g_cd_holdL = (int16_t)hL; g_cd_holdR = (int16_t)hR;
+	g_midi_cnt = mcnt; if (mprod) g_midi_clk_produced += mprod;
+	st->pphase = pphase; st->cpos = cpos; st->pre_w = pre_w; st->pre_val = pre_val; st->fsince = fs;
+	st->dec_acc = (int64_t)(int32_t)acc; st->dec_accR = (int64_t)(int32_t)accR;   /* <= 16 frames since the last emit: exact */
+}
 static void __attribute__((noinline)) pa_armed(int rt_i, int16_t lsamp, uint32_t f, struct pa_ctx *c)
 {
 	uint32_t _cpos = c->cpos, _pre_w = c->pre_w, _pre_val = c->pre_val, _pphase = c->pphase, _fsince = c->fsince;
@@ -6332,6 +6393,13 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 		g_bt_acc = (g_bt_acc * 7u + _bl) >> 3;   /* slow mean, no divide */
 		g_bt_n++;
 	}
+	if (_lactive && g_rec_track < 0 && !g_done_pending && step >= 4096u && _fsince < 0x8000u) {
+		/* PASSA2-786: the idle transport (a loop playing, nothing recording) -- its own function */
+		struct pa_idle _pi = { _pphase, _fsince, _pre_w, _pre_val, _cpos, _dec_acc, _dec_accR };
+		pa_idle_block(tmp, got, step, posb, fracb, &_pi);
+		_pphase = _pi.pphase; _fsince = _pi.fsince; _pre_w = _pi.pre_w; _pre_val = _pi.pre_val; _cpos = _pi.cpos;
+		_dec_acc = _pi.dec_acc; _dec_accR = _pi.dec_accR;
+	} else
 	for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 		/* The UAC2 input is a stereo pair and always has been; the
 		 * engine simply summed it away. liveL/liveR feed the monitor;
@@ -6618,6 +6686,7 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 				if (avail >= (int32_t)PLAY_REARM_FRAMES) {
 					trk[i].starved = 0;
 					trk[i].fade = 0;   /* ramp back in (~5 ms), no click */
+					trk[i].held = 0u;   /* HOLDFADE-787 */
 				} else {
 					continue;
 				}
@@ -6627,6 +6696,14 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 					continue;
 				}
 				cpos = trk[i].p_w - 1u; avail = 0;   /* dry with gain up: hold the last frame under the falling gain */
+				trk[i].held = 1u; trk[i].hold_pos = cpos;   /* HOLDFADE-787 */
+			} else if (trk[i].held) {
+				/* HOLDFADE-787: the refill landed before the duck reached 0. Resuming here would
+				 * jump the CONTENT (the held frame -> the real position) at the gain the hold left.
+				 * Finish the duck on the held frame first (2 a frame to 0, below), then ramp the
+				 * real position in from 0 (1 a frame, the re-arm's ramp). A dip, never a step. */
+				if (trk[i].fade > 0u) { cpos = trk[i].hold_pos; avail = 0; }
+				else { trk[i].held = 0u; g_stv_hr++; }
 			}
 			uint32_t frac = (avail > 0) ? fracb[f] : 0u;
 			uint32_t _b0 = (cpos & RING_MASK) * 2u;               /* M63a frame */
@@ -7721,6 +7798,16 @@ extern void emmc_m50_setup(void);
 extern int emmc_m50_read_async(uint32_t blk, uint8_t *buf, uint32_t n);
 extern int emmc_m50_wait(int ms);
 extern uint8_t m54_tails[32][2];
+/* HDRCHK-789: the header canary + its latch; g_rd_p14s tells the unpack the burst it decodes was P14S */
+static volatile uint32_t g_hdr_bad, g_hdr_fixed, g_hdr_alien; static uint8_t g_rd_p14s;
+static volatile uint32_t g_hdr_zero; static uint8_t g_aln_hex[16];   /* ALIEN-790: the pads, and the first real alien's header at decode time */
+static uint32_t g_hdr_blk; static uint8_t g_hdr_idx, g_hdr_hex[16];
+static uint32_t __attribute__((noinline)) hdr_check(const uint8_t *buf, uint32_t c)
+{	/* 0 = clean (or not a P14S burst); else 1 + the index of the first unmarked block */
+	if (buf[11] != P14S_MARK) return 0u;
+	for (uint32_t bi = 1u; bi < c; bi++) if (buf[bi * 512u + 11u] != P14S_MARK) return bi + 1u;
+	return 0u;
+}
 extern void emmc_m54_crc_init(void);
 extern uint16_t emmc_m54_crc16(const uint8_t *d, uint32_t n);
 static volatile uint32_t g_m71_as, g_m71_rt, g_m71_fb;
@@ -8148,6 +8235,7 @@ static void __attribute__((aligned(32))) p14s_unpack(int16_t *ring, uint32_t rin
 			const uint8_t *flash, uint32_t nblk, int trk, uint32_t pad_spb)
 {
 	M73_T0();   /* UP-476 */
+	rl_add(trk, start, nblk * pad_spb, 1u);   /* RUNLOG-785 */
 	uint32_t s0 = start;
 	for (uint32_t b = 0; b < nblk; b++) {
 		const uint8_t *blk = flash + b * EMMC_BLOCK_SIZE;
@@ -8186,6 +8274,23 @@ static void __attribute__((aligned(32))) p14s_unpack(int16_t *ring, uint32_t rin
 				uint32_t fi = ((s0 + f) & ring_mask) * 2u;
 				ring[fi] = 0; ring[fi + 1u] = 0;
 			}
+		} else if (g_rd_p14s) {
+			/* HDRCHK-789: an unmarked block inside a P14S burst -- not the card's block.
+			 * A7-decoding it is rail garbage (the 20:30 click). Silence with continuity. */
+			_spb = SAMP_PER_BLK;
+			{	/* ALIEN-790: a silence-pad block is all zeros -- count it apart; latch the first real alien's header */
+				uint32_t _nz = 0u; for (uint32_t _q = 0u; _q < 16u; _q++) _nz |= blk[_q];
+				if (!_nz) g_hdr_zero++;
+				else { if (g_hdr_alien == 0u) memcpy(g_aln_hex, blk, 16u); g_hdr_alien++; }
+			}
+			for (uint32_t f = 0; f < _spb; f++) {
+				uint32_t fi = ((s0 + f) & ring_mask) * 2u;
+				ring[fi] = 0; ring[fi + 1u] = 0;
+			}
+			{	uint32_t hp = ((s0 - 1u) & ring_mask) * 2u;
+				ring[hp]      = (int16_t)((int32_t)g_p14s_prev[trk][0] >> 1);
+				ring[hp + 1u] = (int16_t)((int32_t)g_p14s_prev[trk][1] >> 1);
+				g_p14s_prev[trk][0] = 0; g_p14s_prev[trk][1] = 0; }
 		} else {
 			_spb = SAMP_PER_BLK;
 			codec_unpack(ring, ring_mask, s0, blk, 1u);
@@ -8199,6 +8304,7 @@ static void __attribute__((aligned(32))) p14s_unpack(int16_t *ring, uint32_t rin
 static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 			     const uint8_t *flash, uint32_t skip, uint32_t nsamp, int trk)
 {
+	rl_add(trk, start, nsamp, 2u);   /* RUNLOG-785 */
 	/* FZ-464: this is NOT seam-rate -- the plain fill and the prime path
 	 * both decode through here, so it needs the SAME cross-block
 	 * continuity as the full-path decoder. Without it, every block's
@@ -8261,6 +8367,7 @@ static void p14s_unpack_part(int16_t *ring, uint32_t ring_mask, uint32_t start,
 static void p14s_unpack_rev(int16_t *ring, uint32_t ring_mask, uint32_t start,
 			    const uint8_t *flash, uint32_t nblk, int trk, uint32_t pad_spb)
 {
+	rl_add(trk, start, nblk * pad_spb, 3u);   /* RUNLOG-785 */
 	/* REV-638 (W308): a burst read as [lo .. hi] plays BACKWARD, so the ring
 	 * gets block hi first -- descending, as codec_unpack_rev always did. Each
 	 * block is emitted time-reversed; its FIRST ring frame is the healed edge:
@@ -8380,6 +8487,15 @@ static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
 				if (bad >= 0) g_crcc_full = CRCC_FULL_BLOCKS;
 				else if (g_crcc_full) g_crcc_full = (g_crcc_full > c) ? (g_crcc_full - c) : 0u;
 			}
+			if (bad < 0) {	/* HDRCHK-789: the header canary -- a P14S burst with an unmarked block is a suspect read */
+				const uint32_t hb = hdr_check(dst, c);
+				if (hb) {
+					g_hdr_bad++;
+					if (g_hdr_bad == 1u) { g_hdr_blk = blk + done + hb - 1u; g_hdr_idx = (uint8_t)(hb - 1u); memcpy(g_hdr_hex, dst + (hb - 1u) * 512u, 16u); }
+					continue;   /* the attempt loop re-reads the chunk */
+				}
+				if (g_hdr_bad && attempt) g_hdr_fixed++;   /* a retry after a suspect read came back clean */
+			}
 			if (bad < 0) good = 1;
 		}
 		if (!good) {
@@ -8392,6 +8508,7 @@ static bool emmc_read_blocks_fast(uint32_t blk, uint8_t *buf, uint32_t n)
 		}
 		done += c;
 	}
+	g_rd_p14s = (buf[11] == P14S_MARK) ? 1u : 0u;   /* HDRCHK-789 */
 	g_m71_wu += (uint32_t)(k_uptime_get() - _t0);
 	rrt_ev(RRT_R, n, (uint32_t)(DWT->CYCCNT - _rrt0) / 64u);   /* RRT-630 */
 	M73_ADD(g_t_rd);
@@ -10406,8 +10523,10 @@ static void __attribute__((optimize("O2"), noinline)) pop_trap(const int16_t *s,
 	if (jmp >= (uint32_t)POP_TH) g_pop_n++;
 	{	/* POPLOG-730: the state now; the last two blocks stay for the tags */
 		struct pop_snap now; pop_snapshot(&now);
-		if (clk && g_pop_logn < POPL_N) {   /* POPTRAP2-734: clicks only */
-			struct pop_ev *e = &g_pop_log[g_pop_logn++];
+		if (clk) {   /* POPTRAP2-734: clicks only; POPSTICKY-788: a rolling ring of the last POPL_N */
+			struct pop_ev *e = &g_pop_log[g_pop_logi];
+			g_pop_logi = (uint8_t)((g_pop_logi + 1u) % POPL_N);
+			if (g_pop_logn < POPL_N) g_pop_logn++;
 			const uint32_t ms = k_uptime_get_32();
 			uint32_t at = 0u; uint8_t ch = 0u;
 			{	int32_t pl = (int16_t)(prev0 & 0xFFFFu), pr = (int16_t)(prev0 >> 16);
@@ -10422,7 +10541,7 @@ static void __attribute__((optimize("O2"), noinline)) pop_trap(const int16_t *s,
 	}
 	if (!clk) { g_pop_prev_dpp = dpp_out; g_pop_dp2 = dp_out; return; }
 	g_pop_c++;
-	if (g_pop_pend) { g_pop_prev_dpp = dpp_out; g_pop_dp2 = dp_out; return; }
+	/* POPSTICKY-788: a new click overwrites the latched one (the print never clears it) */
 	/* an event: find its first frame + channel (only now -- the hot loop above tracks no position) */
 	{
 		int32_t pl = (int16_t)(prev0 & 0xFFFFu), pr = (int16_t)(prev0 >> 16);
@@ -10442,7 +10561,7 @@ static void __attribute__((optimize("O2"), noinline)) pop_trap(const int16_t *s,
 	}
 	g_pop_pl = g_playing ? 1u : 0u; g_pop_spd = g_cur_speed_q16;
 	g_pop_usb = g_usb_streaming ? 1u : 0u; g_pop_got = g_live_got;
-	g_pop_pend = 1u;
+	g_pop_pend = 1u; g_pw_done = 0u;   /* POPSTICKY-788: the readback runs again for this event */
 	g_pop_prev_dpp = dpp_out; g_pop_dp2 = dp_out;
 }
 
@@ -10472,8 +10591,33 @@ static void __attribute__((noinline)) pop_who(void)
 		g_pw_av[i] = (uint16_t)((av < 0) ? 0 : (av > 65535) ? 65535 : av);
 		g_pw_fd[i] = trk[i].fade;
 		if (trk[i].starved) st |= (uint8_t)(1u << i);
+		{	/* BLKOFF-784: where in the take's geometry the click frame sits (the live fill's block index is est / spb) */
+			const uint32_t spb = TSPBI(i), lb = trk[i].len_blocks ? trk[i].len_blocks : 1u;
+			g_pw_bo[i] = (uint16_t)(est % spb);
+			g_pw_so[i] = (est / spb) % lb;
+		}
 	}
 	g_pw_st = st;
+	{	/* RUNLOG-785: the worst ring's shape, the run's ends, the writes into it */
+		int wt = 0;
+		for (int i = 1; i < NTRK; i++) if (g_pw_t[i] > g_pw_t[wt]) wt = i;
+		g_rl_wt = (uint8_t)wt;
+		const int16_t *pr = trk[wt].pring;
+		for (uint32_t k = 0u; k < 24u; k++) g_rl_rv[k] = pr[((est - 8u + k) & RING_MASK) * 2u];   /* ALIEN-790: est-8 .. est+15 */
+		g_rl_rl = 0u; g_rl_rls = 0u; g_rl_rb = 0u; g_rl_rbs = 0u;
+		for (uint32_t d = 4u; d < 600u; d++) {
+			const int32_t a = pr[((est + d - 1u) & RING_MASK) * 2u], b = pr[((est + d) & RING_MASK) * 2u];
+			const int32_t dd = (b > a) ? b - a : a - b;
+			if (dd >= 4000) { g_rl_rl = (uint16_t)d; g_rl_rls = (uint16_t)dd; break; }
+		}
+		for (uint32_t d = 5u; d < 600u; d++) {
+			const int32_t a = pr[((est - d) & RING_MASK) * 2u], b = pr[((est - d + 1u) & RING_MASK) * 2u];
+			const int32_t dd = (b > a) ? b - a : a - b;
+			if (dd >= 4000) { g_rl_rb = (uint16_t)d; g_rl_rbs = (uint16_t)dd; break; }
+		}
+		for (uint32_t k = 0u; k < RL_N; k++)   /* newest first */
+			g_rl_out[k] = g_rl_log[wt][(g_rl_idx[wt] + RL_N - 1u - k) % RL_N];
+	}
 	{	/* the jack block around the frame (what the monitor mixed) */
 		uint32_t worst = 0u;
 		const uint32_t f0 = (at > 4u) ? at - 4u : 0u;
@@ -10550,7 +10694,7 @@ static void audio_thread(void *a, void *b, void *c)
 		uint32_t _cus = (DWT->CYCCNT - _c0) / 64u;   /* 64 MHz -> us */
 		if (_cus > g_audio_us_max) g_audio_us_max = _cus;
 		grid_follow_tape();   /* GRIDSPD-622 (W301): the tapped grid follows the tape speed */
-		pop_trap((const int16_t *)blk, _cus);   /* POPTRAP-728 (W335): the finished block, every block */
+		if (g_dmp_arm) pop_trap((const int16_t *)blk, _cus);   /* POPTRAP-728 (W335): the finished block, every block -- TRAPGATE-792: only once a capture has connected */
 		if (g_pop_pend && !g_pw_done) { pop_who(); g_pw_done = 1u; }   /* POPWHO-779: once per latched event */
 		g_pw_ecd = g_ec_dly;   /* POPWHO-779: the echo delay this block, for the next block's step */
 		{	/* FXSTAT2-585: which ONE effect is up this block? Threshold 32
@@ -11079,10 +11223,20 @@ static void controls_diag(void)
 		       (unsigned)trk[2].p16m_next, (unsigned)trk[3].p16m_next);
 		/* STVFIX-650 (W312): the arguments in the order the format names them.
 		 * v=2 marks a truthful line; older captures are remapped by 571. */
-		printk("STV,v=2,lo=%u,up=%u,cx=%u,pf=%u,re=%u,rhw=%u\n",
+		printk("STV,v=2,lo=%u,up=%u,cx=%u,pf=%u,re=%u,rhw=%u,hr=%u,hb=%u,hf=%u,ha=%u,hz=%u\n",
 		       (unsigned)g_stv_lo, (unsigned)g_stv_up,
 		       (unsigned)g_stv_cx, (unsigned)g_stv_pf, (unsigned)g_stv_re,
-		       (unsigned)g_rw_hw);
+		       (unsigned)g_rw_hw, (unsigned)g_stv_hr, (unsigned)g_hdr_bad, (unsigned)g_hdr_fixed, (unsigned)g_hdr_alien, (unsigned)g_hdr_zero);   /* HOLDFADE-787, HDRCHK-789, ALIEN-790 */
+		if (g_hdr_alien) {   /* ALIEN-790: the first real alien's header, as the decoder saw it */
+			printk("ALN,h=");
+			for (uint32_t _k = 0u; _k < 16u; _k++) printk("%02x", (unsigned)g_aln_hex[_k]);
+			printk("\n");
+		}
+		if (g_hdr_bad) {   /* HDRCHK-789: the first suspect block, card address + index in its burst + 16 header bytes */
+			printk("HDR,blk=%u,i=%u,h=", (unsigned)g_hdr_blk, (unsigned)g_hdr_idx);
+			for (uint32_t _k = 0u; _k < 16u; _k++) printk("%02x", (unsigned)g_hdr_hex[_k]);
+			printk("\n");
+		}
 		/* FXSTAT2-585: 19 x starves/dry/blocks, one class per field (676: 16 = reverb; 691: 17 = eq, 18 = MULTI) */
 		printk("FXS2");
 		for (uint32_t _k = 0; _k < FXS_N; _k++)
@@ -11103,25 +11257,36 @@ static void controls_diag(void)
 			       (unsigned)g_pop_ms, (int)g_pop_jmp, (int)g_pop_pk, (unsigned)g_pop_at, (unsigned)g_pop_ch, (unsigned)g_pop_cus,
 			       (unsigned)g_pop_stv, (unsigned)g_pop_pl, (unsigned)g_pop_spd, (unsigned)g_pop_usb, (unsigned)g_pop_got);
 			if (g_pw_done)   /* POPWHO-779: the readback */
-				printk(",who=%u/%u/%u/%u,mon=%u,av=%u/%u/%u/%u,fd=%u/%u/%u/%u,st=%x,ecd=%u",
+				printk(",who=%u/%u/%u/%u,mon=%u,av=%u/%u/%u/%u,fd=%u/%u/%u/%u,st=%x,ecd=%u,bo=%u/%u/%u/%u,so=%u/%u/%u/%u",
 				       (unsigned)g_pw_t[0], (unsigned)g_pw_t[1], (unsigned)g_pw_t[2], (unsigned)g_pw_t[3], (unsigned)g_pw_mon,
 				       (unsigned)g_pw_av[0], (unsigned)g_pw_av[1], (unsigned)g_pw_av[2], (unsigned)g_pw_av[3],
 				       (unsigned)g_pw_fd[0], (unsigned)g_pw_fd[1], (unsigned)g_pw_fd[2], (unsigned)g_pw_fd[3],
-				       (unsigned)g_pw_st, (unsigned)g_pw_ecd_step);
-			g_pop_pend = 0u; g_pw_done = 0u;
+				       (unsigned)g_pw_st, (unsigned)g_pw_ecd_step,
+				       (unsigned)g_pw_bo[0], (unsigned)g_pw_bo[1], (unsigned)g_pw_bo[2], (unsigned)g_pw_bo[3],   /* BLKOFF-784 */
+				       (unsigned)g_pw_so[0], (unsigned)g_pw_so[1], (unsigned)g_pw_so[2], (unsigned)g_pw_so[3]);
+			if (g_pw_done) {   /* RUNLOG-785 */
+				printk(",wt=%u,rv=", (unsigned)g_rl_wt);
+				for (uint32_t _k = 0u; _k < 24u; _k++) printk("%s%d", _k ? "/" : "", (int)g_rl_rv[_k]);   /* ALIEN-790: 24 frames, est-8 first */
+				printk(",rl=%u:%u,rb=%u:%u,wl=", (unsigned)g_rl_rl, (unsigned)g_rl_rls, (unsigned)g_rl_rb, (unsigned)g_rl_rbs);
+				for (uint32_t _k = 0u; _k < RL_N; _k++)
+					printk("%s%d:%u:%u:%u", _k ? "/" : "", (int)(g_pop_ms - g_rl_out[_k].ms),
+					       (unsigned)g_rl_out[_k].s, (unsigned)g_rl_out[_k].n, (unsigned)g_rl_out[_k].p);
+			}
+			/* POPSTICKY-788: the latch persists; a new click overwrites it */
 		}
 		printk("\n");
 		/* POPLOG-730: the census ring -- up to 4 events since the last print: ms:jump:frame:ch:tags(hex):ctl:age */
 		printk("POPL,n=%u", (unsigned)g_pop_logn);
-		for (uint32_t _k = 0; _k < g_pop_logn && _k < POPL_N; _k++)
-			printk(",%u:%u:%u:%u:%x:%u:%u", (unsigned)g_pop_log[_k].ms, (unsigned)g_pop_log[_k].jmp, (unsigned)g_pop_log[_k].at,
-			       (unsigned)g_pop_log[_k].ch, (unsigned)g_pop_log[_k].tags, (unsigned)g_pop_log[_k].ctl, (unsigned)g_pop_log[_k].age);
+		for (uint32_t _k = 0; _k < g_pop_logn && _k < POPL_N; _k++) {   /* POPSTICKY-788: oldest first, never cleared */
+			const uint32_t _j = (g_pop_logn < POPL_N) ? _k : ((g_pop_logi + _k) % POPL_N);
+			printk(",%u:%u:%u:%u:%x:%u:%u", (unsigned)g_pop_log[_j].ms, (unsigned)g_pop_log[_j].jmp, (unsigned)g_pop_log[_j].at,
+			       (unsigned)g_pop_log[_j].ch, (unsigned)g_pop_log[_j].tags, (unsigned)g_pop_log[_j].ctl, (unsigned)g_pop_log[_j].age);
+		}
 		printk("\n");
-		g_pop_logn = 0u;
 
 		printk("BTN,lat=%u,max=%u\n",
 		       (unsigned)g_stop_lat_ms, (unsigned)g_stop_lat_max);
-		printk("MT,b=781,mute=%u,tog=%u,rel=%u,tap=%u,rst=%u,sp=%u,last=%u,play=%u,cmb=%u,tr=%u,br=%u,brd=%u\n",   /* MTDIAG-742 / MUTEFIX4-743 / BEATREP-749: the PLAY-release trap, the chord-release mutes, the sagged PLAY reading, the repeat's engages + live div */
+		printk("MT,b=792,mute=%u,tog=%u,rel=%u,tap=%u,rst=%u,sp=%u,last=%u,play=%u,cmb=%u,tr=%u,br=%u,brd=%u\n",   /* MTDIAG-742 / MUTEFIX4-743 / BEATREP-749: the PLAY-release trap, the chord-release mutes, the sagged PLAY reading, the repeat's engages + live div */
 		       (unsigned)g_mon_mute, (unsigned)g_mt_tog, (unsigned)g_mt_rel, (unsigned)g_mt_tap, (unsigned)g_mt_rst, (unsigned)g_mt_sp, (unsigned)g_mt_last, (unsigned)g_playing, (unsigned)g_mt_cmb, (unsigned)g_mt_tr, (unsigned)g_br_n, (unsigned)(g_br_on ? g_chop_div : 0u));
 
 
@@ -12009,11 +12174,14 @@ static uint32_t bipolar_depth(uint32_t v)
  * lane's depth. ~80 ms on / ~80 ms off at the 8 ms LED tick; only the page views
  * read it, so it costs nothing anywhere else. */
 static uint8_t g_led_fl_n[4], g_led_fl_t[4];   /* flashes left; ticks into the current phase */
-#define LED_FL_TICKS 10u
+static uint8_t g_led_fl_long[4];               /* LEDFLASH-791: this sequence is the OFF sign, one long blink */
+#define LED_FL_TICKS 5u                         /* LEDFLASH-791: 40 ms phases (was 10 = 80 ms): a 3-count in ~240 ms */
+#define LED_FL_LONG_TICKS 25u                   /* LEDFLASH-791: the OFF blink, 200 ms on */
 static void led_flash_lane(int i, uint32_t count)
 {
 	if (i < 0 || i > 3) return;
-	g_led_fl_n[i] = (uint8_t)(count * 2u);   /* on + off per flash */
+	g_led_fl_n[i] = (uint8_t)((count ? count : 1u) * 2u);   /* on + off per flash; LEDFLASH-791: 0 = OFF = one long blink */
+	g_led_fl_long[i] = count ? 0u : 1u;
 	g_led_fl_t[i] = 0u;
 }
 static void page_led_depth(int i, uint32_t amt)
@@ -12021,7 +12189,7 @@ static void page_led_depth(int i, uint32_t amt)
 	if (g_led_fl_n[i]) {   /* the count overlay owns the LED until it is done */
 		const int _on = (g_led_fl_n[i] & 1u) == 0u;   /* even = on phase first */
 		if (_on) { track_led_on(i); track_level(i, 255u); } else { track_led_off(i); }
-		if (++g_led_fl_t[i] >= LED_FL_TICKS) { g_led_fl_t[i] = 0u; g_led_fl_n[i]--; }
+		if (++g_led_fl_t[i] >= ((g_led_fl_long[i] && _on) ? LED_FL_LONG_TICKS : LED_FL_TICKS)) { g_led_fl_t[i] = 0u; g_led_fl_n[i]--; }   /* LEDFLASH-791 */
 		return;
 	}
 	if (amt > 255u) amt = 255u;
