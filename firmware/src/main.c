@@ -1993,6 +1993,8 @@ static uint8_t           g_br_on, g_br_n, g_br_free0, g_br_m0[2];   /* BEATREP-7
 static uint32_t          g_br_div0, g_br_off0;         /* BEATREP-749: the chop pair to restore at the release */
 static volatile uint8_t  g_br_live;                   /* BRWIN-754: the streamer maps through g_br_w/g_br_b */
 static volatile uint32_t g_br_w[NTRK], g_br_b[NTRK];   /* BRWIN-754: per track, in its own blocks: the window and its storage base (w = 0: not repeated) */
+static volatile uint32_t g_br_a[NTRK];                /* BRSTICK-763: the window's phase anchor (0 at the engage; the playhead at a resize) */
+static uint32_t          g_br_s, g_br_len;            /* BRFN-765: the captured window in LOOP samples: start (mod L) and length */
 static uint8_t           g_vol_pair;                  /* MUTEFIX3-741: the VOL pair was consumed under PLAY and has not been released (mirrors _rt_swallow for the track-ladder code) */
 static uint32_t          g_mt_tick;
 #define INW_N 768u                                    /* delay line, frames: > WOB_BASE_SAMP + peaks (672) */
@@ -2014,10 +2016,27 @@ static volatile int8_t   g_bk_trk = -1;   /* the print being baked */
 static volatile uint32_t g_bk_ph;         /* Q16 phase from p0 (the frame at r_r) */
 static volatile uint32_t g_bk_blocks;     /* baked blocks committed this print */
 static uint32_t          s_bk_ph_next, s_bk_cons_next;   /* pack -> commit handoff */
-static volatile uint32_t g_bk_prints, g_bk_last_spd, g_bk_last_len, g_bk_capped;   /* diag */
+static volatile uint32_t g_bk_last_spd; static volatile uint16_t g_bk_prints; static volatile uint8_t g_bk_capped;   /* diag (SPEEDBAKE-768: shrunk) */
+/* SPEEDBAKE-768 (row 121): the audio thread's integral of the baked frames (Q16 = whole + rem),
+ * the recorder count it last saw, and the loop's sample-exact baked length chosen at the stop. */
+static uint32_t          g_bk_accf, g_bk_rc_prev, g_bk_lens;
+static uint16_t          g_bk_accr;
+/* SPEEDBAKE2-769: the bake's reference speed -- a tape copy (mode 1) prints the tape at its
+ * anchor speed and a sweep RELATIVE to it; a sampler print (mode 2) prints what was heard
+ * (relative to 1x). g_bk_m1: the integral has been re-based to identity for a tape copy. */
+static uint32_t          g_bk_ref = BK_ONE;
+static uint8_t           g_bk_m1;
 static volatile uint32_t g_bk_len;   /* TRUE-621: the loop in baked blocks, chosen at the stop (0 = derive at promotion) */
 static volatile uint8_t  g_bk_mode;  /* TAPECOPY-684: 0 undecided, 1 TAPE COPY (no bake), 2 SAMPLER (bake) */
 #define BK_DECIDE_MS 180             /* TAPECOPY-684: TN still down this long after the chord = sampler */
+/* SPEEDBAKE2-769: the bake's speed relative to the print's reference (after g_bk_mode: it reads it). */
+static inline uint32_t bk_rel(uint32_t cur)
+{
+	if (cur < 12288u) cur = 12288u;   /* RANGE-655: the floor (a stopped tape never divides by 0) */
+	const uint32_t ref = (g_bk_mode == 1u) ? g_bk_ref : BK_ONE;
+	uint32_t r = (ref == BK_ONE) ? cur : (uint32_t)(((uint64_t)cur << 16) / ref);
+	return (r < 4096u) ? 4096u : r;
+}
 static uint8_t           g_bnc_p16m_prev;   /* the target's next-record mode before the arm */
 static uint8_t           g_arm_gsh_prev;    /* the target's print gain before ANY arm (cancel restores) */
 #define BNC_GSH 2u   /* BNC2-604: a print is stored 12 dB down -- room for four
@@ -3400,7 +3419,7 @@ static volatile uint32_t g_stop_lat_max;
  * A tap means nothing on an empty track, so there is nothing else to
  * disambiguate. Fresh-tapped-grid empty keeps 0 (A-r2). */
 #define EMPTY_ARM_MS     48
-#define DTAP_GAP_MS      420   /* 2nd tap within this of the 1st tap's release => DOUBLE-TAP */
+#define DTAP_GAP_MS      600   /* DELFIX-762: was 420 -- 2nd tap within this of the 1st tap's release => DOUBLE-TAP */
 #define DTAP_DEL_HOLD_MS 400   /* GS-531 (map v2 row 99): the 2nd tap HELD this long = DELETE.
                                 * A QUICK 2nd tap = the mono/stereo record toggle -- the
                                 * destructive gesture gets the dwell, the safe one the tap. */
@@ -3532,7 +3551,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 4\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -4904,22 +4923,53 @@ static void __attribute__((noinline)) bnc_arm_prep(int i)
  * (the last output's p0 + its 3-frame lookahead). Promotion uses this N when the loop is the
  * recorded length (g_bk_len); a snapped-back loop keeps its own length.
  * <= half a baked block from the musical length, like every loop here. */
+/* SPEEDBAKE-768: the input frames the kernel needs for n baked blocks -- the last
+ * output's p0 + its 3-frame lookahead -- given the integral so far (acc, Q16 baked
+ * frames for the rcf frames recorded) and the speed now. Past or future alike: the
+ * distance from acc to the last output, converted at cur. At a constant speed this
+ * is TRUE-621's ((n*fpb-1)*spd>>16)+4 exactly. */
+static uint32_t __attribute__((noinline)) bk_need(uint32_t n, uint32_t fpb, uint32_t rcf, uint64_t acc, uint32_t cur)
+{
+	const uint64_t out = ((uint64_t)(n * fpb - 1u) << 16);
+	int64_t need = (int64_t)rcf + 4;
+	if (out >= acc) need += (int64_t)((((out - acc) >> 8) * cur) >> 24);
+	else            need -= (int64_t)((((acc - out) >> 8) * cur) >> 24);
+	if (need < 0) need = 0;
+	return (uint32_t)need;
+}
+
 static uint32_t __attribute__((noinline)) bnc_bake_target(int i, uint32_t tgt, uint8_t sil)
 {
 	const uint32_t spd = g_bk_spd;
-	g_bk_len = 0u;
+	g_bk_len = 0u; g_bk_lens = 0u;
 	if (!spd) return tgt;
 	const uint32_t fpb = trk[i].p16m ? 248u : 140u;
-	const uint64_t per = (uint64_t)spd * fpb;
-	uint32_t n = (uint32_t)((((uint64_t)(tgt >> 1) << 16) + per / 2u) / per);
+	/* SPEEDBAKE-768: the baked frames at the target = the integral so far (what the kernel
+	 * consumes for the frames already recorded) + the rest at the speed now. At a constant
+	 * speed this is tgt/spd exactly as before; through a sweep it is what was heard. */
+	const uint32_t cur = bk_rel(g_cur_speed_q16);   /* SPEEDBAKE2-769 */
+	const uint32_t rcf = trk[i].rec_count >> 1, tf = tgt >> 1;
+	const uint64_t acc = ((uint64_t)g_bk_accf << 16) + g_bk_accr;
+	uint64_t at = acc;
+	if (tf >= rcf) at += ((uint64_t)(tf - rcf) << 32) / cur;   /* Q16 */
+	else { const uint64_t back = ((uint64_t)(rcf - tf) << 32) / cur; at = (at > back) ? at - back : 0u; }
+	uint32_t n = (uint32_t)((at + ((uint64_t)fpb << 15)) / ((uint64_t)fpb << 16));   /* nearest whole baked block */
 	if (n < 1u) n = 1u;
-	uint64_t need = (((uint64_t)(n * fpb - 1u) * spd) >> 16) + 4u;   /* the last output's p0 + the lookahead */
+	uint64_t need = bk_need(n, fpb, rcf, acc, cur);   /* the last output's p0 + the lookahead */
 	if (sil && need * 2u < (uint64_t)trk[i].rec_count) {   /* in emissions: an immediate stop never snaps back */
 		n += 1u;
-		need = (((uint64_t)(n * fpb - 1u) * spd) >> 16) + 4u;
+		need = bk_need(n, fpb, rcf, acc, cur);
 	}
 	if (n > MAX_LOOP_BLOCKS) n = MAX_LOOP_BLOCKS;
-	if (trk[i].len_blocks * (fpb * 2u) == tgt) g_bk_len = n;   /* the loop IS the recorded length */
+	if (trk[i].len_blocks * (fpb * 2u) == tgt) {   /* the loop IS the recorded length */
+		g_bk_len = n;
+		/* BAKELEN-727 through the sweep: the sample-exact recorded length, in baked samples */
+		const uint32_t lf = trk[i].len_samps >> 1;
+		uint64_t ls = acc;
+		if (lf >= rcf) ls += ((uint64_t)(lf - rcf) << 32) / cur;   /* Q16 */
+		else { const uint64_t back = ((uint64_t)(rcf - lf) << 32) / cur; ls = (ls > back) ? ls - back : 0u; }
+		g_bk_lens = (uint32_t)(((ls + 32768u) >> 16) * 2u);
+	}
 	return (uint32_t)(need * 2u);
 }
 
@@ -5005,6 +5055,33 @@ static void __attribute__((noinline)) bnc_postpass(int32_t *mL, int32_t *mR, con
 		g_bk_spd = (g_bk_mode != 1u && g_cur_speed_q16 != BK_ONE) ? g_cur_speed_q16 : 0u;   /* TAPECOPY-684: a tape copy never bakes */
 		g_bk_trk = (int8_t)_rt; g_bk_ph = 0u; g_bk_blocks = 0u; g_bk_len = 0u;   /* TRUE-621 */
 		if (g_bk_spd) g_bk_prints++;
+		g_bk_accf = 0u; g_bk_accr = 0u; g_bk_rc_prev = 0u; g_bk_lens = 0u;   /* SPEEDBAKE-768 */
+		g_bk_ref = (g_cur_speed_q16 < 12288u) ? 12288u : g_cur_speed_q16; g_bk_m1 = 0u;   /* SPEEDBAKE2-769: the anchor speed */
+	}
+	/* SPEEDBAKE-768 (row 121): the tape may move during a bounce. Per block: the integral
+	 * of the baked frames (recorded frames / the speed they were recorded at, Q16 -- what
+	 * the kernel will consume, ~150 ms later, at ~this speed); a HELD print leaving 1x joins
+	 * the bake (its flushed blocks are baked blocks 1:1); a run-on stop's target walks with
+	 * the speed so the recorder ends on exactly the n baked blocks the stop chose. */
+	if (_rt >= 0 && g_bk_trk == (int8_t)_rt && trk[_rt].state == TS_REC) {
+		const uint32_t _rc = trk[_rt].rec_count;
+		const uint32_t _df = (_rc - g_bk_rc_prev) >> 1;   /* frames recorded since the last block */
+		g_bk_rc_prev = _rc;
+		if (g_bk_mode == 1u && !g_bk_m1) {   /* SPEEDBAKE2-769: the verdict is a tape copy -- the frames so far are the tape 1:1 */
+			g_bk_m1 = 1u; g_bk_accf = _rc >> 1; g_bk_accr = 0u;
+		}
+		const uint32_t _sp = bk_rel(g_cur_speed_q16);   /* SPEEDBAKE2-769: relative to the print's reference */
+		if (g_bk_mode != 0u && g_bk_spd == 0u && _sp != BK_ONE) {   /* the tape left the print's reference speed: bake from here */
+			g_bk_ph = 0u; g_bk_spd = _sp; g_bk_prints++;
+		}
+		const uint64_t _q = (((uint64_t)_df << 32) / _sp) + g_bk_accr;   /* Q16 baked frames */
+		g_bk_accf += (uint32_t)(_q >> 16); g_bk_accr = (uint16_t)(_q & 0xFFFFu);
+		if (g_bk_spd && g_bk_len && trk[_rt].rec_target && !trk[_rt].rec_silence) {
+			/* TRUE-621 walked: the frames the kernel needs for n blocks, from here, at the speed now */
+			uint32_t _tg = bk_need(g_bk_len, trk[_rt].p16m ? 248u : 140u, _rc >> 1, ((uint64_t)g_bk_accf << 16) + g_bk_accr, _sp) * 2u;
+			if (_tg < _rc) _tg = _rc;   /* already there: the recorder finalises on its next sample */
+			trk[_rt].rec_target = _tg;
+		}
 	}
 }
 
@@ -8301,6 +8378,17 @@ static uint32_t bk_navail(const struct looptrk *t)
 	return k;
 }
 
+/* SPEEDBAKE-768: the bake reads the tape speed NOW, once per flush iteration --
+ * the flush trails the recorder by ~100-170 ms, so a sweep is smeared by that
+ * and no more. Floor 0.25x (RANGE-655); a stopped tape keeps the last speed. */
+static inline int bk_spd_live(const struct looptrk *t, int i)
+{
+	if (bk_flush_on(t, i)) {
+		g_bk_spd = bk_rel(*(volatile const uint32_t *)&g_cur_speed_q16);   /* SPEEDBAKE2-769: relative */
+	}
+	return 1;
+}
+
 /* The flush's unit of work, in whichever units this take is in. */
 static inline uint32_t bk_flush_navail(const struct looptrk *t, int i)
 {
@@ -8387,17 +8475,20 @@ static void __attribute__((noinline)) bk_promote(struct looptrk *t)
 	const uint32_t spd = g_bk_spd;
 	uint32_t lb = g_bk_len ? g_bk_len   /* TRUE-621: the stop chose it */
 	            : (uint32_t)((((uint64_t)t->len_blocks << 16) + spd / 2u) / spd);
-	uint32_t cb = (uint32_t)((((uint64_t)t->content_blocks << 16) + spd / 2u) / spd);
+	uint32_t cb = g_bk_blocks;   /* SPEEDBAKE-768: every baked block is content (the speed-derived count is not defined through a sweep) */
 	if (lb < 1u) lb = 1u;
 	if (lb > MAX_LOOP_BLOCKS) lb = MAX_LOOP_BLOCKS;
+	if (g_bk_len && lb > g_bk_blocks && g_bk_blocks) lb = g_bk_blocks;   /* SPEEDBAKE-768: never a loop past what was baked (a ramp's last 150 ms may land a block short) */
 	if (cb < lb) cb = lb;                 /* TRUE-621: the loop's last block holds the fade, not silence */
+	if (g_bk_len && cb > lb) cb = lb;     /* SPEEDBAKE-768: the recorded length IS the loop */
 	if (cb > g_bk_blocks) cb = g_bk_blocks;
 	if (cb < 1u) cb = 1u;
 	const uint32_t _src = t->len_samps;   /* BAKELEN-727: the recorded length, sample-exact (whole beats of the true beat) */
 	t->len_blocks = lb; t->content_blocks = cb;
 	t->len_samps = lb * TSPB(t);
 	if (_src) {   /* BAKELEN-727: the print's loop is the sources' length at the baked speed, not whole blocks */
-		uint32_t _ls = (uint32_t)((((uint64_t)_src << 16) + spd / 2u) / spd);
+		uint32_t _ls = g_bk_lens ? g_bk_lens   /* SPEEDBAKE-768: the integral at the loop's frames */
+		             : (uint32_t)((((uint64_t)_src << 16) + spd / 2u) / spd);
 		const uint32_t _hi = lb * TSPB(t), _lo = (lb - 1u) * TSPB(t) + 1u;
 		if (_ls > _hi) _ls = _hi;
 		if (_ls < _lo) _ls = _lo;
@@ -8408,7 +8499,7 @@ static void __attribute__((noinline)) bk_promote(struct looptrk *t)
 		t->start_blk = sb; t->start_samps = sb * TSPB(t);
 	}
 	t->r_r = t->r_w;
-	g_bk_last_spd = spd; g_bk_last_len = lb;
+	g_bk_last_spd = spd;
 	g_bk_spd = 0u; g_bk_trk = -1; g_bk_mode = 0u;   /* TAPECOPY-684 */
 }
 /* ===== end BAKE-619 kernel ===== */
@@ -8738,16 +8829,18 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				 * the frames are real audio with fixed destinations;
 				 * a late flush self-heals on the next loop pass. */
 				uint32_t _wretry = 0u;   /* RETRY-633: failed-write retries this pass */
-				while (bk_flush_navail(t, i) > 0u) {   /* BAKE-619: in this take's units */
+				while (bk_spd_live(t, i) && bk_flush_navail(t, i) > 0u) {   /* BAKE-619: in this take's units; SPEEDBAKE-768: at the speed now */
 					if (_p1spr && (k_uptime_get_32() - _p1t0) > 150u) {   /* SPRINT-P1-631: the duty bound */
 						_p1spr = 0; g_p1spr_cut++;
 						k_thread_priority_set(k_current_get(), K_PRIO_PREEMPT(5));
 					}
 					uint32_t fm = t->flush_mod ? t->flush_mod : MAX_LOOP_BLOCKS;
+					const bool _bkon = bk_flush_on(t, i);   /* SPEEDBAKE-768: ONE reading per iteration -- pack and commit agree */
 					/* batch as many contiguous blocks as are ready, up to the
 					 * buffer size and the loop-wrap boundary, into one CMD25 write */
-					uint32_t navail = bk_flush_navail(t, i);   /* BAKE-619 */
+					uint32_t navail = _bkon ? bk_navail(t) : (t->r_w - t->r_r) / TSPB(t);   /* BAKE-619 */
 					uint32_t n = navail < FLUSH_BATCH ? navail : FLUSH_BATCH;
+					if (!n) break;   /* SPEEDBAKE-768: a join between the two readings can leave nothing whole */
 					uint32_t to_wrap = fm - (t->flush_blk % fm);
 					if (n > to_wrap) n = to_wrap;
 					uint32_t blkno = trk_blk(slot, (uint32_t)i) +
@@ -8841,7 +8934,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 						continue;
 					}
 					g_w4_pk++; g_w4_pb += n;   /* W4P */
-					if (bk_flush_on(t, i))   /* BAKE-619: resample by the bounce speed on the way to flash */
+					if (_bkon)   /* BAKE-619: resample by the bounce speed on the way to flash */
 						bk_pack_blocks(t, batchbuf, n, (int16_t *)(void *)(batchbuf + 30u * EMMC_BLOCK_SIZE));
 					else
 					takes_pack_blocks(t, g_rring, RRING_MASK, (t->r_r >> 1) & RRING_MASK,
@@ -8908,8 +9001,8 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					}
 					wfail_start = 0;
 					wfail_ready1 = 0;
-					if (bk_flush_on(t, i)) { t->r_r += 2u * s_bk_cons_next; g_bk_ph = s_bk_ph_next; g_bk_blocks += n; }   /* BAKE-619: commit */
-					else t->r_r += n * TSPB(t);
+					if (_bkon) { t->r_r += 2u * s_bk_cons_next; g_bk_ph = s_bk_ph_next; g_bk_blocks += n; }   /* BAKE-619: commit */
+					else { t->r_r += n * TSPB(t); if (g_bk_trk == (int8_t)i) g_bk_blocks += n; }   /* SPEEDBAKE-768: a 1x print's blocks are baked blocks 1:1 (a join counts from here) */
 					t->flush_blk += n;
 					work = true;
 					/* FB-529 (W137): PROACTIVE page pacing at high tape
@@ -9414,7 +9507,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					uint32_t loop_blk = (c / win) * wper + wbase + (c % win);
 					if (g_br_live && !hrev && !head_active(i) && g_br_w[i]) {   /* BRWIN-754: the beat repeat's window, per track, storage-relative, wrapping */
 						win = g_br_w[i]; cyc = win; wper = gb; wbase = g_br_b[i];
-						c = pwb % win;
+						c = (pwb + win - (g_br_a[i] % win)) % win;   /* BRSTICK-763: the phase anchor (0 at the engage) */
 						loop_blk = (wbase + c) % gb;
 					}
 					uint32_t n = budget;
@@ -10686,7 +10779,7 @@ static void controls_diag(void)
 		       (unsigned)g_grid_src, (unsigned)((g_slot < NUM_SLOTS) ? g_grid_n[g_slot] : 0u), (unsigned)((g_slot < NUM_SLOTS) ? g_grid_o[g_slot] : 0u),
 		       (unsigned)g_loop_len, (unsigned)g_grid_beat_frames, (unsigned)g_grid_tick_prev, (unsigned)g_grid_lap_tk);
 		printk("BK,p=%u,s=%u,l=%u,c=%u,b=%u,n=%u\n",   /* BAKE-619/TRUE-621: prints baked, last speed q16, last len (baked blocks), capped, blocks this print, loop chosen at the stop */
-		       (unsigned)g_bk_prints, (unsigned)g_bk_last_spd, (unsigned)g_bk_last_len,
+		       (unsigned)g_bk_prints, (unsigned)g_bk_last_spd, (unsigned)g_bk_len,
 		       (unsigned)g_bk_capped, (unsigned)g_bk_blocks, (unsigned)g_bk_len);
 		printk("P16,m=%u%u%u%u,n=%u%u%u%u\n",
 		       (unsigned)trk[0].p16m, (unsigned)trk[1].p16m,
@@ -10731,7 +10824,7 @@ static void controls_diag(void)
 
 		printk("BTN,lat=%u,max=%u\n",
 		       (unsigned)g_stop_lat_ms, (unsigned)g_stop_lat_max);
-		printk("MT,b=758,mute=%u,tog=%u,rel=%u,tap=%u,rst=%u,sp=%u,last=%u,play=%u,cmb=%u,tr=%u,br=%u,brd=%u\n",   /* MTDIAG-742 / MUTEFIX4-743 / BEATREP-749: the PLAY-release trap, the chord-release mutes, the sagged PLAY reading, the repeat's engages + live div */
+		printk("MT,b=771,mute=%u,tog=%u,rel=%u,tap=%u,rst=%u,sp=%u,last=%u,play=%u,cmb=%u,tr=%u,br=%u,brd=%u\n",   /* MTDIAG-742 / MUTEFIX4-743 / BEATREP-749: the PLAY-release trap, the chord-release mutes, the sagged PLAY reading, the repeat's engages + live div */
 		       (unsigned)g_mon_mute, (unsigned)g_mt_tog, (unsigned)g_mt_rel, (unsigned)g_mt_tap, (unsigned)g_mt_rst, (unsigned)g_mt_sp, (unsigned)g_mt_last, (unsigned)g_playing, (unsigned)g_mt_cmb, (unsigned)g_mt_tr, (unsigned)g_br_n, (unsigned)(g_br_on ? g_chop_div : 0u));
 
 
@@ -11041,13 +11134,61 @@ static void __attribute__((noinline)) br_geom(uint32_t div)
 		g_br_w[i] = 0u;
 		if (t->state != TS_PLAY || head_active(i) || !t->len_blocks || !div) continue;
 		const uint32_t spb = TSPB(t), gb = t->len_blocks;
-		uint32_t w = gb / div; if (w < 1u) w = 1u;
-		const uint32_t pwbc = g_consume_pos / spb, phi = pwbc % w;
-		int64_t b = ((int64_t)pwbc - (int64_t)phi - (int64_t)w - (int64_t)(t->start_blk % gb)) % (int64_t)gb;
+		uint32_t w = (gb + div / 2u) / div; if (w < 1u) w = 1u;   /* BRGRID-764: rounded, not truncated (87.875 -> 88, not 87) */
+		const uint32_t P = g_consume_pos, pwbc = P / spb;
+		uint32_t line_blk;   /* the last window boundary at or before the playhead, in this track's blocks */
+		{	/* BRGRID-764: on a gridded song the boundaries are the BEAT LINES (GRIDCORE: O + k * L / n), subdivided by the
+			 * window; ungridded: multiples of the window in the free-running count, as before. */
+			const uint32_t n = (g_slot < NUM_SLOTS) ? (uint32_t)g_grid_n[g_slot] : 0u;
+			if (n && g_loop_len) {   /* windows of L / div from the 1 (O): every beat line when div is a multiple of n, every other beat for the 2-beat window */
+				const uint32_t O = (g_slot < NUM_SLOTS) ? g_grid_o[g_slot] : 0u;
+				const uint32_t off = (uint32_t)((((uint64_t)((P + g_loop_len - (O % g_loop_len)) % g_loop_len) * div) % g_loop_len) / div);   /* samples into the current window */
+				line_blk = (P - off) / spb;
+			} else {
+				line_blk = pwbc - (pwbc % w);
+			}
+		}
+		int64_t b = ((int64_t)line_blk - (int64_t)w - (int64_t)(t->start_blk % gb)) % (int64_t)gb;
 		if (b < 0) b += (int64_t)gb;
-		g_br_b[i] = (uint32_t)b; g_br_w[i] = w;
+		g_br_b[i] = (uint32_t)b; g_br_w[i] = w; g_br_a[i] = line_blk % w;   /* BRSTICK-763 / BRGRID-764: phase-continuous, one window back from the line */
+		if (g_loop_len) {   /* BRFN-765: the same window in loop samples, for the FN layer */
+			const uint32_t len = (g_loop_len + div / 2u) / div;
+			g_br_len = len ? len : 1u;
+			g_br_s = (uint32_t)(((uint64_t)(line_blk * spb) + g_loop_len - (g_br_len % g_loop_len)) % g_loop_len);
+		}
 	}
 	g_br_live = 1;
+}
+/* BRFN-765: set the repeat's window to [s, s + len) in LOOP samples, per track, keeping each track's phase
+ * inside the window (no retrigger). Used by the resize, the FN shift and the FN faders. */
+static void __attribute__((noinline)) br_setwin(uint32_t s_loop, uint32_t len)
+{
+	if (!g_loop_len) return;
+	if (len < 1u) len = 1u; if (len > g_loop_len) len = g_loop_len;
+	s_loop %= g_loop_len;
+	g_br_live = 0;
+	const uint32_t P = g_consume_pos;
+	const uint32_t S_free = P - ((P + g_loop_len - s_loop) % g_loop_len);   /* the most recent occurrence of loop position s */
+	for (int i = 0; i < NTRK; i++) {
+		struct looptrk *t = &trk[i];
+		if (!g_br_w[i] || t->state != TS_PLAY || head_active(i) || !t->len_blocks) { g_br_w[i] = 0u; continue; }
+		const uint32_t spb = TSPB(t), gb = t->len_blocks;
+		uint32_t w = (len + spb / 2u) / spb; if (w < 1u) w = 1u; if (w > gb) w = gb;
+		const uint32_t pwbc = P / spb, w0 = g_br_w[i];
+		const uint32_t phi = (pwbc + w0 - (g_br_a[i] % w0)) % w0;      /* the phase inside the old window now */
+		int64_t b = ((int64_t)(S_free / spb) - (int64_t)(t->start_blk % gb)) % (int64_t)gb;
+		if (b < 0) b += (int64_t)gb;
+		g_br_b[i] = (uint32_t)b; g_br_w[i] = w;
+		g_br_a[i] = ((pwbc % w) + w - (phi % w)) % w;                  /* keep the phase */
+	}
+	g_br_s = s_loop; g_br_len = len;
+	g_br_live = 1;
+}
+/* BRSTICK-763 / BRFN-765: a resize keeps the CAPTURED start and changes only the length (the phase kept). */
+static void __attribute__((noinline)) br_resize(uint32_t div)
+{
+	if (!div || !g_loop_len) return;
+	br_setwin(g_br_s, (g_loop_len + div / 2u) / div);
 }
 static void __attribute__((noinline)) br_click(int down)   /* BRDIR-757: `down` = SHRINK = the rocker UP (the chop's convention) */
 {
@@ -11068,7 +11209,7 @@ static void __attribute__((noinline)) br_click(int down)   /* BRDIR-757: `down` 
 		if (down) { if (d * 2u <= CHOP_DIV_MAX) { d *= 2u; o *= 2u; } }          /* half the window */
 		else      { if (d > 1u && (d & 1u) == 0u) { d /= 2u; o /= 2u; } }         /* double it */
 		g_chop_off = (d > 1u) ? (o % d) : 0u; g_chop_div = d;
-		br_geom(d);   /* BRWIN-754: a resize re-anchors one (new) window back from now */
+		br_resize(d);   /* BRSTICK-763: the same captured clip, resized from its start */
 	}
 	g_chop_req = 1; g_dip_req = 1;
 }
@@ -12830,6 +12971,11 @@ int main(void)
 						 * triple, no mode toggle on release. */
 						combo_start = fnp_now;
 						combo_fired = 1;
+					} else if (g_br_on) {
+						/* BRFN-765: FN pressed with a repeat live under PLAY = the FN layer of the
+						 * repeat -- a chord: no snap chain, no heads triple, no mode toggle. */
+						combo_start = fnp_now;
+						combo_fired = 1;
 					} else {
 					fnp_presses++;
 					/* FUNCTION + PLAY DOUBLE-TAP = snap to 1.0x. A
@@ -12946,7 +13092,7 @@ int main(void)
 					else if (fraw >= 1886 && fraw < 1957) rch = 1;   /* PLAY+T2 ~1910 */
 					else if (fraw >= 1957 && fraw < 2081) rch = 2;   /* PLAY+T3 ~2004 */
 					else if (fraw >= 2081 && fraw < 2267) rch = 3;   /* PLAY+T4 ~2159 */
-					if (rch >= 0) {
+					if (rch >= 0 && !(g_bnc_on && rch == g_rec_track)) {   /* SPEEDBAKE2-769: PLAY on the held print target is the octave's modifier, not isolate / reverse */
 						fnr_off = 0;
 						if (rch == fnr_cand) { if (fnr_cnt < 3) fnr_cnt++; }
 						else { fnr_cand = rch; fnr_cnt = 1; }
@@ -12986,7 +13132,10 @@ int main(void)
 					else { fv_cand = fvb; fv_cnt = 1; }
 					if (fv_cnt == 2) {   /* the committed press edge */
 						combo_fired = 1; fnp_pend_snap = 0; combo_seen = 1;
-						if (fvb == VOL_UP || fvb == VOL_DOWN) {
+						if (g_br_on && (fvb == VOL_UP || fvb == VOL_DOWN)) {   /* BRFN-765: the repeat's FN layer -- VOL-/+ = the window one earlier / later; BROCT-771: the rocker falls through to the OCTAVE (bare PLAY + rocker is shorter / longer) */
+							if (g_loop_len && g_br_len) br_setwin((fvb == VOL_UP) ? (g_br_s + g_br_len) : (g_br_s + g_loop_len - (g_br_len % g_loop_len)), g_br_len);
+							g_chop_req = 1; g_dip_req = 1;
+						} else if (fvb == VOL_UP || fvb == VOL_DOWN) {
 							uint32_t d = (fvb == VOL_DOWN) ? 1u : g_chop_div;   /* VOL-: reset, whole loop; VOL+: home, size kept */
 							g_win_free = 0;   /* the buttons reclaim the SHAPE; g_win_rev stays (M23-r11) */
 							g_chop_off = 0u;
@@ -12997,7 +13146,7 @@ int main(void)
 							}
 							g_chop_req = 1;
 							g_dip_req = 1;
-						} else if (g_rec_track < 0 && (fvb == VOL_TEMPO_UP || fvb == VOL_TEMPO_DOWN)) {   /* the octave (the ROCKER only -- MUTEFIX-739: VOL_BOTH fell in here as an octave down); tempo locked mid-take */
+						} else if ((g_rec_track < 0 || g_bnc_on) && (fvb == VOL_TEMPO_UP || fvb == VOL_TEMPO_DOWN)) {   /* SPEEDBAKE2-769: the octave is free during a bounce */   /* the octave (the ROCKER only -- MUTEFIX-739: VOL_BOTH fell in here as an octave down); tempo locked mid-take */
 							int b = g_play_bpm, nb = b;
 							if (fvb == VOL_TEMPO_UP) {
 								nb = (fv_oct_from && b == fv_oct_from / 2) ? fv_oct_from : b * 2;
@@ -13025,6 +13174,42 @@ int main(void)
 					g_meta_save_req = 1;
 					led_hw_refresh();   /* LEDS-725: the flip IS the confirm -- push the new duties now, not on the release */
 					combo_fired = 1;
+				}
+				if (g_br_on && g_loop_len) {   /* BRFN2-766: FN + faders 1-3 on the repeat's window (the chord branch owns the pass, so the free-window code below never runs) */
+					static int64_t bf_press = -1;
+					static int16_t bf_snap[3], bf_s, bf_e; static uint8_t bf_eng[3];   /* 13 B: the floor is 3,500 */
+					if (bf_press != combo_start) {
+						bf_press = combo_start;
+						for (int k = 0; k < 3; k++) { bf_snap[k] = -1; bf_eng[k] = 0; }
+						bf_s = (int16_t)(((uint64_t)g_br_s * 256u) / g_loop_len);
+						bf_e = (int16_t)(bf_s + (int)(((uint64_t)g_br_len * 256u) / g_loop_len)); if (bf_e > 255) bf_e = 255;
+					}
+					int bf_pend = 0;
+					for (int k = 0; k < 3; k++) {
+						int fv = ladder_read(&adc_ladder[LAD_FADER0 + k]);
+						if (fv < 0) continue;
+						int q = (int)((uint32_t)fv * 256u / 3700u); if (q > 255) q = 255;
+						if (bf_snap[k] < 0) { bf_snap[k] = (int16_t)q; continue; }
+						if (!bf_eng[k]) {
+							int d = q - bf_snap[k]; if (d < 0) d = -d;
+							if (d < 7) continue;                      /* the M31 intent gate */
+							bf_eng[k] = 1; combo_seen = 1;
+							g_fh_latch[k] = 1; g_fh_lastq[k] = -1;    /* the volume pickup law: no jump on the release */
+						}
+						if (k == 0)      { if (q != bf_s) { bf_s = (int16_t)q; bf_pend = 1; } }
+						else if (k == 1) { if (q != bf_e) { bf_e = (int16_t)q; bf_pend = 1; } }
+						else {
+							int w = (bf_s <= bf_e) ? bf_e - bf_s : bf_s - bf_e;
+							int base = (q * (255 - w)) >> 8;
+							bf_s = (int16_t)base; bf_e = (int16_t)(base + w); bf_pend = 1;
+						}
+					}
+					if (bf_pend) {
+						int ws = bf_s, we = bf_e;
+						if (ws > we) { int t2 = ws; ws = we; we = t2; }
+						if (we - ws < 2) { we = ws + 2; if (we > 255) { we = 255; ws = 253; } }
+						br_setwin((uint32_t)(((uint64_t)ws * g_loop_len) >> 8), (uint32_t)(((uint64_t)(we - ws) * g_loop_len) >> 8));
+					}
 				}
 				k_msleep(25);
 				continue;                /* combo owns the button */
@@ -13132,7 +13317,7 @@ int main(void)
 				else if (fraw >= 308  && fraw <  488) tb = TRK_2;   /* ~404  */
 				else if (fraw >= 650  && fraw <  795) tb = TRK_3;   /* ~728  */
 				else if (fraw >= 1099 && fraw < 1256) tb = TRK_4;   /* ~1209 */
-				if (tb >= TRK_1 && tb <= TRK_4) {
+				if (tb >= TRK_1 && tb <= TRK_4 && !(g_bnc_on && (int)tb - (int)TRK_1 == g_rec_track)) {   /* SPEEDBAKE2-769: the held print target is no bank-jump / page candidate */
 					if (tb == bj_cand) bj_cnt++;
 					else { bj_cand = tb; bj_cnt = 1; }
 					if (bj_cnt == 3) {   /* exact edge: once per press */
@@ -13479,6 +13664,10 @@ int main(void)
 						we = ws + 2;
 						if (we > 255) { we = 255; ws = 253; }
 					}
+					if (g_br_on) {   /* BRFN-765: faders 1/2 = the repeat window's start / end, fader 3 = its shift; not the chop's free window */
+						if (g_loop_len) br_setwin((uint32_t)(((uint64_t)ws * g_loop_len) >> 8), (uint32_t)(((uint64_t)(we - ws) * g_loop_len) >> 8));
+						(void)rv;
+					} else {
 					g_win_s8 = (uint8_t)ws;
 					g_win_e8 = (uint8_t)we;
 					g_win_rev = (uint8_t)rv;
@@ -13495,6 +13684,7 @@ int main(void)
 					 * itself. Defer, and settle up on release. */
 					g_chop_defer = 1;
 					g_defer_t = k_uptime_get();   /* r3 */
+					}   /* BRFN-765 */
 				}
 			}
 			if (combo_seen) {
@@ -13973,7 +14163,7 @@ int main(void)
 			if (trk_raw >= 1840) {
 				raw = TRK_NONE;          /* never PLAY, never a track */
 				combo14_t = -1;
-				if (bchord >= 0 && !suppress_play) {   /* REV2-641: FN lifted first out of FN+PLAY+TN is not a bounce */
+				if (bchord >= 0 && (!suppress_play || g_br_on)) {   /* REV2-641: FN lifted first out of FN+PLAY+TN is not a bounce -- BRBNC3-767: unless a repeat is live (its FN layer parks that chord machine) */
 					if (bchord == bch_cand) { if (bch_cnt < 3) bch_cnt++; }
 					else { bch_cand = bchord; bch_cnt = 1; }
 					/* BNC2-600: fires once per PRESS (the count passes 2 exactly
@@ -14440,7 +14630,7 @@ int main(void)
 						 * lives on the FN+hold-T4 MODE PAGE. A quick 2nd
 						 * tap is just another mute; the DELETE dwell (kept,
 						 * marc-approved) still owns the held 2nd tap. */
-						tap_deadline[ti] = 0;
+						tap_deadline[ti] = tnow + DTAP_GAP_MS;   /* DELFIX-762: every tap re-opens the window (was 0: a tap inside a window closed it, so tap-tap-HOLD failed) */
 						trk[ti].muted = !trk[ti].muted;
 					} else {
 						/* tap -> mute, INSTANT on gridded and
@@ -14945,7 +15135,7 @@ int main(void)
 			static int64_t _rt_pend_t;
 			static uint8_t _rt_swallow;               /* MUTEANY-738: after the pair, singles are the release -- ignored until VOL_NONE */
 			static int64_t _br_rep_t;                 /* BRHOLD-756: the next auto-step of a held rocker (0 = none) */
-			if (committed == TRK_PLAY) {   /* anywhere -- the routing is GLOBAL */
+			if (committed == TRK_PLAY || (bch_held && trk_raw >= 1509) || (suppress_play && g_br_on)) {   /* SPEEDBAKE2-769: a held bounce with PLAY lifted is not the chord -- the rocker is the tempo */   /* anywhere -- the routing is GLOBAL; BRREC-762 / BRREC2-763 / BRFN2-766: PLAY still down after a bounce chord (the swallowed sweep) or after FN lifted (suppress_play) is PLAY held -- the repeat's rocker stays alive */
 				_rt_hold = 1;
 				int64_t _tn = k_uptime_get();
 				if (vcommit == VOL_NONE) _rt_swallow = 0;
@@ -14975,16 +15165,22 @@ int main(void)
 			}
 			if (_rt_pend != VOL_NONE && (committed != TRK_PLAY || k_uptime_get() - _rt_pend_t >= 100)) {
 				/* the window closed without the pair (or PLAY lifted): the route fires as before */
+				if (g_br_on) {   /* BRVOL-770: a repeat is live under PLAY -- VOL-/+ = the window one earlier / later (BRFN-765's FN layer, no FN) */
+					if (g_loop_len && g_br_len) br_setwin((_rt_pend == VOL_UP) ? (g_br_s + g_br_len) : (g_br_s + g_loop_len - (g_br_len % g_loop_len)), g_br_len);
+					g_chop_req = 1; g_dip_req = 1;
+					_rt_last_t = 0;
+				} else {
 				uint8_t nr = (_rt_last_t != 0 && _rt_pend_t - _rt_last_t <= 350) ? RT_BOTH
 				           : (_rt_pend == VOL_DOWN) ? RT_IN : RT_TRK;
 				_rt_last_t = (nr == RT_BOTH) ? 0 : _rt_pend_t;   /* a double-click closes the pair */
 				for (int _p = 1; _p <= 4; _p++) g_pg_route[_p] = nr;   /* all four pages */
 				g_rt_flash = (nr == RT_IN) ? 1u : (nr == RT_TRK) ? 2u : 3u;
 				g_rt_tick  = 0u;
+				}
 				_rt_pend = VOL_NONE;
 			}
 			if (committed != TRK_PLAY) _rt_last_t = 0;   /* PLAY lifted: the next press starts fresh (MUTEFIX2-740: the swallow clears on VOL_NONE only) */
-			if (g_br_on && (committed != TRK_PLAY || !g_playing || g_slot_switch_req)) br_release();   /* BEATREP-749 / BRBNC-758: PLAY lifted (or the song stopped / a song switch) = release; a recording (a bounce of the stutter) does NOT end it */
+			if (g_br_on && ((committed != TRK_PLAY && ladder_read(&adc_ladder[LAD_TRACKS]) < 110) || !g_playing || g_slot_switch_req)) br_release();   /* BEATREP-749 / BRBNC-758 / BRBNC2-761: the ladder IDLE (PLAY lifted, no chord in flight) or the song stopped / switched = release; the bounce chord (PLAY + track reads as one value) and a recording do NOT end it */
 			if (vcommit == VOL_NONE) _rt_swallow = 0;
 			g_vol_pair = _rt_swallow;   /* MUTEFIX3-741 */
 			{
@@ -15022,7 +15218,7 @@ int main(void)
 				static uint32_t dclick_base;    /* the speed BEFORE that click */
 				/* tempo LOCKED while a take is in flight: a mid-take speed
 				 * glide records the warp into the loop (tape-bend artifact) */
-				int dir = (g_rec_track >= 0 || _rt_hold) ? 0 :   /* BEATREP-749: the rocker under PLAY is the repeat, not the tempo */
+				int dir = ((g_rec_track >= 0 && !g_bnc_on) || _rt_hold) ? 0 :   /* BEATREP-749: the rocker under PLAY is the repeat, not the tempo; SPEEDBAKE-768: free during a bounce */
 					  (vcommit == VOL_TEMPO_UP) ? 1 :
 					  (vcommit == VOL_TEMPO_DOWN) ? -1 : 0;
 				int step = 0;
