@@ -1061,6 +1061,7 @@ static uint32_t          g_grid_tick_prev;     /* the tape tick index at the las
 static uint8_t           g_grid_tick_ok;       /* tick_prev is valid (same regime, no jump) */
 static uint8_t           g_grid_src;           /* 0 none, 1 tape-derived, 2 tapped clock (diag + regime edge) */
 static volatile uint8_t  g_grid_punch_k;       /* beat-in-bar of the scheduled punch line (first take -> O) */
+static volatile uint8_t  g_grid_bib;           /* BEATSPB-824: beat-in-bar 0..u-1, published by the service */
 static volatile uint64_t g_grid_o_req_w;       /* controls thread: "the 1 is at this wall frame" (a tap) */
 static volatile uint8_t  g_grid_o_req;         /* ... pending; the service converts it with coherent (W, P) */
 static volatile uint32_t g_grid_lap_tk;        /* diag: ticks emitted in the last completed lap (must read 24n) */
@@ -1109,6 +1110,33 @@ struct grid_ext3 {
 };
 BUILD_ASSERT(GRID_EXT2_OFF + sizeof(struct grid_ext2) <= GRID_EXT3_OFF, "grid ext3 must follow ext2");
 BUILD_ASSERT(GRID_EXT3_OFF + sizeof(struct grid_ext3) <= 512, "grid ext3 must fit block 2's tail");
+/* BEATSPB-824: BEATS PER BAR, per song. 0 = unset = 4 -- the ONE canonical spelling of
+ * "four", so an old card, a cleared grid and a reset control all agree without a second
+ * representation to keep in sync. Only 2, 3 and 6 are ever stored. */
+static volatile uint8_t g_grid_bpb[NUM_SLOTS];
+#define GRID_EXT4_OFF   456u
+#define GRID_EXT4_MAGIC 0x34445247u   /* 'GRD4' */
+struct grid_ext4 {
+	uint32_t magic;
+	uint8_t  bpb[NUM_SLOTS];
+	uint16_t sum;                 /* over bpb */
+};
+BUILD_ASSERT(GRID_EXT3_OFF + sizeof(struct grid_ext3) <= GRID_EXT4_OFF, "grid ext4 must follow ext3");
+BUILD_ASSERT(GRID_EXT4_OFF + sizeof(struct grid_ext4) <= 512, "grid ext4 must fit block 2's tail");
+/* THE ONE PLACE THAT DECIDES WHAT A BAR IS. Every site below calls this; none of them
+ * repeats the default or the whitelist. W349: one law, one definition -- the tree gate
+ * counts the call sites, so a new reader that forgets is a build failure, not a bug. */
+static inline uint32_t grid_bpb(void)
+{
+	const uint8_t b = (g_slot < NUM_SLOTS) ? g_grid_bpb[g_slot] : 0u;
+	return (b == 2u || b == 3u || b == 6u) ? (uint32_t)b : 4u;
+}
+static uint16_t grid_ext4_sum(const struct grid_ext4 *e)
+{
+	uint16_t sum = 0;
+	for (uint32_t i = 0; i < NUM_SLOTS; i++) sum = (uint16_t)(sum + e->bpb[i]);
+	return sum;
+}
 static uint16_t grid_ext3_sum(const struct grid_ext3 *e)
 {
 	const uint8_t *b = (const uint8_t *)&e->n[0];
@@ -1142,6 +1170,13 @@ static void __attribute__((noinline)) grid_ext2_store(uint8_t *blk)
 		for (uint32_t i = 0; i < NUM_SLOTS; i++) { e3->n[i] = g_grid_n[i]; e3->o[i] = g_grid_o[i]; }
 		e3->sum = grid_ext3_sum(e3);
 	}
+	{	/* BEATSPB-824: GRD4 */
+		struct grid_ext4 *e4 = (struct grid_ext4 *)(blk + GRID_EXT4_OFF);
+		memset(e4, 0, sizeof(*e4));
+		e4->magic = GRID_EXT4_MAGIC;
+		for (uint32_t i = 0; i < NUM_SLOTS; i++) e4->bpb[i] = g_grid_bpb[i];
+		e4->sum = grid_ext4_sum(e4);
+	}
 }
 static void __attribute__((noinline)) grid_ext2_load(const uint8_t *blk)
 {
@@ -1156,6 +1191,14 @@ static void __attribute__((noinline)) grid_ext2_load(const uint8_t *blk)
 		const struct grid_ext3 *e3 = (const struct grid_ext3 *)(blk + GRID_EXT3_OFF);
 		if (e3->magic == GRID_EXT3_MAGIC && grid_ext3_sum(e3) == e3->sum)
 			for (uint32_t i = 0; i < NUM_SLOTS; i++) { g_grid_n[i] = e3->n[i]; g_grid_o[i] = e3->o[i]; }
+	}
+	{	/* BEATSPB-824: GRD4 (an older card: all zero -> every song is 4 beats to the bar) */
+		const struct grid_ext4 *e4 = (const struct grid_ext4 *)(blk + GRID_EXT4_OFF);
+		if (e4->magic == GRID_EXT4_MAGIC && grid_ext4_sum(e4) == e4->sum)
+			for (uint32_t i = 0; i < NUM_SLOTS; i++) {
+				const uint8_t b = e4->bpb[i];
+				g_grid_bpb[i] = (b == 2u || b == 3u || b == 6u) ? b : 0u;   /* whitelist, like the preset's */
+			}
 	}
 }
 static volatile uint64_t g_grid_next_tick;
@@ -3645,7 +3688,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 4\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 2\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -5558,7 +5601,7 @@ static void __attribute__((noinline)) pa_armed(int rt_i, int16_t lsamp, uint32_t
 				g_gridrec_beat_samps = (uint32_t)
 					(((uint64_t)g_grid_beat_frames *
 					  g_cur_speed_q16) >> 16);
-			g_grid_punch_k = (uint8_t)(((g_grid_punch_at - g_grid_anchor_e) / g_grid_beat_frames) & 3u);
+			g_grid_punch_k = (uint8_t)(((g_grid_punch_at - g_grid_anchor_e) / g_grid_beat_frames) % grid_bpb());   /* BEATSPB-824 */
 			g_gridrec = 1;
 			if (g_loop_len == 0u && !g_grid_fresh) {
 				/* M8b-r2: your first loop IS the
@@ -10272,7 +10315,7 @@ static void __attribute__((noinline)) grid_adopt_loop(uint32_t beats, uint32_t s
 	 * old firmware or a migration reads). */
 	if (g_slot >= NUM_SLOTS || !g_loop_len || !beats || beats > 255u) return;
 	const uint32_t L = g_loop_len, B = (L + beats / 2u) / beats;
-	const uint32_t back = (uint32_t)(((uint64_t)(k & 3u) * B) % L);
+	const uint32_t back = (uint32_t)(((uint64_t)(k % grid_bpb()) * B) % L);   /* BEATSPB-824 (k is already reduced at the punch; the second reduction is deliberate, W350) */
 	g_grid_n[g_slot] = (uint8_t)beats;
 	g_grid_o[g_slot] = (start_samps % L + L - back) % L;
 	g_grid_bpm_q8[g_slot] = (uint16_t)((48000ULL * 60u * 256u * beats) / L);
@@ -10323,7 +10366,13 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 		const uint32_t bf = g_gf_bf;                                    /* wall frames a beat at this speed */
 		const uint32_t phf = (uint32_t)((frac * bf) / L);                /* wall frames into the beat */
 		g_grid_beat_frames = bf;
-		g_grid_anchor_e = g_sample_clock - ((uint64_t)(beat & 3u) * bf + phf);   /* modular: (now - anchor_e) = the bar phase */
+		{	/* BEATSPB-824: the bar is u beats, u from grid_bpb(). When u does not divide n the
+			 * last bar of the lap is SHORT: the tape's own 1 wins and the count restarts there,
+			 * which is what a splice does. The 1 never moves. */
+			const uint32_t _u = grid_bpb();
+			g_grid_bib = (uint8_t)(beat % _u);
+			g_grid_anchor_e = g_sample_clock - ((uint64_t)g_grid_bib * bf + phf);   /* modular: (now - anchor_e) = the bar phase */
+		}
 		g_gridrec_beat_samps = (L + n / 2u) / n;
 		g_beat_samples = g_gridrec_beat_samps;
 		g_midi_div = g_gridrec_beat_samps / 24u;
@@ -10363,6 +10412,9 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 	g_grid_o_req = 0u;
 	g_grid_src = 2u;
 	g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716: once a block, for every reader */
+	if (g_grid_beat_frames) {   /* BIBPUB-826: publish bib on the TAPPED clock too, so the GR line never prints a stale one */
+		g_grid_bib = (uint8_t)(((g_sample_clock - g_grid_anchor_e) / g_grid_beat_frames) % grid_bpb());
+	}
 	if (!g_grid_beat_frames) return;
 wall_ticks:
 	{	/* M22-A: EXACT tick schedule. beat/24 truncates (937.5 -> 937 at 128 BPM) and
@@ -11248,9 +11300,9 @@ static void controls_diag(void)
 		       (unsigned)(((uint32_t)g_ec_mix * 166u) >> 8), (unsigned)g_ec2_w,   /* ECHO2-610: fb q8 + line index */
 		       (unsigned)g_pg_route[1], (unsigned)g_pg_route[2], (unsigned)g_pg_route[3], (unsigned)g_pg_route[4],
 		       (unsigned)g_mon_mute, (unsigned)g_in_blk, (unsigned)g_inw_blk);   /* INFX-672 */
-		printk("GR,src=%u,n=%u,o=%u,L=%u,bf=%u,tk=%u,lap=%u\n",   /* GRIDCORE-733: 1 = the tape is the clock, 2 = the tapped clock; beats in the loop; the 1; loop_len; the wall beat now; tick index; ticks in the last lap (= 24n) */
+		printk("GR,src=%u,n=%u,o=%u,L=%u,bf=%u,tk=%u,lap=%u,u=%u,bib=%u\n",   /* GRIDCORE-733: 1 = the tape is the clock, 2 = the tapped clock; beats in the loop; the 1; loop_len; the wall beat now; tick index; ticks in the last lap (= 24n) */
 		       (unsigned)g_grid_src, (unsigned)((g_slot < NUM_SLOTS) ? g_grid_n[g_slot] : 0u), (unsigned)((g_slot < NUM_SLOTS) ? g_grid_o[g_slot] : 0u),
-		       (unsigned)g_loop_len, (unsigned)g_grid_beat_frames, (unsigned)g_grid_tick_prev, (unsigned)g_grid_lap_tk);
+		       (unsigned)g_loop_len, (unsigned)g_grid_beat_frames, (unsigned)g_grid_tick_prev, (unsigned)g_grid_lap_tk, (unsigned)grid_bpb(), (unsigned)g_grid_bib);   /* BEATSPB-824 */
 		printk("BK,p=%u,s=%u,l=%u,c=%u,b=%u,n=%u\n",   /* BAKE-619/TRUE-621: prints baked, last speed q16, last len (baked blocks), capped, blocks this print, loop chosen at the stop */
 		       (unsigned)g_bk_prints, (unsigned)g_bk_last_spd, (unsigned)g_bk_len,
 		       (unsigned)g_bk_capped, (unsigned)g_bk_blocks, (unsigned)g_bk_len);
@@ -11766,7 +11818,8 @@ static void __attribute__((noinline)) br_release(int roll)
 			const uint32_t c_rol = chop_phase(i, t->start_blk, pwbc, gb, cyc, spb);   /* where the tape is (CHOPANCHOR-805) */
 			uint32_t raw = ((c_rol + cyc - c_rep) % cyc) * spb;                 /* the hold, in loop samples */
 			const uint32_t n = (uint32_t)g_grid_n[g_slot];
-			const uint32_t u = (n % 4u == 0u) ? 4u : (n % 3u == 0u) ? 3u : (n % 2u == 0u) ? 2u : 1u;   /* a bar, in beats */
+			uint32_t u = grid_bpb();   /* BEATSPB-824: the STORED bar, not a guess. 804's ladder tried %% 4 first, so a 12/24/48-beat waltz always took the 4 branch -- the one input it existed to serve. */
+			if (u > n) u = n;          /* a bar can never be longer than the loop it rounds inside */
 			const uint32_t unit = (uint32_t)(((uint64_t)g_loop_len * u) / n);
 			if (unit) raw = ((raw + unit / 2u) / unit) * unit;   /* NEAREST bar: a short stutter rounds to 0 and lands in time */
 			if (raw) g_br_shift = (uint32_t)(((uint64_t)g_br_shift + raw) % g_loop_len);
@@ -12265,7 +12318,7 @@ static uint32_t bipolar_depth(uint32_t v)
  * read it, so it costs nothing anywhere else. */
 static uint8_t g_led_fl_n[4], g_led_fl_t[4];   /* flashes left; ticks into the current phase */
 static uint8_t g_led_fl_long[4];               /* LEDFLASH-791: this sequence is the OFF sign, one long blink */
-#define LED_FL_TICKS 5u                         /* LEDFLASH-791: 40 ms phases (was 10 = 80 ms): a 3-count in ~240 ms */
+#define LED_FL_TICKS 18u   /* LEDSLOW3-825 (marc 09-15: "twice as slow as they are now so you can easily count"), amending LEDFLASH-791: 144 ms phases at the ~8 ms LED tick, so a 3-count reads in ~864 ms -- countable at a glance. The ladder was 791's 40 ms, then 56 (823), then 72 (824); each was still too quick to count. ONE constant drives every lane's count flash, so the FX tap cycles and page 7's confirm are the same speed by construction. 791 took this 10 -> 5 because an 80 ms phase was unreadable; 40 ms reads as a flicker now the cycles are short and have no OFF slot. 7 is the middle, not a revert to the value that felt wrong. */
 #define LED_FL_LONG_TICKS 25u                   /* LEDFLASH-791: the OFF blink, 200 ms on */
 static void led_flash_lane(int i, uint32_t count)
 {
@@ -12400,7 +12453,7 @@ static void led_service(void)
 		int _gb7 = -1, _ob7 = 0;
 		if (g_grid_active && g_grid_beat_frames) {
 			const uint64_t _ph7 = g_sample_clock - g_grid_anchor_e;
-			_gb7 = (int)((_ph7 / g_grid_beat_frames) & 3u);
+			_gb7 = (int)((_ph7 / g_grid_beat_frames) % grid_bpb());   /* BEATSPB-824 */
 			_ob7 = ((uint32_t)(_ph7 % g_grid_beat_frames) < g_grid_beat_frames / 8u);
 		}
 		if (g_sec_led) {
@@ -12452,12 +12505,15 @@ static void led_service(void)
 		 * carries on. The walker steps ~9x faster than the beat, so a
 		 * catch inside one bounce is certain; 48 is only a floor. */
 		uint32_t sstep = (uint32_t)(48u - g_snap_sweep) / 2u;
-		uint32_t sp_   = sstep % 6u;
-		uint32_t lit   = (sp_ <= 3u) ? sp_ : (6u - sp_);
+		/* SNAPSPAN-826: the walker spans the BAR, not the row. span 4 reproduces M23 exactly. */
+		uint32_t span  = grid_bpb(); if (span > (uint32_t)NUM_TRACK_LEDS) span = (uint32_t)NUM_TRACK_LEDS; if (span < 2u) span = 2u;
+		uint32_t per_  = span * 2u - 2u;
+		uint32_t sp_   = sstep % per_;
+		uint32_t lit   = (sp_ < span) ? sp_ : (per_ - sp_);
 		int sgb = -1;
 		if (g_grid_active && g_grid_beat_frames)
 			sgb = (int)(((g_sample_clock - g_grid_anchor_e) /
-				g_grid_beat_frames) & 3u);
+				g_grid_beat_frames) % grid_bpb());   /* BEATSPB-824 */
 		for (int i = 0; i < NUM_TRACK_LEDS; i++)
 			((uint32_t)i == lit) ? track_led_on(i) : track_led_off(i);
 		if (sstep >= 6u && sgb >= 0 && (uint32_t)sgb == lit) g_snap_sweep = 0;
@@ -12490,7 +12546,7 @@ static void led_service(void)
 		if (g_grid_active && g_grid_beat_frames) {
 			uint64_t ph = g_sample_clock - g_grid_anchor_e;
 			uint32_t bf = g_grid_beat_frames;
-			gbeat  = (int)((ph / bf) & 3u);
+			gbeat  = (int)((ph / bf) % grid_bpb());   /* BEATSPB-824 */
 			on_beat = ((uint32_t)(ph % bf) < bf / 8u);  /* grid outranks
 			                                             * the take beat */
 		}
@@ -12662,7 +12718,7 @@ static uint32_t take_preset_samps(void)
 		if (!g_grid_active || !g_grid_beat_frames) return 0u;
 		const uint64_t rs = ((uint64_t)g_grid_beat_frames * g_cur_speed_q16) >> 16;
 		if (!rs) return 0u;
-		t = rs * 4u * n;
+		t = rs * grid_bpb() * n;   /* BEATSPB-824: n BARS, and a bar is u beats */
 	}
 	return (t == 0u || t >= (uint64_t)MAX_LOOP_SAMPLES) ? 0u : (uint32_t)t;
 }
@@ -13884,6 +13940,7 @@ int main(void)
 						} else if (g_pg_open && g_pg_id == 7u) {   /* PAGE7V-718: on page 7 the chord resets the page */
 							if (g_slot < NUM_SLOTS) {
 								g_grid_off_q8[g_slot] = 0; g_take_preset[g_slot] = 0u;
+								g_grid_bpb[g_slot] = 0u;   /* BEATSPB-824: back to 4 -- the page's reset owns every control the page sets */
 								g_grid_dirty_ms = k_uptime_get_32() | 1u;
 							}
 							for (int _k = 0; _k < NTRK; _k++) { nudge_set(_k, 128u); g_fx_pick[_k] = 1; g_fx_lastq[_k] = -1; }
@@ -14357,6 +14414,7 @@ int main(void)
 					 * at any sane BPM (469 ms at 128). */
 					g_grid_bpm_q8[g_slot] = 0;
 					g_grid_n[g_slot] = 0u; g_grid_o[g_slot] = 0u;   /* GRIDCORE-733: the tape grid goes with it */
+					g_grid_bpb[g_slot] = 0u;   /* BEATSPB-824: and so does the bar -- a cleared song must not keep a 3 nothing on the panel explains */
 					g_grid_off_q8[g_slot] = 0;   /* NUDGE-717: the offset goes with the grid (the tail rides the same save) */
 					g_gridrec_beat_samps = 0;    /* LOCKLOAD-725: no grid, no stored beat */
 					g_grid_active = 0;
@@ -15141,7 +15199,7 @@ int main(void)
 						if (ti == 2) g_awh_amt = 0u;
 						/* ECHO-572: T4 cycles the delay division, exactly as the
 						 * trance gate's T4 cycles its pattern. One page, one rule. */
-						if (ti == 3) { g_ec_div = (uint8_t)((g_ec_div + 1u) % 4u); g_lane_per[1] = 0u; led_flash_lane(ti, (g_ec_div < 3u) ? (uint32_t)g_ec_div + 1u : 0u); }   /* A4 (660): 1/16 -> dotted -> 1/8 -> OFF; 661/664: count the division, not OFF */
+						if (ti == 3) { g_ec_div = (uint8_t)((g_ec_div + 1u) % 3u); g_lane_per[1] = 0u; led_flash_lane(ti, (uint32_t)g_ec_div + 1u); }   /* NOOFF-821 (marc 09-15): 1/16 -> dotted -> 1/8. A tap is EITHER a fast kill OR a cycle of real values -- never a cycle with a hole in it. The kill is the fader at the bottom, which always works. */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
 					} else if (g_pg_open && g_pg_id == 1u && g_rec_track < 0 &&
@@ -15152,10 +15210,10 @@ int main(void)
 						 * this rung; the others land with their kernels. */
 						if (ti == 0) g_flt_pos = 128u;   /* bypass -- the fast kill (marc 09-05) */
 						if (ti == 1) g_chr_mix = 0u;     /* FX2-550: dry   */
-						if (ti == 2) { g_dst_typ = (uint8_t)((g_dst_typ + 1u) % 4u); led_flash_lane(ti, (g_dst_typ < 3u) ? (uint32_t)g_dst_typ + 1u : 0u); }   /* A5 (660): soft -> hard -> fold -> OFF; 661/664: count the type, not OFF */
+						if (ti == 2) { g_dst_typ = (uint8_t)((g_dst_typ + 1u) % 3u); led_flash_lane(ti, (uint32_t)g_dst_typ + 1u); }   /* NOOFF-821: soft -> hard -> fold, no OFF slot */
 						if (ti == 3) {                   /* TG-551: next pattern */
-							g_gat_pat = (uint8_t)((g_gat_pat + 1u) % 3u);
-							led_flash_lane(ti, (g_gat_pat < 2u) ? (uint32_t)g_gat_pat + 1u : 0u);   /* 661/664: count the pattern; OFF just goes dark */
+							g_gat_pat = (uint8_t)((g_gat_pat + 1u) % 2u);   /* NOOFF-821: gallop -> halves, no OFF slot */
+							led_flash_lane(ti, (uint32_t)g_gat_pat + 1u);   /* 661/664: count the pattern; OFF just goes dark */
 							g_gat_g = 4096;   /* Q12 unity. The old 256 here was a
 							                   * Q8 constant in a Q12 gain and cut
 							                   * the output by 24 dB on every tap. */
@@ -15166,7 +15224,7 @@ int main(void)
 					    !armed_press[ti]) {
 						/* A5: page 3 tap = the lane's DIVISION (beat -> half -> quarter) and
 						 * it clears a tapped rate; the fader to the bottom is the kill. */
-						if (ti < 3) { g_lfo_div[ti] = (uint8_t)((g_lfo_div[ti] + 1u) % 4u); g_lane_per[2 + ti] = 0u; led_flash_lane(ti, (g_lfo_div[ti] < 3u) ? (uint32_t)g_lfo_div[ti] + 1u : 0u); }   /* 660: beat -> half -> quarter -> OFF; 661/664: count the division, not OFF */
+						if (ti < 3) { g_lfo_div[ti] = (uint8_t)((g_lfo_div[ti] + 1u) % 3u); g_lane_per[2 + ti] = 0u; led_flash_lane(ti, (uint32_t)g_lfo_div[ti] + 1u); }   /* NOOFF-821: beat -> half -> quarter, no OFF slot */
 						if (ti == 3) g_rv_mix = 0u;   /* REVERB-676: the kill */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
@@ -15213,6 +15271,9 @@ int main(void)
 							} else if (ti == 1 && g_take_preset[g_slot]) {
 								g_take_preset[g_slot] = 0u; g_grid_dirty_ms = k_uptime_get_32() | 1u;
 								g_fx_pick[1] = 1; g_fx_lastq[1] = -1;
+							} else if (ti == 2 && g_grid_bpb[g_slot]) {
+								g_grid_bpb[g_slot] = 0u; g_grid_dirty_ms = k_uptime_get_32() | 1u;   /* BEATSPB-824: back to four */
+								g_fx_pick[2] = 1; g_fx_lastq[2] = -1;
 							}
 						}
 						tap_deadline[ti] = 0;
@@ -15536,7 +15597,7 @@ int main(void)
 						if (g_pg_id == 7u && *_tab == 0u) *_tab = 128u;   /* unset reads as centre */
 						if (!sec_on[fi]) { sec_on[fi] = 1; sec_q0[fi] = (int)q; sec_moved[fi] = 0; sec_base[fi] = (int)*_tab; }
 						int _d = (int)q - sec_q0[fi];
-						if (!sec_moved[fi] && (_d >= 3 || _d <= -3)) {
+						if (!sec_moved[fi] && (_d >= 7 || _d <= -7)) {   /* SECGATE-822: M31's intent gate (3 -> 7, ~2.7 % of travel). 3 sat under the measured drift of a loose fader, so a bump during a TAP spent the press and the cycle never fired. */
 							sec_moved[fi] = 1;
 							armed_press[_held] = 1;   /* spend the press: its release is not the kill */
 							tap_deadline[_held] = 0;
@@ -15590,7 +15651,7 @@ int main(void)
 							else if (fi == 1) g_rng_amt = (uint8_t)_q8;
 							else if (fi == 2) g_awh_amt = (uint8_t)_q8;
 							else              g_ec_mix = (uint8_t)_q8;   /* ECHO-572 */
-							if (fi == 3 && _q8 > 0 && g_ec_div >= 3u) { g_ec_div = 0u; led_flash_lane(fi, 1u); }   /* OFFWAKE-697: the fader wakes an OFF lane */
+							/* NOOFF-821: OFFWAKE-697 deleted -- no OFF slot left to wake from. It tested the fader POSITION, not movement, so it re-fired on every scan and made OFF unreachable. */
 						}
 					} else if (g_pg_open && g_pg_id == 1u) {
 						/* FXP-547: THE FX PAGE OWNS THE FADERS while it is
@@ -15618,12 +15679,12 @@ int main(void)
 						if (!g_fx_pick[fi] && fi == 3) {
 							g_gat_amt = (uint8_t)_q8;   /* FX2-550:
 							 * fader 4 = gate threshold; bottom = open */
-							if (_q8 > 0 && g_gat_pat >= 2u) { g_gat_pat = 0u; g_gat_g = 4096; led_flash_lane(fi, 1u); }   /* OFFWAKE-697 */
+							/* NOOFF-821: OFFWAKE-697 deleted -- no OFF slot left to wake from. It tested the fader POSITION, not movement, so it re-fired on every scan and made OFF unreachable. */
 						}
 						if (!g_fx_pick[fi] && fi == 2) {
 							g_dst_amt = (uint8_t)_q8;   /* DST-548:
 							 * fader 3 = drive; bottom = clean */
-							if (_q8 > 0 && g_dst_typ >= 3u) { g_dst_typ = 0u; led_flash_lane(fi, 1u); }   /* OFFWAKE-697 */
+							/* NOOFF-821: OFFWAKE-697 deleted -- no OFF slot left to wake from. It tested the fader POSITION, not movement, so it re-fired on every scan and made OFF unreachable. */
 						}
 						if (!g_fx_pick[fi] && fi == 0)
 							g_flt_pos = (uint8_t)_q8;   /* ONE filter,
@@ -15632,10 +15693,13 @@ int main(void)
 					} else if (g_pg_open && g_pg_id == 7u) {
 						/* STACKT-716: page 7 owns the faders -- F1 = the downbeat
 						 * offset (bipolar, +-1/2 beat), F2 = the preset take length
-						 * (off / 1 / 2 / 4 / 8), F3/F4 nothing; the pickup law (W155). */
-						if (fi < 2 && g_slot < NUM_SLOTS) {
+						 * (off / 1 / 2 / 4 / 8), F3 = BEATS PER BAR (BEATSPB-824: 2 / 3 / 4 / 6),
+						 * F4 nothing; the pickup law (W155). */
+						if (fi < 3 && g_slot < NUM_SLOTS) {
 							const uint8_t _cur = g_take_preset[g_slot];
+							const uint32_t _ubar = grid_bpb();   /* BEATSPB-824 */
 							uint8_t _pv = (fi == 0) ? (uint8_t)((int)g_grid_off_q8[g_slot] + 128)
+							            : (fi == 2) ? ((_ubar == 2u) ? 32u : (_ubar == 3u) ? 96u : (_ubar == 6u) ? 224u : 160u)   /* BEATSPB-824: the centre of this value's band */
 							            : (_cur == 8u) ? 230u : (_cur == 4u) ? 178u : (_cur == 2u) ? 127u : (_cur == 1u) ? 76u : 0u;
 							int _q8 = (int)((q > 255u) ? 255u : q);
 							if (g_fx_pick[fi]) {
@@ -15650,11 +15714,21 @@ int main(void)
 								if (fi == 0) {
 									int _o = (_q8 >= 120 && _q8 <= 136) ? 0 : (_q8 - 128);
 									if (_o != (int)g_grid_off_q8[g_slot]) { g_grid_off_q8[g_slot] = (int8_t)_o; g_grid_dirty_ms = k_uptime_get_32() | 1u; }
-								} else {
+								} else if (fi == 1) {
 									uint8_t _n = (_q8 < 51) ? 0u : (_q8 < 102) ? 1u : (_q8 < 153) ? 2u : (_q8 < 204) ? 4u : 8u;
 									if (_n != _cur) {
 										g_take_preset[g_slot] = _n; g_grid_dirty_ms = k_uptime_get_32() | 1u;
 										led_flash_lane(1, (_n == 8u) ? 4u : (_n == 4u) ? 3u : (_n == 2u) ? 2u : (_n == 1u) ? 1u : 0u);   /* PAGE7V-718 */
+									}
+								} else {
+									/* BEATSPB-824: F3 = BEATS PER BAR, detented 2 / 3 / 4 / 6. Pure labelling --
+									 * no audio moves, nothing is re-recorded, and it can be changed before or
+									 * after the take. 4 stores as 0 so "unset" and "four" stay one thing. */
+									const uint32_t _u = (_q8 < 64) ? 2u : (_q8 < 128) ? 3u : (_q8 < 192) ? 4u : 6u;
+									if (_u != _ubar) {
+										g_grid_bpb[g_slot] = (uint8_t)((_u == 4u) ? 0u : _u);
+										g_grid_dirty_ms = k_uptime_get_32() | 1u;
+										led_flash_lane(2, _u);   /* BPBFLASH-825: flash the BEATS, not the detent index -- 3 beats is three flashes */
 									}
 								}
 							}
@@ -15728,7 +15802,7 @@ int main(void)
 							else if (fi == 1) g_swp_amt = (uint8_t)_q8;
 							else if (fi == 2) g_trm_amt = (uint8_t)_q8;
 							else              g_rv_mix  = (uint8_t)_q8;   /* REVERB-676: page 3 fader 4 */
-							if (fi < 3 && _q8 > 0 && g_lfo_div[fi] >= 3u) { g_lfo_div[fi] = 0u; led_flash_lane(fi, 1u); }   /* OFFWAKE-697 */
+							/* NOOFF-821: OFFWAKE-697 deleted -- no OFF slot left to wake from. It tested the fader POSITION, not movement, so it re-fired on every scan and made OFF unreachable. */
 						}
 					} else if (!g_fh_latch[fi])
 						trk[fi].vol_q8 = (uint16_t)q;
