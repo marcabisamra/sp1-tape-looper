@@ -1129,7 +1129,7 @@ BUILD_ASSERT(GRID_EXT4_OFF + sizeof(struct grid_ext4) <= 512, "grid ext4 must fi
 static inline uint32_t grid_bpb(void)
 {
 	const uint8_t b = (g_slot < NUM_SLOTS) ? g_grid_bpb[g_slot] : 0u;
-	return (b == 2u || b == 3u || b == 6u) ? (uint32_t)b : 4u;
+	return (b == 3u || b == 5u || b == 7u) ? (uint32_t)b : 4u;   /* BPBSET-833: 3/4/5/7. 4 is still spelled 0 (the one canonical four), so it is the fallback, not a whitelist entry. */
 }
 static uint16_t grid_ext4_sum(const struct grid_ext4 *e)
 {
@@ -1197,7 +1197,7 @@ static void __attribute__((noinline)) grid_ext2_load(const uint8_t *blk)
 		if (e4->magic == GRID_EXT4_MAGIC && grid_ext4_sum(e4) == e4->sum)
 			for (uint32_t i = 0; i < NUM_SLOTS; i++) {
 				const uint8_t b = e4->bpb[i];
-				g_grid_bpb[i] = (b == 2u || b == 3u || b == 6u) ? b : 0u;   /* whitelist, like the preset's */
+				g_grid_bpb[i] = (b == 3u || b == 5u || b == 7u) ? b : 0u;   /* BPBSET-833: the load's whitelist IS the reachable set -- a stored 2 or 6 (only marc's own 826-831 test songs can hold one) reads back as 4 rather than becoming a value the panel cannot return to (W362) */
 			}
 	}
 }
@@ -2129,10 +2129,20 @@ static uint8_t           g_arm_gsh_prev;    /* the target's print gain before AN
  * be left uninitialised by a call that never happens. */
 static volatile uint8_t g_tp_drive = 0u;
 static volatile uint8_t g_tp_tone  = 128u;   /* 128 = flat */
-static volatile uint8_t g_tp_hiss  = 128u;   /* HISS2-701: bipolar -- 128 = off, above = the cassette hiss, below = vinyl crackle */
+static volatile uint8_t g_tp_hiss  = 0u;     /* NSRC-707: unipolar level again (701's bipolar centre is gone); the SOURCE is the T3 cycle */
+static volatile uint8_t g_tp_nsrc;           /* NSRC-707: 0 cassette, 1 vinyl, 2 pink, 3 minidisc -- page-4 T3 cycle */
+static volatile uint8_t g_stopfx;            /* STOPFX-837: what the FX do when the tape stops. 0 = today (default, so old cards are right), 1 = natural (transport artefacts only), 2 = all. Site-owned, bits 2-3 of meta.led_full. */
+static uint16_t g_tp_mddur;                  /* NSRC-707: blocks left in the current minidisc event */
+static int32_t  g_tp_cenv, g_tp_cg = 32768;  /* COMP-709: the compressor's envelope and per-frame gain (q15) */
 static volatile uint8_t g_tp_wob   = 0u;
 static int32_t  g_tp_toneL, g_tp_toneR;      /* tilt one-pole state */
-static int32_t  g_tp_ck1, g_tp_ck2;          /* HISS2-701: the crackle resonator (two-pole, ~2.4 kHz, ~1.2 ms) */
+static int32_t  g_tp_ck1, g_tp_ck1R;         /* CRACK-836: the two NOISE ENVELOPES. There is no resonator here any more -- a rung resonator is a pitched instrument, which is why every earlier crackle had a note in it. */
+static int32_t  g_tp_ck2,  g_tp_cka1L;       /* CRACK-836: the LEFT band -- a 1.9 kHz one-pole and a 240 Hz one-pole, subtracted. No Q, no peak, no pole to hear. */
+static int32_t  g_tp_ck2R, g_tp_cka1R;       /* CRACK-836: the RIGHT band, the SAME band: every pop is the same tone (marc) */
+static uint16_t g_tp_embL;                   /* CRACK-836: the ember -- a light nudge so the spacing is uneven rather than metronomic */
+static int32_t  g_tp_ckbx;                   /* CRACK-836: the amplitude this pop starts at (both sides share it: one pop) */
+static uint32_t g_tp_ckx = 2654435769u;      /* CRACK-836: the RIGHT channel's own XORSHIFT32 stream. It cannot be the next LCG draw -- consecutive LCG draws are lattice-correlated (measured L/R +0.63, i.e. the two sides were half the same noise). MUST be non-zero or xorshift is dead. */
+static uint8_t  g_tp_ckdL, g_tp_ckdR;        /* CRACK-836: the lag of the trailing side, 0.25..0.9 ms -- shorter than 835's, because a broadband transient turns into an echo much sooner than a tonal one */
 static uint16_t g_tp_hsi;                    /* FXCOST-578: hiss table index */
 #define TP_HISS_N     16384u
 #define TP_HISS_MASK  (TP_HISS_N - 1u)
@@ -3238,6 +3248,7 @@ static uint32_t g_wb_fltph = 0x40000000u;    /* the quarter-cycle offset */
 static uint32_t g_wb_rng   = 0x1234567u;
 static int32_t  g_wb_wnse, g_wb_fnse;
 static int32_t  g_wb_off, g_wb_tgt;          /* Q16 read offset, ramped */
+static volatile uint8_t g_wb_typ;            /* WOBTYP-703 + TAPE4-834: 0 both, 1 wow, 2 flutter. NO OFF (NOOFF-821): fader 4 is the kill. */
 
 #define WOB_BASE_SAMP   340          /* TUNE3-577: must exceed peak wobble (300+32) */
 #define WOB_WOW_PEAK    (300 << 16)   /* TUNE3-577: 3.1% / 54 cents at 0.8 Hz (marc: exaggerate) */
@@ -3348,13 +3359,21 @@ static volatile uint8_t g_eq_g[4] = { 128u, 128u, 128u, 128u };
 static volatile uint8_t g_eq_live;
 /* SEC-695: the secondary layer. g_sec[page-1][lane], pages 1-4; the defaults
  * reproduce the kernels as they were before the layer existed. */
-#define SEC_DEF { { 128u, 128u, 128u, 128u }, { 128u, 128u, 128u, 166u }, { 128u, 128u, 128u, 179u }, { 128u, 128u, 128u, 128u } }
+#define SEC_DEF { { 128u, 128u, 128u, 128u }, { 128u, 128u, 128u, 166u }, { 128u, 128u, 128u, 179u }, { 128u, 0u, 128u, 128u } }   /* COMP-709: page-4 lane 2 = comp, off by default */
 static volatile uint8_t g_sec[4][4] = SEC_DEF;
 /* SHAPE-696: the THIRD control -- hold TN + the fader to its right. g_sec2[page-1][lane];
  * wired: page 3 lane 3 (tremolo) = stereo spread (default 0 = mono tremolo). */
 static volatile uint8_t g_sec2[4][4];
 static volatile uint8_t g_sec_led;   /* 1..4 = that lane's LED shows its secondary (a hold is on) */
 static volatile uint8_t g_sec_led2;  /* SHAPE-696: 1 = the LED shows the third control instead */
+/* SECKILL-839: one lane back to factory. Reads the SAME SEC_DEF sec_reset() reads, because
+ * the defaults are NOT all 128 -- echo feedback is 166 and reverb damping is 179, and a
+ * hardcoded neutral here would retune the effect it claims to be resetting. */
+static void sec_lane_default(uint32_t _p, uint32_t _l)
+{
+	static const uint8_t _d[4][4] = SEC_DEF;
+	if (_p < 4u && _l < 4u) { g_sec[_p][_l] = _d[_p][_l]; g_sec2[_p][_l] = 0u; }
+}
 static void sec_reset(void)
 {
 	static const uint8_t _d[4][4] = SEC_DEF;
@@ -3475,7 +3494,8 @@ static void fx_reset_all(void)
         for (int _b = 0; _b < 4; _b++) g_eq_g[_b] = 128u;   /* EQ-691: flat; the chain ramps down */
         sec_reset();   /* SEC-695 */
         g_eq_live = 1u;
-        g_tp_drive = 0u;  g_tp_tone = 128u;  g_tp_hiss = 128u;  g_tp_wob = 0u;   /* HISS2-701: the hiss rests at centre */
+        g_tp_drive = 0u;  g_tp_tone = 128u;  g_tp_hiss = 0u;  g_tp_wob = 0u;   /* NSRC-707: the hiss level rests at 0 */
+        g_tp_nsrc = 0u;   /* NSRC-707: cassette */
         /* STACKA-664: the reset also clears every tapped rate, division and type */
         for (int _l = 0; _l < 7; _l++) g_lane_per[_l] = 0u;   /* WOBTAP-675: 7 lanes */
         g_lfo_div[0] = 0u; g_lfo_div[1] = 0u; g_lfo_div[2] = 2u;
@@ -3688,7 +3708,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 2\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -3997,6 +4017,21 @@ static void rec_write_sample(int16_t lsamp, int16_t rsamp)
  * belongs to an effect: the per-block constants, the ramps, the trance
  * gate clock, the echo taps, and the 14 effect-major passes (EFXM-586,
  * bit-identical by harness). Pure code motion from the mixer. */
+/* STOPFX-837: the two ramps. Both are Q15 and both follow g_cur_speed_q16 -- the SMOOTHED
+ * speed, which already ramps to zero on a stop -- rather than the g_playing flag, so an
+ * effect dies WITH the tape and there is no step left to slew (ramp, never gate). */
+static inline int32_t sfx_nat(void)   /* TRANSPORT artefacts: PROPORTIONAL to speed. Half the motion, half the artefact -- true at every speed, not just at zero. */
+{
+	if (g_stopfx == 0u) return 32768;
+	const uint32_t _q = g_cur_speed_q16;
+	return (int32_t)((_q > 65536u ? 65536u : _q) >> 1);
+}
+static inline int32_t sfx_all(void)   /* SIGNAL effects under ALL: full above 0.25x, and only falls away BELOW it. A stop behaviour, not a speed behaviour -- slowing the tape must not quietly halve the reverb. */
+{
+	if (g_stopfx != 2u) return 32768;
+	const uint32_t _q = g_cur_speed_q16;
+	return (int32_t)(_q >= 16384u ? 32768u : (_q << 1));
+}
 static void __attribute__((noinline)) wob_tick_block(void);                                 /* WOBBUS-673 */
 /* ===== REVERB-676 (E1): the Clouds reverb, 12 kHz -- RVLINE-746: IN ITS OWN LINE (echo AND reverb) =====
  * Ten sub-lines end to end: 4 input diffusers, then per loop damping + 2 allpasses + a
@@ -4055,6 +4090,8 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 	const int rp1 = (pm & 1u) ? 1 : 0, rp2 = (pm & 2u) ? 1 : 0;
 	const int rp3 = (pm & 4u) ? 1 : 0, rp4 = (pm & 8u) ? 1 : 0;
 	const int rp5 = (pm & 16u) ? 1 : 0;   /* EQ-691: the wrapper's BOTH call only */
+	const int32_t _sfn = sfx_nat();   /* STOPFX-837: transport artefacts */
+	const int32_t _sfa = sfx_all();   /* STOPFX-837: everything else, under ALL only */
 	static uint32_t _infx_clk = 0xFFFFFFFFu;
 	const int _first = (_infx_clk != (uint32_t)g_sample_clock);
 	_infx_clk = (uint32_t)g_sample_clock;
@@ -4099,7 +4136,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		/* FX2-558 per-block constants -- hoisted so the frame loop only
 		 * branches on an int, never recomputes a shift table. */
 		const uint32_t bcr_hold = (rp2 && g_bcr_amt)
-		                        ? (1u + (((uint32_t)g_bcr_amt * 15u) >> 8)) : 0u;
+		                        ? (1u + ((((uint32_t)g_bcr_amt * (uint32_t)_sfa) >> 15) * 15u >> 8)) : 0u;   /* STOPFX-837: ALL only */
 		const int32_t  bcr_mask = (int32_t)(0xFFFFFFFFu <<
 		                          (((uint32_t)g_bcr_amt * 8u) >> 8));
 		/* STACKA-664 A3/A4: ONE beat for every clocked lane this block -- the grid's
@@ -4109,21 +4146,21 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		                       : ((g_play_bpm > 0) ? (48000u * 60u / (uint32_t)g_play_bpm) : 24000u);
 		const uint32_t lane_p0 = g_lane_per[0], lane_p1 = g_lane_per[1];
 		const uint32_t lane_p2 = g_lane_per[2], lane_p3 = g_lane_per[3], lane_p4 = g_lane_per[4], lane_p5 = g_lane_per[5];
-		const int32_t  swp_d    = (!rp3 || g_lfo_div[1] >= 3u) ? 0 : (int32_t)g_swp_amt;   /* 660: division 3 = OFF */
-		const int32_t  trm_d    = (!rp3 || g_lfo_div[2] >= 3u) ? 0 : (int32_t)g_trm_amt;
+		const int32_t  swp_d    = (!rp3 || g_lfo_div[1] >= 3u) ? 0 : (((int32_t)g_swp_amt * _sfa) >> 15);   /* 660: division 3 = OFF */
+		const int32_t  trm_d    = (!rp3 || g_lfo_div[2] >= 3u) ? 0 : (((int32_t)g_trm_amt * _sfa) >> 15);
 		const int      fx2_lfo_on = (swp_d || trm_d) ? 1 : 0;
 		/* PG8-560 FX3 per-block constants. */
-		const int32_t  rng_d    = rp2 ? (int32_t)g_rng_amt : 0;
-		const int32_t  awh_d    = rp2 ? (int32_t)g_awh_amt : 0;
+		const int32_t  rng_d    = rp2 ? (((int32_t)g_rng_amt * _sfa) >> 15) : 0;
+		const int32_t  awh_d    = rp2 ? (((int32_t)g_awh_amt * _sfa) >> 15) : 0;
 		const int32_t  awh_q    = (g_sec[1][2] < 40u) ? 40 : (int32_t)g_sec[1][2];   /* SEC-695: damping q8 (default 128 = the old >> 1); floor 40 keeps the SVF stable at the top of the sweep */
-		const int32_t  phs_d    = (!rp3 || g_lfo_div[0] >= 3u) ? 0 : (int32_t)g_phs_amt;   /* 660: division 3 = OFF */
+		const int32_t  phs_d    = (!rp3 || g_lfo_div[0] >= 3u) ? 0 : (((int32_t)g_phs_amt * _sfa) >> 15);   /* 660: division 3 = OFF */
 		/* Ring carrier: ONE fader sets depth and pitch together, 40 Hz at the
 		 * bottom to ~1.2 kHz at the top. Low = growl, high = clangorous metal.
 		 * 2^32 / 48000 = 89478 phase units per Hz. */
 		const uint32_t rng_inc  = 3579139u + (uint32_t)g_rng_amt * 406000u;
 		/* ECHO2-610 per-block constants: the delay in LINE samples, the wet and
 		 * feedback gains, and the engage edge. Decided once per block. */
-		const int32_t  ec_mix = (!rp2 || g_ec_div >= 3u) ? 0 : (int32_t)g_ec_mix;   /* 660: the 4th tap state is OFF */
+		const int32_t  ec_mix = (!rp2 || g_ec_div >= 3u) ? 0 : (((int32_t)g_ec_mix * _sfa) >> 15);   /* 660: the 4th tap state is OFF */
 		int ec_n = 0;
 		uint32_t ec2_d = 0u;             /* delay, 12 kHz line samples */
 		int32_t  ec2_fb = 0, ec2_wet = 0;
@@ -4165,7 +4202,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		}
 		/* REVERB-676 per-block constants -- RVLINE-746: the reverb has its own line, so the echo no
 		 * longer gates it; echo (page 2) into reverb (page 3), in series, whenever both are up. */
-		const int32_t rv_mix = !rp3 ? 0 : (int32_t)g_rv_mix;
+		const int32_t rv_mix = !rp3 ? 0 : (((int32_t)g_rv_mix * _sfa) >> 15);
 		int rv_n = 0;
 		int32_t rv_krt = 0, rv_wet = 0;
 		const int32_t rv_klp = (g_sec[2][3] < 32u) ? 32 : (g_sec[2][3] > 250u) ? 250 : (int32_t)g_sec[2][3];   /* SEC-695: damping (default 179 = 0.7) */
@@ -4198,7 +4235,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			g_rv_live = 0u;
 		}
 		/* TAPE-569 per-block constants. */
-		const int32_t tp_dr = 4096 + ((int32_t)g_tp_drive * 112);   /* 1.0x..7.97x */
+		const int32_t tp_dr = 4096 + (((((int32_t)g_tp_drive * _sfa) >> 15)) * 112);   /* 1.0x..7.97x. STOPFX-837: drive is SIGNAL -- neutral is 1.0x, so ALL ramps toward 4096, never toward 0. */
 		const int32_t tp_mk = (256 * 4096) / tp_dr;   /* makeup DERIVED from the
 		                                               * drive, not tuned apart
 		                                               * from it -- an independent
@@ -4212,18 +4249,35 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		 * hiss, (h - 128) >> 2 -- 31 at the top, the same as 700's 255 >> 3 (TUNE3-577).
 		 * Below: vinyl -- tp_ck is the depth (8..128); the hiss loop runs at a faint
 		 * surface-bed level (2..6) under the clicks. */
-		const uint32_t _tph  = rp4 ? (uint32_t)g_tp_hiss : 128u;
-		const int32_t  tp_ck = (_tph < 120u) ? (int32_t)(128u - _tph) : 0;
-		const int32_t  tp_hs = (_tph > 136u) ? (int32_t)((_tph - 128u) >> 2) : (tp_ck ? (2 + (tp_ck >> 5)) : 0);
+		/* NSRC-707: one level fader, four SOURCES on the T3 cycle. */
+		const uint32_t _tph   = rp4 ? (uint32_t)g_tp_hiss : 0u;
+		const uint32_t _nsrc  = g_tp_nsrc;
+		const int32_t  tp_lvl = (int32_t)(_tph >> 3);                                   /* 0..31, TUNE3-577's scale */
+		/* STOPFX-837's LINE, MOVED UP ONE LEVEL BY NSRCNAT-840 (marc, after testing 839).
+		 * 837 split these four by physics: a record turns and tape runs past a head, so those
+		 * followed the tape; pink is a generic bed and minidisc artefacts are digital coding, so
+		 * those had no transport and moved only under ALL. Correct about the world, wrong about
+		 * the instrument: all four sit on ONE FADER on ONE LANE. They are not four effects that
+		 * share a control, they are four flavours of "the noise the tape makes", and a hand on T3
+		 * is not reasoning about whether a minidisc has a capstan. THE NOISE LANE IS TRANSPORT --
+		 * all four follow, which also means all four sit at half depth at half speed, so the
+		 * fader means one thing at every speed. The tape page's SIGNAL half is untouched: drive,
+		 * tone and comp process what is in front of them and must keep running (row 118). */
+		const int32_t  tp_ck  = (_nsrc == 1u) ? (((int32_t)(_tph >> 1) * _sfn) >> 15) : 0;   /* vinyl: 701's depth scale -- TRANSPORT */
+		const int32_t  tp_hs  = (_nsrc == 0u) ? ((tp_lvl * _sfn) >> 15) : (tp_ck ? (2 + (tp_ck >> 5)) : 0);   /* cassette -- TRANSPORT (and vinyl's bed rides tp_ck) */
+		const int32_t  tp_pk  = (_nsrc == 2u) ? ((tp_lvl * _sfn) >> 15) : 0;            /* pink -- NSRCNAT-840: the lane is transport */
+		const int32_t  tp_md  = (_nsrc == 3u) ? ((tp_lvl * _sfn) >> 15) : 0;            /* minidisc -- NSRCNAT-840: the lane is transport */
 		/* A1: the tone fader has a DEADBAND (120..136 = flat), so the LED that
 		 * lights on 'not 128' and the kernel that engages on 'not 128' agree with
 		 * the hand: a fader parked near the middle is flat and dark. */
-		const int32_t tp_tn = (g_tp_tone >= 120u && g_tp_tone <= 136u) ? 128 : (int32_t)g_tp_tone;
+		const int32_t tp_tn = 128 + (((((g_tp_tone >= 120u && g_tp_tone <= 136u) ? 128 : (int32_t)g_tp_tone) - 128) * _sfa) >> 15);   /* STOPFX-837: tone is SIGNAL, and its neutral is 128 (flat), not 0 */
 		const int32_t tp_glo = (tp_tn >= 128) ? (256 - (tp_tn - 128))
 		                                      : (256 + (128 - tp_tn));
 		const int32_t tp_ghi = (tp_tn >= 128) ? (256 + (tp_tn - 128) * 3)
 		                                      : (256 - (128 - tp_tn) * 2);
 		const int      tp_any = rp4 && ((g_tp_drive != 0u) || (tp_hs != 0) || (tp_ck != 0)   /* HISS2-701 */
+		                     || (tp_pk != 0) || (tp_md != 0) || (g_tp_mddur != 0u)   /* NSRC-707 */
+		                     || (g_sec[3][1] != 0u) || (g_tp_cg != 32768)   /* COMP-709 */
 		                     || (tp_tn != 128) || (g_tp_wob != 0u) || (g_wb_off != 0) || (g_wb_tgt != 0));   /* WOBBUS-673 */
 		/* ONE accumulator serves sweep, tremolo and the phaser. */
 		const int      lfo_on   = (swp_d || trm_d || phs_d) ? 1 : 0;
@@ -4231,7 +4285,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		 * exactly like the filter and the distortion. Reading a volatile
 		 * inside the frame loop would re-load it 128 times and would also
 		 * let a fader move mid-block. */
-		const int32_t chr_mix = rp1 ? (int32_t)g_chr_mix : 0;
+		const int32_t chr_mix = rp1 ? (((int32_t)g_chr_mix * _sfa) >> 15) : 0;
 		/* TG-551: the grid anchor, recomputed once per block.
 		 * g_grid_beat_frames is in OUTPUT frames -- the tape domain has its
 		 * own g_gridrec_beat_samps -- so this locks to WHAT YOU HEAR and
@@ -4242,7 +4296,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		 * effect that silently does nothing is indistinguishable from a
 		 * broken one; today proved that twice. */
 		const uint32_t tg_rate = g_gat_amt
-		                       ? (1u + (((uint32_t)g_gat_amt * 6u) >> 8)) : 0u;
+		                       ? (1u + ((((uint32_t)g_gat_amt * (uint32_t)_sfa) >> 15) * 6u >> 8)) : 0u;   /* STOPFX-837: ALL only */
 		uint32_t tg_sf = 0u;
 		if (tg_rate && rp1) {
 			uint32_t _bf = (g_grid_active && g_grid_beat_frames)
@@ -4304,7 +4358,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			dst_g_s += d;
 			}
 		}
-		const int32_t dst_g = (!rp1 || (g_dst_amt == 0u && dst_g_s < 4160) || g_dst_typ >= 3u) ? 0 : dst_g_s;   /* 660: type 3 = OFF */
+		const int32_t dst_g = (!rp1 || (g_dst_amt == 0u && dst_g_s < 4160) || g_dst_typ >= 3u) ? 0 : ((dst_g_s * _sfa) >> 15);   /* 660: type 3 = OFF. STOPFX-837: ALL only. */
 		/* DST-548 r2: the trim used to cancel the drive EXACTLY, which
 		 * kept the level honest but also removed the loudness cue that
 		 * makes distortion read as distortion. It now allows up to +6 dB
@@ -4404,31 +4458,147 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			g_tp_rng = _h_g_tp_rng;
 		}
 		if (tp_ck) {
-			/* HISS2-701 VINYL CRACKLE. The hiss's LCG decides a click with
-			 * probability (150 + 26 depth) / 2^24 a frame (~1 to ~10 a second). A
-			 * click is one excitation, depth x (1..4) (random per click, random
-			 * sign), into a two-pole resonator: 2.4 kHz, r = 0.983 (~1.2 ms) --
-			 * a band-limited TICK (peak ~1,550 = -26 dBFS at full depth, ~5 ms),
-			 * not 658's raw impulse. The sign and size come from a second LCG
-			 * step so they are the high bits, not the LCG's weak low bits. */
-			uint32_t _h_g_tp_rng = g_tp_rng;
-			int32_t  _y1 = g_tp_ck1, _y2 = g_tp_ck2;
-			const uint32_t _ckp = 150u + (uint32_t)tp_ck * 26u;
+			/* CRACK-836 (marc 09-16: "way too tonal ... musical water droplets almost",
+			 * "much less tonal maybe almost all the same tone actually and less and more
+			 * of a crack or a pop"). THE RESONATOR IS GONE. Every crackle from 701 to 835
+			 * struck a two-pole section, and a struck two-pole section is a pitched
+			 * instrument -- 835 lowered it and lengthened the ring, which only made the
+			 * note easier to hear. A droplet IS a resonator being struck. A vinyl crack
+			 * is not: it is a brief burst of NOISE, shaped rather than pitched.
+			 * So: white noise x an exponential envelope (~1.3 ms per e-fold, forced to
+			 * zero by 6 ms), through ONE fixed non-resonant band -- 1.9 kHz one-pole
+			 * minus 240 Hz one-pole -- identical for every pop, so every pop is the same
+			 * colour. Nothing in the pop feeds back, so nothing can ring.
+			 * Stereo stays one event and wide, more cleanly than 835: both sides share
+			 * ONE envelope, and get INDEPENDENT noise. The right stream is an xorshift,
+			 * NOT the next LCG draw -- consecutive LCG draws are lattice-correlated and
+			 * measured +0.63, half the same noise in both ears.
+			 * ⚠ Every shift-decay below is FLOORED: `e -= e >> 6` stalls at 63 and never
+			 * reaches zero, which once left the "previous pop finished" gate shut and
+			 * fired ONE pop in twenty seconds. */
+			uint32_t _h_g_tp_rng = g_tp_rng, _xs = g_tp_ckx;
+			int32_t  _eL = g_tp_ck1,  _eR = g_tp_ck1R, _amp = g_tp_ckbx;
+			int32_t  _l1 = g_tp_ck2,  _l2 = g_tp_cka1L;
+			int32_t  _r1 = g_tp_ck2R, _r2 = g_tp_cka1R;
+			uint32_t _dl = g_tp_ckdL, _dr = g_tp_ckdR, _e = g_tp_embL;
+			const uint32_t _ckp = 20u + (uint32_t)tp_ck * 6u;   /* 2.2 a second at full depth; 834 ran ~6, 835 ~5 */
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				_h_g_tp_rng = _h_g_tp_rng * 1664525u + 1013904223u;
-				int32_t _x = 0;
-				if ((_h_g_tp_rng >> 8) < _ckp) {
-					_h_g_tp_rng = _h_g_tp_rng * 1664525u + 1013904223u;
-					_x = tp_ck * (1 + (int32_t)(_h_g_tp_rng >> 30));
-					if (_h_g_tp_rng & 0x20000000u) _x = -_x;
+				if ((_eL | _eR | (int32_t)_dl | (int32_t)_dr) == 0) {
+					_l1 = 0; _l2 = 0; _r1 = 0; _r2 = 0;   /* idle: flush the one-poles. They stall a few LSB above zero, and a shared DC residue reads as correlation. */
+					if ((_h_g_tp_rng >> 8) < _ckp + _e) {
+						_h_g_tp_rng = _h_g_tp_rng * 1664525u + 1013904223u;
+						_amp = (int32_t)tp_ck * (8 + (int32_t)((_h_g_tp_rng >> 27) & 31u)) * 16;  /* size, 32:1 */
+						const uint32_t _lag = 12u + ((_h_g_tp_rng >> 18) & 31u);                  /* 0.25 .. 0.9 ms */
+						if (_h_g_tp_rng & 0x80000000u) { _dr = _lag; _eL = _amp; }
+						else                           { _dl = _lag; _eR = _amp; }
+						_e = 400u;                           /* a light ember: uneven, not metronomic */
+					}
 				}
-				int32_t _y = _x + ((_y1 * 30628) >> 14) - ((_y2 * 15825) >> 14);
-				_y2 = _y1; _y1 = _y;
-				mix32[f]  += _y;
-				mix32R[f] += _y;
+				if (_dl) { _dl--; if (_dl == 0u) _eL = _amp; }   /* the trailing side, same pop, same envelope */
+				if (_dr) { _dr--; if (_dr == 0u) _eR = _amp; }
+				if (_e) _e--;
+				_h_g_tp_rng = _h_g_tp_rng * 1664525u + 1013904223u;
+				const int32_t _nL = (int32_t)((_h_g_tp_rng >> 24) & 255u) - 128;
+				_xs ^= _xs << 13; _xs ^= _xs >> 17; _xs ^= _xs << 5;   /* a DIFFERENT generator, not a different seed */
+				const int32_t _nR = (int32_t)((_xs >> 24) & 255u) - 128;
+				const int32_t _xL = (_nL * _eL) >> 11;
+				const int32_t _xR = (_nR * _eR) >> 11;
+				_eL -= _eL >> 6; if (_eL < 64) _eL = 0;    /* FLOORED: a shift-decay stalls at 63 forever */
+				_eR -= _eR >> 6; if (_eR < 64) _eR = 0;
+				_l1 += (_xL - _l1) >> 2; _l2 += (_l1 - _l2) >> 5;   /* the band: ~1.9 kHz minus ~240 Hz */
+				_r1 += (_xR - _r1) >> 2; _r2 += (_r1 - _r2) >> 5;
+				mix32[f]  += _l1 - _l2;
+				mix32R[f] += _r1 - _r2;
+			}
+			g_tp_rng = _h_g_tp_rng; g_tp_ckx = _xs;
+			g_tp_ck1  = _eL; g_tp_ck2  = _l1; g_tp_cka1L = _l2;
+			g_tp_ck1R = _eR; g_tp_ck2R = _r1; g_tp_cka1R = _r2;
+			g_tp_ckbx = _amp;
+			g_tp_ckdL = (uint8_t)_dl; g_tp_ckdR = (uint8_t)_dr; g_tp_embL = (uint16_t)_e;
+		}
+		if (tp_pk) {
+			/* NSRC-707 PINK: white from the LCG (+-2048) through Kellet's economy
+			 * three-pole pink filter in Q15 -- RMS ~3,600 at this input, the table's
+			 * scale, so the level fader means the same thing on every source. L and
+			 * R from separate LCG steps: decorrelated. */
+			uint32_t _h_g_tp_rng = g_tp_rng;
+			int32_t _b0L = g_tp_k0L, _b1L = g_tp_k1L, _b2L = g_tp_k2L;
+			int32_t _b0R = g_tp_k0R, _b1R = g_tp_k1R, _b2R = g_tp_k2R;
+			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+				_h_g_tp_rng = _h_g_tp_rng * 1664525u + 1013904223u;
+				const int32_t _wL = (int32_t)(int16_t)(_h_g_tp_rng >> 16) >> 4;
+				_h_g_tp_rng = _h_g_tp_rng * 1664525u + 1013904223u;
+				const int32_t _wR = (int32_t)(int16_t)(_h_g_tp_rng >> 16) >> 4;
+				_b0L = (_b0L * 32690 + _wL * 3245) >> 15;
+				_b1L = (_b1L * 31555 + _wL * 9716) >> 15;
+				_b2L = (_b2L * 18677 + _wL * 34494) >> 15;
+				_b0R = (_b0R * 32690 + _wR * 3245) >> 15;
+				_b1R = (_b1R * 31555 + _wR * 9716) >> 15;
+				_b2R = (_b2R * 18677 + _wR * 34494) >> 15;
+				mix32[f]  += ((_b0L + _b1L + _b2L + ((_wL * 6055) >> 15)) * tp_pk) >> 8;
+				mix32R[f] += ((_b0R + _b1R + _b2R + ((_wR * 6055) >> 15)) * tp_pk) >> 8;
 			}
 			g_tp_rng = _h_g_tp_rng;
-			g_tp_ck1 = _y1; g_tp_ck2 = _y2;
+			g_tp_k0L = _b0L; g_tp_k1L = _b1L; g_tp_k2L = _b2L;
+			g_tp_k0R = _b0R; g_tp_k1R = _b1R; g_tp_k2R = _b2R;
+		}
+		if (tp_md || g_tp_mddur) {
+			/* NSRC-707 MINIDISC: digital damage on the bus. Per block: an event in
+			 * progress counts down; otherwise the LCG starts one with probability
+			 * (350 + 130 level) / 65536 (~1.4 .. 12.5 a second), 1..4 blocks long.
+			 * During an event every frame is bit-crushed (step 1024), sample-and-
+			 * held in fours and dropped 6 dB -- an ATRAC-ish smear. Nothing added
+			 * between events; the level fader is the RATE. */
+			if (g_tp_mddur != 0u) {
+				g_tp_mddur--;
+			} else {
+				g_tp_rng = g_tp_rng * 1664525u + 1013904223u;
+				if ((g_tp_rng >> 16) < 350u + (uint32_t)tp_md * 130u)
+					g_tp_mddur = (uint16_t)(1u + ((g_tp_rng >> 8) & 3u));
+			}
+			if (g_tp_mddur != 0u) {
+				/* TAPE4-834 WIDE: 707 held BOTH channels on the same (f & 3) phase with the
+				 * same crush step, so the damage was identical L and R -- centred. Now the
+				 * right channel holds on the opposite phase and crushes one bit coarser, so
+				 * the artefacts decorrelate and the smear opens out across the image. */
+				int32_t _hL = 0, _hR = 0;
+				for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+					if ((f & 3u) == 0u) _hL = (mix32[f]  >> 11) << 10;   /* crush + the -6 dB */
+					if ((f & 3u) == 2u) _hR = (mix32R[f] >> 12) << 11;   /* opposite phase, one bit coarser */
+					mix32[f] = _hL; mix32R[f] = _hR;
+				}
+			}
+		}
+
+		if (rp4 && (g_sec[3][1] != 0u || g_tp_cg != 32768)) {
+			/* COMP-709 TAPE COMP. Block peak (every 4th frame) -> envelope (instant
+			 * attack, release 1/16 a block ~ 80 ms) -> gain T / (T + over k), make-up
+			 * 1 + k/2, walked per frame at 1/64. Amount 0 = the gain returns to 1. */
+			const int32_t _ck = ((int32_t)g_sec[3][1] * _sfa) >> 15;   /* hold T2 + F2. STOPFX-837: a compressor is SIGNAL; amount 0 already returns the gain to 1, so the ramp is the amount. */
+			int32_t _pk = 0;
+			for (uint32_t f = 0; f < BLK_FRAMES; f += 4u) {
+				int32_t _a = mix32[f]; if (_a < 0) _a = -_a; if (_a > _pk) _pk = _a;
+				_a = mix32R[f];        if (_a < 0) _a = -_a; if (_a > _pk) _pk = _a;
+			}
+			int32_t _env = g_tp_cenv - (g_tp_cenv >> 4);
+			if (_pk > _env) _env = _pk;
+			g_tp_cenv = _env;
+			int32_t _tg = 32768;
+			if (_ck) {
+				const int32_t _over = (_env > 8000) ? (_env - 8000) : 0;
+				const int32_t _den = 8000 + ((_over * _ck) >> 8);
+				_tg = (int32_t)((8000 * 32768) / _den);                 /* <= 32768 */
+				_tg = (_tg * (256 + (_ck >> 1))) >> 8;                   /* make-up 1 + k/2 */
+				if (_tg > 65535) _tg = 65535;
+			}
+			int32_t _g = g_tp_cg;
+			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
+				_g += (_tg - _g) >> 6;
+				mix32[f]  = ((mix32[f]  >> 3) * _g) >> 12;
+				mix32R[f] = ((mix32R[f] >> 3) * _g) >> 12;
+			}
+			g_tp_cg = _g;
 		}
 		if (rp4 && tp_dr != 4096) {
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
@@ -4475,17 +4645,18 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 			 * from the lows. One filter, two handles (FN + fader 4 drives it too). */
 			const uint32_t _fdc = (g_flt_pos >= 128u) ? ((uint32_t)g_flt_pos - 128u) : (128u - (uint32_t)g_flt_pos);
 			const int32_t  _bpw = (_fdc <= 16u) ? 0 : ((_fdc - 16u) * 8u >= 256u ? 256 : (int32_t)((_fdc - 16u) * 8u));
+			const int32_t  _fq  = (g_sec[0][0] < 20u) ? 40 : (int32_t)g_sec[0][0] * 2;   /* FLTQ-704: damping q8 (default 128 -> 256 = the old literal 1); floor 40 keeps the SVF stable */
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				int32_t xL = mix32[f];
 				int32_t xR = mix32R[f];
 				/* Chamberlin SVF x2 (M63a): per-channel state, shared
 				 * coefficient. int64 products per the M25 overflow fix. */
 				_h_flt_lowL += CPU780_MULH14(_f17, _h_flt_bandL);
-				int32_t hiL = xL - _h_flt_lowL - _h_flt_bandL;
+				int32_t hiL = xL - _h_flt_lowL - ((_h_flt_bandL * _fq) >> 8);   /* FLTQ-704 */
 				_h_flt_bandL += CPU780_MULH14(_f17, hiL);
 				xL += (((_h_flt_bandL * 2) - xL) * _bpw) >> 8;   /* CPU-780 C1: int32 (_bpw <= 256, the bus < 2^23) */
 				_h_flt_lowR += CPU780_MULH14(_f17, _h_flt_bandR);
-				int32_t hiR = xR - _h_flt_lowR - _h_flt_bandR;
+				int32_t hiR = xR - _h_flt_lowR - ((_h_flt_bandR * _fq) >> 8);   /* FLTQ-704 */
 				_h_flt_bandR += CPU780_MULH14(_f17, hiR);
 				xR += (((_h_flt_bandR * 2) - xR) * _bpw) >> 8;
 				mix32[f] = xL; mix32R[f] = xR;
@@ -4498,6 +4669,8 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 		if (chr_mix) {
 			uint32_t _h_g_chr_w = g_chr_w;
 			uint32_t _h_g_chr_ph = g_chr_ph;
+			int32_t  _cspan = ((int32_t)g_sec[0][1] * CHR_D_SPAN) >> 7;   /* CHRDEP-706: the sweep span (default 128 -> 672) */
+			if (_cspan > 830) _cspan = 830;                                /* 192 + 830 < CHR_LEN */
 			for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 				int32_t xL = mix32[f];
 				int32_t xR = mix32R[f];
@@ -4528,7 +4701,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 					                              : (int32_t)(131071u - _t);
 					/* delay = 4 ms .. 18 ms, in Q8 frames */
 					int32_t _d8 = (CHR_D_MIN << 8) +
-					              ((_tri * CHR_D_SPAN) >> 8);
+					              ((_tri * _cspan) >> 8);   /* CHRDEP-706 */
 					uint32_t _di = (uint32_t)(_d8 >> 8);
 					int32_t  _fr = _d8 & 255;
 					int32_t  _a = g_chr_buf[(_h_g_chr_w - _di)      & CHR_MASK];
@@ -4717,6 +4890,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 				}
 			}
 			int32_t *_mx = mix32;
+			const int32_t _pfk = (g_sec[2][0] > 230u) ? 230 : (int32_t)g_sec[2][0];   /* PHSFB-705: feedback q8 (default 128 = the old 1/2), capped at 0.9 */
 			for (int _ch = 0; _ch < 2; _ch++) {
 				int32_t _s0 = g_phs_xi[_ch * 4 + 0], _s1 = g_phs_xi[_ch * 4 + 1];
 				int32_t _s2 = g_phs_xi[_ch * 4 + 2], _s3 = g_phs_xi[_ch * 4 + 3];
@@ -4726,7 +4900,7 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_run(int32_t *mix3
 				for (uint32_t f = 0; f < BLK_FRAMES; f++) {
 					const int32_t _pa = _pas[f];   /* CPU-781 C4 (A3: both channels from the same base) */
 					int32_t _x = _mx[f];
-					int32_t _y = _x + (_fb >> 1);   /* PHS3-565 feedback 1/2 */
+					int32_t _y = _x + ((_fb * _pfk) >> 8);   /* PHS3-565 feedback 1/2 -> PHSFB-705: the secondary */
 					int32_t _o;
 					_o = ((_pa * (_t0 - _y)) >> 12) + _s0; _s0 = _y; _t0 = _o; _y = _o;
 					_o = ((_pa * (_t1 - _y)) >> 12) + _s1; _s1 = _y; _t1 = _o; _y = _o;
@@ -4947,7 +5121,8 @@ static void __attribute__((noinline)) wob_tick_block(void)
 	int32_t _n2 = (int32_t)((int16_t)(g_wb_rng >> 16));
 	g_wb_wnse += (_n1 - g_wb_wnse) >> 6;
 	g_wb_fnse += (_n2 - g_wb_fnse) >> 4;
-	int32_t _d = (int32_t)g_tp_wob, _tg;
+	const uint32_t _wt = g_wb_typ;   /* WOBTYP-703 */
+	int32_t _d = ((int32_t)g_tp_wob * sfx_nat()) >> 15, _tg;   /* TAPE4-834: no OFF state -- depth 0 is the off, and it already glides. STOPFX-837: wow and flutter ARE the transport failing to hold speed, so the DEPTH follows it; the RATE is a separate lever (row 159). */
 	if (_d == 0) {
 		/* idle target is ZERO, not the base tap. His rc2 hardware fix:
 		 * pinning idle at the base tap while a fast path read at offset 0
@@ -4961,8 +5136,16 @@ static void __attribute__((noinline)) wob_tick_block(void)
 		int32_t _d2 = _d;
 		int32_t _ws = ((wob_sin(g_wb_wowph) * 7) >> 3) + (g_wb_wnse >> 3);
 		int32_t _fs = ((wob_sin(g_wb_fltph) * 7) >> 3) + (g_wb_fnse >> 3);
-		int32_t _w = (int32_t)(((int64_t)WOB_WOW_PEAK * _ws) >> 15);
-		int32_t _l = (int32_t)(((int64_t)WOB_FLT_PEAK * _fs) >> 15);
+		/* TAPE4-834 (marc: "make the different wobble ones a little more obvious").
+		 * 703 only ZEROED a term. Wow is 300<<16 and flutter 32<<16, so "flutter only"
+		 * was 32/332 of what BOTH gives -- about a tenth, which is why the types did not
+		 * read as different. A soloed term is now SCALED UP to carry the effect on its
+		 * own: wow x1.5, flutter x4. BOTH is untouched, so the default never moves.
+		 * Head-room: the worst case is wow-only at 300 * 3/2 = 450 < WOB_BASE_SAMP 340?
+		 * No -- so wow-only is capped at 330, just under the base, and flutter-only at
+		 * 128; both stay inside TUNE3-577's reserve and under WOB_MAX_RATE_Q16's slew. */
+		int32_t _w = (_wt == 2u) ? 0 : (int32_t)(((int64_t)((_wt == 1u) ? (330 << 16) : WOB_WOW_PEAK) * _ws) >> 15);
+		int32_t _l = (_wt == 1u) ? 0 : (int32_t)(((int64_t)((_wt == 2u) ? (128 << 16) : WOB_FLT_PEAK) * _fs) >> 15);
 		_tg = (int32_t)(WOB_BASE_SAMP << 16)
 		    + (int32_t)(((int64_t)(_w + _l) * _d2) >> 8);
 	}
@@ -7148,6 +7331,7 @@ static void xfer_commit(void)
 			g_meta.fixed_len = g_mode_pref;      /* M7c: field = preference */
 			{ g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u; led_hw_refresh(); }   /* M8c: site owns it */
 			g_instant_rec = (uint8_t)(((g_meta.led_full >> 1) & 1u) ? 0u : 1u);   /* M41-r5: bit 1 SET = classic */
+			g_stopfx = (uint8_t)((g_meta.led_full >> 2) & 3u);   /* STOPFX-837: 0 today, 1 natural, 2 all */
 			memcpy(g_meta.chop, keep_chop, sizeof(keep_chop));
 			memcpy(g_meta.song_mode, keep_mode, sizeof(keep_mode));
 			if (g_slot < NUM_SLOTS) {   /* reload effective for current song */
@@ -10798,7 +10982,7 @@ static void audio_thread(void *a, void *b, void *c)
 			_FXS(g_ec_mix   >= 32u, 8u);  _FXS(g_phs_amt >= 32u, 9u);
 			_FXS(g_swp_amt  >= 32u, 10u); _FXS(g_trm_amt >= 32u, 11u);
 			_FXS(g_tp_drive >= 32u, 12u); _FXS(g_tp_tone >= 160u || g_tp_tone <= 96u, 13u);
-			_FXS(g_tp_hiss >= 160u || g_tp_hiss <= 96u, 14u); _FXS(g_tp_wob >= 32u, 15u);   /* HISS2-701: bipolar */
+			_FXS(g_tp_hiss >= 32u, 14u); _FXS(g_tp_wob >= 32u, 15u);   /* NSRC-707: unipolar again */   /* HISS2-701: bipolar */
 			_FXS(g_rv_mix   >= 32u, 16u);   /* REVERB-676 */
 			_FXS(g_eq_g[0] >= 160u || g_eq_g[0] <= 96u || g_eq_g[1] >= 160u || g_eq_g[1] <= 96u ||
 			     g_eq_g[2] >= 160u || g_eq_g[2] <= 96u || g_eq_g[3] >= 160u || g_eq_g[3] <= 96u, 17u);   /* EQ-691 */
@@ -12320,12 +12504,30 @@ static uint8_t g_led_fl_n[4], g_led_fl_t[4];   /* flashes left; ticks into the c
 static uint8_t g_led_fl_long[4];               /* LEDFLASH-791: this sequence is the OFF sign, one long blink */
 #define LED_FL_TICKS 18u   /* LEDSLOW3-825 (marc 09-15: "twice as slow as they are now so you can easily count"), amending LEDFLASH-791: 144 ms phases at the ~8 ms LED tick, so a 3-count reads in ~864 ms -- countable at a glance. The ladder was 791's 40 ms, then 56 (823), then 72 (824); each was still too quick to count. ONE constant drives every lane's count flash, so the FX tap cycles and page 7's confirm are the same speed by construction. 791 took this 10 -> 5 because an 80 ms phase was unreadable; 40 ms reads as a flicker now the cycles are short and have no OFF slot. 7 is the middle, not a revert to the value that felt wrong. */
 #define LED_FL_LONG_TICKS 25u                   /* LEDFLASH-791: the OFF blink, 200 ms on */
+/* BEATWRAP-830: which LIGHT shows a given beat-in-bar. The bar may be longer than the row,
+ * so the count WRAPS: at 6 beats the row reads 1-2-3-4-1-2 and restarts. Beat 1 and beat 5
+ * share a light by construction -- the pattern, not the frame, is what you read. Every site
+ * that paints a beat calls this; the tree gate counts them. */
+static inline int beat_led(uint32_t bib) { return (int)(bib % (uint32_t)NUM_TRACK_LEDS); }
+/* PG7QUIET-830: wall ms until which page 7's beat chase stays out of the way, so a count
+ * flash is read against a still row instead of a moving one. Set by led_flash_lane. */
+static volatile uint32_t g_led_quiet_ms;
 static void led_flash_lane(int i, uint32_t count)
 {
 	if (i < 0 || i > 3) return;
 	g_led_fl_n[i] = (uint8_t)((count ? count : 1u) * 2u);   /* on + off per flash; LEDFLASH-791: 0 = OFF = one long blink */
 	g_led_fl_long[i] = count ? 0u : 1u;
 	g_led_fl_t[i] = 0u;
+	{	/* PG7QUIET-830 + BPBSET-833: the stillness must OUTLAST THE FLASH, by construction.
+		 * A count is count*2 phases at LED_FL_TICKS (~8 ms a tick); the OFF blink's on-phase is
+		 * the longer LED_FL_LONG_TICKS. 2,000 ms was chosen when 6 was the longest count and is
+		 * 16 ms SHORT of a 7-count -- so it is a floor now, not the rule (W360). */
+		const uint32_t _c  = count ? count : 1u;
+		const uint32_t _tk = count ? LED_FL_TICKS : LED_FL_LONG_TICKS;
+		uint32_t _q = _c * 2u * _tk * 8u + 600u;
+		if (_q < 2000u) _q = 2000u;
+		g_led_quiet_ms = k_uptime_get_32() + _q;
+	}
 }
 static void page_led_depth(int i, uint32_t amt)
 {
@@ -12431,7 +12633,7 @@ static void led_service(void)
 	} else if (g_pg_open && g_pg_id == 4u) {
 		/* TAPE-569: PAGE 4 VIEW -- drive / tone / hiss / wobble. */
 		/* A6: depth; tone (A1) is bipolar with a 120..136 deadband; the hiss is 655's */
-		const uint32_t _lv[4] = { g_tp_drive, bipolar_depth(g_tp_tone), bipolar_depth(g_tp_hiss), g_tp_wob };   /* HISS2-701 */
+		const uint32_t _lv[4] = { g_tp_drive, bipolar_depth(g_tp_tone), g_tp_hiss, (uint32_t)g_tp_wob };   /* NSRC-707 (level) / WOBTYP-703 + TAPE4-834: no OFF, so the depth IS the light */
 		for (int i = 0; i < NUM_TRACK_LEDS; i++) page_led_depth(i, (g_sec_led == (uint8_t)(i + 1)) ? (uint32_t)(g_sec_led2 ? g_sec2[(g_pg_id - 1u) & 3u][i] : g_sec[(g_pg_id - 1u) & 3u][i]) : _lv[i]);   /* SEC-695 / SHAPE-696 */
 	} else if (g_pg_open && g_pg_id == 5u) {
 		/* EQ-691: PAGE 5 VIEW -- four bands, LED = |gain| (bipolar, A1's deadband). */
@@ -12451,6 +12653,7 @@ static void led_service(void)
 		const uint32_t _ta7 = g_take_auto_at;
 		const uint8_t _pn7 = (g_slot < NUM_SLOTS) ? g_take_preset[g_slot] : 0u;
 		int _gb7 = -1, _ob7 = 0;
+		const int _quiet = (int)((int32_t)(g_led_quiet_ms - k_uptime_get_32()) > 0);   /* PG7QUIET-830: a setting is being shown; hold the chase */
 		if (g_grid_active && g_grid_beat_frames) {
 			const uint64_t _ph7 = g_sample_clock - g_grid_anchor_e;
 			_gb7 = (int)((_ph7 / g_grid_beat_frames) % grid_bpb());   /* BEATSPB-824 */
@@ -12472,7 +12675,7 @@ static void led_service(void)
 			for (int i = 0; i < NUM_TRACK_LEDS; i++) {
 				const uint8_t _nq = (g_slot < NUM_SLOTS) ? g_trk_nudge[g_slot][i] : 0u;
 				const uint32_t _dim = (_nq && _nq != 128u) ? 40u : 0u;
-				page_led_depth(i, (i == _gb7 && _ob7) ? 255u : _dim);
+				page_led_depth(i, (_gb7 >= 0 && i == beat_led((uint32_t)_gb7) && _ob7 && !_quiet) ? 255u : _dim);   /* BEATWRAP-830 + PG7QUIET-830 */
 			}
 		}
 	} else if (g_pg_open && g_pg_id == 8u) {
@@ -12516,7 +12719,7 @@ static void led_service(void)
 				g_grid_beat_frames) % grid_bpb());   /* BEATSPB-824 */
 		for (int i = 0; i < NUM_TRACK_LEDS; i++)
 			((uint32_t)i == lit) ? track_led_on(i) : track_led_off(i);
-		if (sstep >= 6u && sgb >= 0 && (uint32_t)sgb == lit) g_snap_sweep = 0;
+		if (sstep >= 6u && sgb >= 0 && (uint32_t)beat_led((uint32_t)sgb) == lit) g_snap_sweep = 0;   /* BEATWRAP-830: the catch compares LIGHTS, so it stays certain when the bar is longer than the row */
 		else g_snap_sweep--;
 	} else if (g_led_shrug) {
 		/* M25-r12 THE SHRUG, HOISTED. It used to be handled INSIDE the
@@ -12558,7 +12761,7 @@ static void led_service(void)
 			 * chase (downbeat = LED 1) — the tapped grid made visible.
  */
 			for (int i = 0; i < NUM_TRACK_LEDS; i++)
-				((i == gbeat) && on_beat) ? track_led_on(i)
+				((gbeat >= 0 && i == beat_led((uint32_t)gbeat)) && on_beat) ? track_led_on(i)   /* BEATWRAP-830 */
 				                          : track_led_off(i);
 		} else for (int i = 0; i < NUM_TRACK_LEDS; i++) {
 			uint8_t st = trk[i].state;
@@ -12891,6 +13094,12 @@ static void power_off(void)
 	 * address and sets this nop count so it lands on mod32 == 0. The nops
 	 * execute once, at power-off. 592 needs 0 of them. */
 	/* PADHOST-715: the nop pad moved to tempo_refine (this build's between-function) */
+	/* GRIDFLUSH-832: a page-7 / page-6 edit made in the last 1.5 s has NOT been written yet --
+	 * power_off had no eMMC write of any kind, so it died with the rails. Raise the requests
+	 * before stop_and_flush(); the ~640 ms LED shutdown sweep below gives the streamer far more
+	 * time than a 512 B block write needs, and it is the same window the meta save already uses. */
+	if (g_grid_dirty_ms)  { g_grid_dirty_ms  = 0u; g_grid_save_req = 1; }
+	if (g_place_dirty_ms) { g_place_dirty_ms = 0u; g_meta_save_req = 1; }
 	g_off_fade = 1;                      /* M10: fade the outputs (~85 ms) so the
 	                                      * codecs power down on silence — the
 	                                      * fade completes during the flush and
@@ -13073,6 +13282,16 @@ static void jump_to_slot(uint32_t ns)
 	if (ns >= NUM_SLOTS) return;
 	if (g_slot >= NUM_SLOTS) g_slot = 0;
 	if (ns == g_slot) return;
+	/* GRIDFLUSH-832: the OUTGOING song's pending page-7 / page-6 edit goes to the card NOW.
+	 * The values already sit in their per-slot arrays and the save writes all 16, so flushing
+	 * here (before g_slot moves) or after is equivalent -- here is where it is obvious. */
+	if (g_grid_dirty_ms)  { g_grid_dirty_ms  = 0u; g_grid_save_req = 1; }
+	if (g_place_dirty_ms) { g_place_dirty_ms = 0u; g_meta_save_req = 1; }
+	/* SLOTARM-832: RE-ARM THE FADER PICKUP. It was armed only when a page OPENED, so a song
+	 * switch with a page still open left every fader already picked up -- the next movement
+	 * wrote the NEW song from the OLD physical position. Every page-6/7 control is per-song,
+	 * so this could copy a bar, an offset, a preset or a place between songs silently. */
+	for (int _f = 0; _f < 4; _f++) { g_fx_pick[_f] = 1; g_fx_lastq[_f] = -1; }
 	g_meta.slot[g_slot].speed_q16 = g_play_speed_q16;   /* remember where you left it */
 	g_meta.cur_slot = ns;
 	g_slot = ns;
@@ -13385,6 +13604,7 @@ int main(void)
 		if (g_play_bpm > BPM_MAX) g_play_bpm = BPM_MAX;
 		{ g_led_dim = (g_meta.led_full & 1u) ? 0u : 1u; led_hw_refresh(); }   /* restore brightness mode */
 		g_instant_rec = (uint8_t)(((g_meta.led_full >> 1) & 1u) ? 0u : 1u);   /* M41-r5: bit 1 SET = classic */
+		g_stopfx = (uint8_t)((g_meta.led_full >> 2) & 3u);   /* STOPFX-837: 0 today, 1 natural, 2 all */
 		{	/* M7: current song's persisted chop + effective mode */
 			uint32_t cd, co;
 			chop_meta_decode(g_meta.chop[g_slot], &cd, &co);   /* CHOPCAP-690 */
@@ -14006,6 +14226,12 @@ int main(void)
 									g_fx_pick[_f] = 1;   /* pickup law */
 									g_fx_lastq[_f] = -1;
 								}
+								/* PG7SHOW-832: opening page 7 on a gridded song SAYS THE BAR. It was
+								 * the one page-7 value with no display of its own -- it spoke only when
+								 * it changed, so reading it meant moving the control that changes it
+								 * (W361/W362). PG7QUIET-830 stills the chase for 2 s, so the count is
+								 * read against a dead row. */
+								if (_id == 7u && g_grid_active) led_flash_lane(2, grid_bpb());
 							}
 						}   /* PF-545 r4: the same
 						          * FN+hold-TN dwell TOGGLES its page (W156).
@@ -14604,9 +14830,13 @@ int main(void)
 					    nf <= (48000u * 60u) / 50u) {   /* 50..200 BPM */
 						uint32_t bpmq8 = (uint32_t)
 							((48000ULL * 60u * 256u) / nf);
-						/* M8c BEATMATCH: if this song already has
-						 * loops, the tap run means "match THIS" —
-						 * capture their native tempo first. */
+						/* M8c BEATMATCH, as corrected by TAPGRID-838: if this song already has a
+						 * GRID, the tap run means "match THIS" -- capture the grid's native tempo
+						 * first and retune the tape to the taps. M8c's own comment said "already
+						 * has LOOPS", and THAT IS THE BUG: a loop has no tempo of its own until
+						 * something declares one, and the grid IS the declaration. A song with
+						 * loops and no grid gets a GRID BUILT FROM THE TAPS, at the speed it is
+						 * already playing at -- no retune, no pitch change. */
 						/* TAPFIX-663: the loops' native tempo AT 1x. The grid follower
 						 * keeps ref_nf * ref_spd = the loops' beat in TAPE samples
 						 * (W301), so that product is the reference whatever the tape
@@ -14620,11 +14850,20 @@ int main(void)
 								native_q8 = (uint32_t)((48000ULL * 60u * 256u * g_grid_n[g_slot]) / g_loop_len);
 							} else if (g_grid_bpm_q8[g_slot] && g_play_speed_q16) {
 								native_q8 = (uint32_t)(((uint64_t)g_grid_bpm_q8[g_slot] << 16) / g_play_speed_q16);
-							} else if (g_beat_samples) {
-								native_q8 = (uint32_t)
-									((48000ULL * 60u * 256u) /
-									 g_beat_samples);
 							}
+							/* TAPGRID-838: there used to be a THIRD branch here -- `else if (g_beat_samples)`.
+							 * It is deleted, and the deletion IS the fix. g_beat_samples is not a property of
+							 * this song: it is ONE GLOBAL holding either the onset estimator's answer for
+							 * whatever take last ran through it (and only if that answer fell inside
+							 * 70..176 BPM -- otherwise the write is skipped), or any grid's published beat,
+							 * or the 80.36 BPM boot default. grid_load_song() writes it ONLY through the grid
+							 * path, so loading a song that has a take and no grid left the PREVIOUS SONG'S
+							 * tempo sitting in it. Beatmatching to that retuned the tape -- pitch and all --
+							 * by an arbitrary ratio, and then the count derived four lines below was measured
+							 * through the same ratio. An ungridded song now answers 0, the retune is skipped,
+							 * and the create that follows fits the grid TO THE RECORDING at the current
+							 * speed. A song that HAS a grid is untouched -- that is the real beatmatch and it
+							 * still runs. */
 						}
 						g_grid_bpm_q8[g_slot] = (uint16_t)bpmq8;
 						/* GRIDLOCK-720: g_grid_beat_frames is published LAST (below), after the
@@ -15194,9 +15433,9 @@ int main(void)
 					    !armed_press[ti]) {
 						/* FX2-558: a track tap on page 5 resets that effect
 						 * to neutral -- the same blind kill switch page 2 has. */
-						if (ti == 0) g_bcr_amt = 0u;
-						if (ti == 1) g_rng_amt = 0u;
-						if (ti == 2) g_awh_amt = 0u;
+						if (ti == 0) { g_bcr_amt = 0u; sec_lane_default(1u, 0u); }   /* SECKILL-839: a kill kills the LANE */
+						if (ti == 1) { g_rng_amt = 0u; sec_lane_default(1u, 1u); }   /* SECKILL-839: a kill kills the LANE */
+						if (ti == 2) { g_awh_amt = 0u; sec_lane_default(1u, 2u); }   /* SECKILL-839: + the wah's damping */
 						/* ECHO-572: T4 cycles the delay division, exactly as the
 						 * trance gate's T4 cycles its pattern. One page, one rule. */
 						if (ti == 3) { g_ec_div = (uint8_t)((g_ec_div + 1u) % 3u); g_lane_per[1] = 0u; led_flash_lane(ti, (uint32_t)g_ec_div + 1u); }   /* NOOFF-821 (marc 09-15): 1/16 -> dotted -> 1/8. A tap is EITHER a fast kill OR a cycle of real values -- never a cycle with a hole in it. The kill is the fader at the bottom, which always works. */
@@ -15208,8 +15447,8 @@ int main(void)
 						 * effect to neutral -- a kill switch you can hit
 						 * blind mid-performance. Only the filter exists
 						 * this rung; the others land with their kernels. */
-						if (ti == 0) g_flt_pos = 128u;   /* bypass -- the fast kill (marc 09-05) */
-						if (ti == 1) g_chr_mix = 0u;     /* FX2-550: dry   */
+						if (ti == 0) { g_flt_pos = 128u; sec_lane_default(0u, 0u); }   /* bypass -- the fast kill (marc 09-05). SECKILL-839: + the filter's damping */
+						if (ti == 1) { g_chr_mix = 0u; sec_lane_default(0u, 1u); }     /* FX2-550: dry. SECKILL-839: + the chorus's span */
 						if (ti == 2) { g_dst_typ = (uint8_t)((g_dst_typ + 1u) % 3u); led_flash_lane(ti, (uint32_t)g_dst_typ + 1u); }   /* NOOFF-821: soft -> hard -> fold, no OFF slot */
 						if (ti == 3) {                   /* TG-551: next pattern */
 							g_gat_pat = (uint8_t)((g_gat_pat + 1u) % 2u);   /* NOOFF-821: gallop -> halves, no OFF slot */
@@ -15225,7 +15464,7 @@ int main(void)
 						/* A5: page 3 tap = the lane's DIVISION (beat -> half -> quarter) and
 						 * it clears a tapped rate; the fader to the bottom is the kill. */
 						if (ti < 3) { g_lfo_div[ti] = (uint8_t)((g_lfo_div[ti] + 1u) % 3u); g_lane_per[2 + ti] = 0u; led_flash_lane(ti, (uint32_t)g_lfo_div[ti] + 1u); }   /* NOOFF-821: beat -> half -> quarter, no OFF slot */
-						if (ti == 3) g_rv_mix = 0u;   /* REVERB-676: the kill */
+						if (ti == 3) { g_rv_mix = 0u; sec_lane_default(2u, 3u); }   /* REVERB-676: the kill. SECKILL-839: + the reverb's damping, which defaults to 179 and NOT to 128 */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
 					} else if (g_pg_open && g_pg_id == 4u && g_rec_track < 0 &&
@@ -15235,10 +15474,10 @@ int main(void)
 						 * is the PICKUP LAW: a fader must cross the stored value
 						 * before it takes over, and nothing shows where that value
 						 * sits. A tap that zeroes it outright is the answer. */
-						if (ti == 0) g_tp_drive = 0u;
-						if (ti == 1) g_tp_tone  = 128u;
-						if (ti == 2) g_tp_hiss  = 128u;   /* HISS2-701: centre = off */
-						if (ti == 3) { g_tp_wob = 0u; g_lane_per[6] = 0u; }   /* WOBTAP-675: the kill also frees the wow (page 3's rule) */
+						if (ti == 0) { g_tp_drive = 0u; sec_lane_default(3u, 0u); }   /* SECKILL-839: a kill kills the LANE */
+						if (ti == 1) { g_tp_tone = 128u; sec_lane_default(3u, 1u); }   /* SECKILL-839: + COMP OFF. This is the case that motivated the whole rule: comp is the ONE secondary whose default is 0 = off, so T2 used to flatten the tone and leave the compressor squeezing. */
+						if (ti == 2) { g_tp_nsrc = (uint8_t)((g_tp_nsrc + 1u) & 3u); led_flash_lane(ti, (uint32_t)g_tp_nsrc + 1u); }   /* NSRC-707: cassette -> vinyl -> pink -> minidisc (the kill is the fader) */
+						if (ti == 3) { g_wb_typ = (uint8_t)((g_wb_typ + 1u) % 3u); g_lane_per[6] = 0u; led_flash_lane(ti, (uint32_t)g_wb_typ); }   /* WOBTYP-703 + TAPE4-834: both -> wow -> flutter, no OFF; the tap still frees the tapped wow (675) */
 						g_fx_pick[ti] = 1; g_fx_lastq[ti] = -1;
 						tap_deadline[ti] = 0;
 					} else if (g_pg_open && g_pg_id == 5u && g_rec_track < 0 &&
@@ -15699,7 +15938,7 @@ int main(void)
 							const uint8_t _cur = g_take_preset[g_slot];
 							const uint32_t _ubar = grid_bpb();   /* BEATSPB-824 */
 							uint8_t _pv = (fi == 0) ? (uint8_t)((int)g_grid_off_q8[g_slot] + 128)
-							            : (fi == 2) ? ((_ubar == 2u) ? 32u : (_ubar == 3u) ? 96u : (_ubar == 6u) ? 224u : 160u)   /* BEATSPB-824: the centre of this value's band */
+							            : (fi == 2) ? ((_ubar == 3u) ? 32u : (_ubar == 5u) ? 160u : (_ubar == 7u) ? 224u : 96u)   /* BEATSPB-824 + BPBSET-833: the centre of this value's band -- 3/4/5/7, four bands of 64, and 4 (the default) sits in the second */
 							            : (_cur == 8u) ? 230u : (_cur == 4u) ? 178u : (_cur == 2u) ? 127u : (_cur == 1u) ? 76u : 0u;
 							int _q8 = (int)((q > 255u) ? 255u : q);
 							if (g_fx_pick[fi]) {
@@ -15724,7 +15963,7 @@ int main(void)
 									/* BEATSPB-824: F3 = BEATS PER BAR, detented 2 / 3 / 4 / 6. Pure labelling --
 									 * no audio moves, nothing is re-recorded, and it can be changed before or
 									 * after the take. 4 stores as 0 so "unset" and "four" stay one thing. */
-									const uint32_t _u = (_q8 < 64) ? 2u : (_q8 < 128) ? 3u : (_q8 < 192) ? 4u : 6u;
+									const uint32_t _u = (_q8 < 64) ? 3u : (_q8 < 128) ? 4u : (_q8 < 192) ? 5u : 7u;   /* BPBSET-833 */
 									if (_u != _ubar) {
 										g_grid_bpb[g_slot] = (uint8_t)((_u == 4u) ? 0u : _u);
 										g_grid_dirty_ms = k_uptime_get_32() | 1u;
