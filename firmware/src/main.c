@@ -1062,6 +1062,16 @@ static uint8_t           g_grid_tick_ok;       /* tick_prev is valid (same regim
 static uint8_t           g_grid_src;           /* 0 none, 1 tape-derived, 2 tapped clock (diag + regime edge) */
 static volatile uint8_t  g_grid_punch_k;       /* beat-in-bar of the scheduled punch line (first take -> O) */
 static volatile uint8_t  g_grid_bib;           /* BEATSPB-824: beat-in-bar 0..u-1, published by the service */
+/* BARSYNC-845 (W374): "hold the beat chase dark until the next bar 1". Raised where a count's FRAME
+ * OF REFERENCE changes -- a tap run commits, page 7 opens -- and cleared right here by the service
+ * the instant it publishes bib == 0. It is a DOWNBEAT GATE, deliberately not a duration:
+ * PG7QUIET-830's g_led_quiet_ms is a WALL window and cannot know where the beat is, which is why
+ * the two COMPOSE rather than replace each other (a chase must clear BOTH).
+ * Without it the grid's anchor is the FIRST tap while the run commits on the LAST, so the eye joins
+ * the count (taps-1) beats in: 7 of 8 tap/bar combinations started mid-bar, and at bpb 5 the commit
+ * tap and the true downbeat are BOTH LED 1 -- which is what marc read as "it starts with 1, then
+ * starts over 1,2,3,4". The wrap law itself (beat_led) was correct and is untouched. */
+static volatile uint8_t  g_bar_sync;
 static volatile uint64_t g_grid_o_req_w;       /* controls thread: "the 1 is at this wall frame" (a tap) */
 static volatile uint8_t  g_grid_o_req;         /* ... pending; the service converts it with coherent (W, P) */
 static volatile uint32_t g_grid_lap_tk;        /* diag: ticks emitted in the last completed lap (must read 24n) */
@@ -1732,6 +1742,17 @@ static volatile int      g_arm_req[NTRK];         /* main -> engine: track i pre
 static volatile int      g_stop_req;               /* main -> engine: track released (stop rec) */
 static volatile int      g_del_req[NTRK];          /* main -> engine: double-tap = delete track i */
 static volatile int      g_restart_req;            /* main -> engine: hold PLAY = jump to song start */
+/* SCRUBOFF-848 (marc 09-17): the whole-song scrub is PARKED, for the turntable firmware.
+ * 0 = off (the looper), 1 = on. It is a runtime-false CONSTANT and not an `#if`, deliberately:
+ * rule 10 / W32 -- this tree already carries functions behind `#if SP1_CODEC == SP1_CODEC_PCM`
+ * that have not compiled in months and have cost three builds. A parked feature is precisely the
+ * code nobody recompiles, so it must stay in front of the compiler. GCC folds this and eliminates
+ * the block (same flash, same cycles as `#if`) while still parsing, type-checking and warning on
+ * every line of it in every build. Flip it to 1 and it works, because it never stopped compiling.
+ * The seek plumbing it drives -- restart_seek() and g_restart_to -- stays LIVE: the plain PLAY-hold
+ * restart uses it with 0 on every restart. */
+static const uint8_t SP1_SCRUB_ENABLED = 0u;
+static volatile uint32_t g_restart_to;             /* SCRUB-845: WHERE the restart lands, in loop samples. 0 = the song start, i.e. every pre-845 caller. Read-and-cleared by the engine, so a caller that does not set it gets the old behaviour by construction. */
 /* GLOBAL LOOP CHOP (performance window, scheme A'): play only 1/div of every
  * track's loop — the off'th slice. Non-destructive playback-window remap in
  * the streamer's fill math only: recorded audio, loop lengths, beat grid and
@@ -1823,6 +1844,8 @@ static uint8_t           g_head_mute_save;   /* song mutes across heads mode */
 /* R1-597: the M19b offline block-copy bounce is DELETED. A bounce is now a
  * take fed from the bus (BNC-597), on every layer, heads included. */
 static volatile uint8_t  g_led_shrug;      /* track row "no" double-blink */
+static volatile uint8_t  g_led_fill;       /* HATCH4-847: a hold's countdown, 0 = none, else 1..NUM_TRACK_LEDS lit */
+static volatile uint8_t  g_led_ack;        /* CTLRESET-845: track row "done" -- all four SOLID, ~0.5 s. Distinct from the shrug's double-blink on purpose: one means no, one means yes. */
 static volatile uint8_t  g_fn_held;        /* LED-549: FUNCTION is down (LED routing) */
 static volatile uint8_t  g_vu;             /* LED-549: master VU, 0..255, decayed */
 static volatile uint8_t  g_pg_sweep;       /* LED-549 r8: page sweep/land counter */
@@ -3708,7 +3731,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 14\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -5420,6 +5443,25 @@ static uint32_t __attribute__((noinline)) bnc_cycle_blocks(int i)
  * end-to-end, where 607 was -2.0 dB @6k / -3.6 @8k / -5.2 @10k. Worst-case
  * gain 1.8x, inside the 12 dB print headroom. Bounce-only, outside the
  * mixer. */
+/* SCRUB-845: THE SEEK, LIFTED OUT OF THE MIXER. This is verbatim what stood inside
+ * looper_audio_block's `if (g_restart_req)` block, plus a destination. It is out here because
+ * rule 11 / W291 is unconditional -- 604 proved that even NEVER-TAKEN code inside the mixer
+ * re-rolls PASS A/B's register allocation (426 -> 555 spills, corner 0.33 % -> 15.37 %). noinline
+ * is load-bearing, not decoration: a static helper with one caller is inlined and has no symbol
+ * (W677), which would put every instruction straight back where it must not be.
+ * `to == 0` is every pre-845 caller and reduces to exactly the code this replaced.
+ * Placed among the mixer's other noinline helpers and deliberately NOT adjacent to
+ * fx_chain_block, because PAD-594's nop-pad host is whatever the map shows between that
+ * function and the mixer -- the PAD pass re-measures either way, but there is no reason to
+ * crowd it. */
+static void __attribute__((noinline)) restart_seek(uint32_t to)
+{
+	g_consume_pos = to; g_pphase = 0; g_frames_since = 0; g_dec_acc = 0; g_dec_accR = 0; g_midi_cnt = 0;
+	for (int i = 0; i < NTRK; i++)
+		trk[i].p_w = to ? (to / TSPB_SRC(i)) * TSPB_SRC(i) : 0u;   /* block-aligned to the SOURCE's geometry (HG-646), as every other re-point in the tree */
+	if (!to) { g_playing = 1; g_midi_start_pending = 1; }   /* a SCRUB is a move, not a transport command: no Start on every step, and it must not start a stopped tape */
+}
+
 static void __attribute__((noinline)) bnc_prepass(int16_t *tmp, const int32_t *mL, const int32_t *mR)
 {
 	int32_t l0 = g_bnc_pre_hist[0][0], l1 = g_bnc_pre_hist[0][1], l2 = g_bnc_pre_hist[0][2], l3 = g_bnc_pre_hist[0][3],
@@ -6425,12 +6467,17 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 	 * while recording (so a take isn't disrupted). */
 	if (g_restart_req) {
 		g_restart_req = 0;
-		if (g_rec_track < 0 && g_loop_active) {
-			g_consume_pos = 0; g_pphase = 0; g_frames_since = 0; g_dec_acc = 0; g_dec_accR = 0; g_midi_cnt = 0;
-			for (int i = 0; i < NTRK; i++) trk[i].p_w = 0;
-			g_playing = 1;
-			g_midi_start_pending = 1;
-		}
+		/* RESTCLR-846 (W377): the destination is read-and-cleared UNCONDITIONALLY, before the
+		 * guard. SCRUB-845 nested this clear inside the guard below and attached a comment
+		 * promising it could not strand a stale target -- the intent was right and the code did
+		 * not implement it. A request raised and then DROPPED (a take starts, or the song goes
+		 * inactive, in the window between the controls thread raising it and this consuming it)
+		 * cleared the REQUEST and left the TARGET, and the next plain PLAY-hold restart jumped
+		 * to the old scrub position instead of the song start.
+		 * The seek itself stays outside the mixer, in restart_seek() (rule 11 / W291). */
+		const uint32_t _rto = g_restart_to; g_restart_to = 0u;
+		if (g_rec_track < 0 && g_loop_active)
+			restart_seek(_rto);
 	}
 
 	/* CHOP CHANGE: drop the (old-window) read-ahead so the new window is
@@ -6808,8 +6855,14 @@ static void __attribute__((optimize("O2"), noinline)) looper_audio_block(int16_t
 
 	M81_LAP(1);
 	/* M90: publish the block's work. One store per variable per block
-	 * instead of one per sample. */
-	g_pphase = _pphase; g_dec_acc = _dec_acc;
+	 * instead of one per sample.
+	 * DECACCR-844: g_dec_accR IS ONE OF THEM. It was missing from this list from M90 until
+	 * 09-16 -- the RIGHT decimator reloaded a stale partial sum at every block head while the
+	 * LEFT one reloaded the true one, so a recording below 1.0x (the only case where a residue
+	 * crosses a block boundary) rasped on one channel. geraasmasjien heard it at 0.5x on a sine
+	 * and then talked himself out of it. Audit a batched publish against the LOOP'S LOCALS, not
+	 * against the other publish site -- the pa_ctx save does store it, which is how this passed. */
+	g_pphase = _pphase; g_dec_acc = _dec_acc; g_dec_accR = _dec_accR;
 	g_frames_since = _fsince; g_pre_w = _pre_w;
 	g_pre_valid = _pre_val; g_consume_pos = _cpos;
 
@@ -10555,6 +10608,7 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 			 * which is what a splice does. The 1 never moves. */
 			const uint32_t _u = grid_bpb();
 			g_grid_bib = (uint8_t)(beat % _u);
+			if (g_bar_sync && g_grid_bib == 0u) g_bar_sync = 0u;   /* BARSYNC-845: the gate ends ON the downbeat, so the chase resumes at 1 */
 			g_grid_anchor_e = g_sample_clock - ((uint64_t)g_grid_bib * bf + phf);   /* modular: (now - anchor_e) = the bar phase */
 		}
 		g_gridrec_beat_samps = (L + n / 2u) / n;
@@ -10598,6 +10652,7 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 	g_grid_anchor_e = grid_anchor_eff();   /* STACKT-716: once a block, for every reader */
 	if (g_grid_beat_frames) {   /* BIBPUB-826: publish bib on the TAPPED clock too, so the GR line never prints a stale one */
 		g_grid_bib = (uint8_t)(((g_sample_clock - g_grid_anchor_e) / g_grid_beat_frames) % grid_bpb());
+		if (g_bar_sync && g_grid_bib == 0u) g_bar_sync = 0u;   /* BARSYNC-845: the tapped clock clears the gate too -- an EMPTY song is exactly where a tap run lands */
 	}
 	if (!g_grid_beat_frames) return;
 wall_ticks:
@@ -12526,7 +12581,17 @@ static void led_flash_lane(int i, uint32_t count)
 		const uint32_t _tk = count ? LED_FL_TICKS : LED_FL_LONG_TICKS;
 		uint32_t _q = _c * 2u * _tk * 8u + 600u;
 		if (_q < 2000u) _q = 2000u;
-		g_led_quiet_ms = k_uptime_get_32() + _q;
+		/* LEDQMAX-844: g_led_quiet_ms is ONE global serving FOUR per-lane flashes, so it takes
+		 * the LATER deadline, never simply the newest. A short flash raised while a longer one
+		 * is still running used to cut the stillness short and let the chase resume on top of a
+		 * live count -- reachable today by moving page 7's F2 then F3, or by opening the page
+		 * while a fader's flash is still going. 833 derived this window from the flash it
+		 * protects; the same law across lanes is a max, not an assignment. Signed-difference
+		 * compare, not `>`, so it is correct across the 32-bit wrap of k_uptime_get_32(). */
+		const uint32_t _now = k_uptime_get_32();
+		const uint32_t _end = _now + _q;
+		if ((int32_t)(g_led_quiet_ms - _now) <= 0 || (int32_t)(_end - g_led_quiet_ms) > 0)
+			g_led_quiet_ms = _end;
 	}
 }
 static void page_led_depth(int i, uint32_t amt)
@@ -12605,7 +12670,26 @@ static void led_service(void)
 
 	if (!(g_pg_open && g_pg_id >= 1u && g_pg_id <= 7u) || g_pg_sweep || g_pg_exit)
 		track_level_rest();   /* STACKA-664 A6: only the FX pages set levels (EQ-691: and page 5) */
-	if (g_pg_sweep) {
+	if (g_led_fill) {
+		/* FILLFIX-850 THE FILL, now genuinely at the top of the chain. It answers a GESTURE
+		 * in progress, so it outranks the page sweep, the page exit AND the page views --
+		 * which is what M25-r12's doctrine says and what the old placement (below every page
+		 * branch) did not do: with a page open the fill was simply never drawn.
+		 * It is a LEVEL: the controls thread clears it at the top of every pass and re-asserts
+		 * it while the hold is live, so letting go stops it within one pass and the row reverts
+		 * to whatever it was doing. track_level is set explicitly because track_level_rest() is
+		 * skipped while an FX page is open, and an LED lit without a level inherits the page's. */
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) {
+			if ((uint32_t)i < (uint32_t)g_led_fill) { track_led_on(i); track_level(i, 255u); }
+			else                                     track_led_off(i);
+		}
+	} else if (g_led_ack) {
+		/* CTLRESET-845 THE ACK, hoisted with the fill for the same reason: a reset is the answer
+		 * to a deliberate chord and must never be mistaken for the shrug's "no", nor be hidden by
+		 * a page that is about to close anyway. SOLID, not blinking. */
+		for (int i = 0; i < NUM_TRACK_LEDS; i++) { track_led_on(i); track_level(i, 255u); }
+		g_led_ack--;
+	} else if (g_pg_sweep) {
 		show_page_sweep();   /* LED-549 r9: the activation sweep owns the
 		                      * track row until it lands on the page's own
 		                      * button; then the page content takes over. */
@@ -12675,7 +12759,7 @@ static void led_service(void)
 			for (int i = 0; i < NUM_TRACK_LEDS; i++) {
 				const uint8_t _nq = (g_slot < NUM_SLOTS) ? g_trk_nudge[g_slot][i] : 0u;
 				const uint32_t _dim = (_nq && _nq != 128u) ? 40u : 0u;
-				page_led_depth(i, (_gb7 >= 0 && i == beat_led((uint32_t)_gb7) && _ob7 && !_quiet) ? 255u : _dim);   /* BEATWRAP-830 + PG7QUIET-830 */
+				page_led_depth(i, (_gb7 >= 0 && i == beat_led((uint32_t)_gb7) && _ob7 && !_quiet && !g_bar_sync) ? 255u : _dim);   /* BEATWRAP-830 + PG7QUIET-830 + BARSYNC-845 */
 			}
 		}
 	} else if (g_pg_open && g_pg_id == 8u) {
@@ -12761,7 +12845,7 @@ static void led_service(void)
 			 * chase (downbeat = LED 1) — the tapped grid made visible.
  */
 			for (int i = 0; i < NUM_TRACK_LEDS; i++)
-				((gbeat >= 0 && i == beat_led((uint32_t)gbeat)) && on_beat) ? track_led_on(i)   /* BEATWRAP-830 */
+				((gbeat >= 0 && i == beat_led((uint32_t)gbeat)) && on_beat && !g_bar_sync) ? track_led_on(i)   /* BEATWRAP-830 + BARSYNC-845: the standby chase starts on the 1 too -- it is the SAME count, and a tap run on an empty song is drawn here, not on page 7 */
 				                          : track_led_off(i);
 		} else for (int i = 0; i < NUM_TRACK_LEDS; i++) {
 			uint8_t st = trk[i].state;
@@ -12884,6 +12968,45 @@ static void __attribute__((noinline)) rev_toggle(int ti)
  * serve are muted (state == TS_PLAY || head_active -- its own predicate); the
  * snapshot covers all four so one that starts playing during the hold is
  * restored to what it was. */
+/* HATCHWIDE-851: everything the escape hatch puts back that you cannot SEE (marc 09-17).
+ * Session state only -- this function must never write to g_meta or raise g_meta_save_req. The
+ * chop it moves home is the LIVE one; the stored chop stays, so a song reload brings it back.
+ * Reads no ladder and no time; safe to call once from the fire path. */
+static void __attribute__((noinline)) hatch_wide(void)
+{
+	/* heads mode FIRST: TSPB_SRC() reads g_heads_mode, so the re-anchors below must be
+	 * computed with it already cleared -- geometry comes from the OWNER of the data.
+	 * (No stage mark here on purpose: a mark in prose is a token the gates count.) */
+	if (g_heads_mode) {
+		g_heads_mode = 0;
+		for (int hm = 0; hm < NTRK; hm++)
+			trk[hm].muted = (uint8_t)((g_head_mute_save >> hm) & 1u);
+		for (int hk = 0; hk < NTRK; hk++) {
+			if (hk == (int)g_head_src) continue;
+			trk[hk].p_w = (uint32_t)(g_consume_pos / TSPB_SRC(hk)) * TSPB_SRC(hk);
+		}
+	}
+	/* the per-track directions, each re-anchored the way rev_toggle does it */
+	for (int hr = 0; hr < NTRK; hr++) {
+		if (!g_head_rev[hr]) continue;
+		g_head_rev[hr] = 0;
+		if (trk[hr].state == TS_PLAY || head_active(hr))
+			trk[hr].p_w = (g_consume_pos / TSPB_SRC(hr)) * TSPB_SRC(hr);
+	}
+	/* the beat repeat, and the tape it was holding */
+	if (g_br_on) br_release(0);
+	g_br_shift = 0;
+	/* the window and the chop -- LIVE only, the card is not touched */
+	g_win_free = 0;
+	g_win_rev = 0;
+	g_chop_off = 0u;
+	g_chop_div = 1u;
+	g_chop_req = 1;
+	g_dip_req = 1;
+	/* the FX: pages 1-5, the tape page, the secondaries, the routing, the pickup */
+	fx_reset_all();
+}
+
 static uint8_t g_iso_on, g_iso_mask;
 static void __attribute__((noinline)) iso_engage(int ti)
 {
@@ -13784,6 +13907,77 @@ int main(void)
 			else if ((fraw >= 110  && fraw <  308) || (fraw >= 308  && fraw <  488) ||
 			         (fraw >= 650  && fraw <  795) || (fraw >= 1099 && fraw < 1256)) fnr_pre = 3;
 			else                                     fnr_pre = 4;
+			{	/* HATCH12-848 -- THE ESCAPE HATCH (marc 09-17; W373's cure).
+				 * FN + TRACK 1 + TRACK 2, held ~2 s. Two adjacent buttons: 847 put this on all
+				 * four and marc's verdict was "it works but its hard to push all 4" -- and an
+				 * escape hatch is the one control that has to be reachable while the instrument
+				 * is misbehaving and you are annoyed.
+				 * 1+2 is a MEASURED ladder code (~572, band 488..650, in the combo table below)
+				 * and under a held FN it is the GAP between T2 (ends 488) and T3 (starts 650),
+				 * which nothing reads.
+				 * 🔑 It also retires 847's sharpest hazard: ALL4 sat at 1713..1773, directly under
+				 * PLAY (1798+) on a ladder that SAGS under a press (W341), so a sagging PLAY
+				 * landed in it. 1+2 has 84 counts of clear air below and 78 above.
+				 * The STICKY, TIMED hold stays anyway -- it now guards a TRANSIT (a finger rolling
+				 * from T2 to T3 crosses this gap) rather than a sag, and it costs nothing: a roll
+				 * is tens of ms, the hold is two seconds. */
+				static int64_t h4_press = -1, h4_t0, h4_last;
+				static uint8_t h4_fired;
+				if (h4_press != press_start) { h4_press = press_start; h4_t0 = 0; h4_fired = 0; }
+				g_led_fill = 0;   /* FILLFIX-850: a LEVEL, cleared every pass and re-asserted below while
+				                   * the hold is live. 849 wrote it only when the hold advanced, so any
+				                   * exit that did not run the cancel left the last value on the row. */
+				const int64_t h4_now = k_uptime_get();
+				if (fraw >= 488 && fraw < 650) {
+					if (!h4_t0) {
+						h4_t0 = h4_now; h4_fired = 0;
+						combo_seen = 1;   /* spend the press at the START: never a power-off, and the FN release cannot bank-jump */
+					}
+					h4_last = h4_now;
+				} else if (h4_t0 && (h4_now - h4_last) > 200) {
+					h4_t0 = 0; g_led_fill = 0;   /* a real release. A sag shorter than 200 ms is ridden out. */
+				}
+				if (h4_t0 && !h4_fired) {
+					const int64_t _h = h4_now - h4_t0;
+					if (_h >= 2000) {
+						for (int _f = 0; _f < NTRK; _f++) {
+							g_fh_latch[_f] = 0; g_fh_lastq[_f] = -1;   /* W373: the one-way door, opened */
+							g_fx_pick[_f]  = 1; g_fx_lastq[_f] = -1;   /* re-armed: no FX jump */
+						}
+						/* Spelled single-spaced, and `0u` for the monitor mute, because the
+						 * inherited monitor-mute gate counts those exact substrings. A
+						 * column-aligned version would slip past it unnoticed, which is worse
+						 * than failing it: a gate you evade is a gate you have silently
+						 * deleted. Its two constants were bumped WITH the reason instead
+						 * (W330/W367). NOTE (W376): this comment deliberately does NOT write
+						 * that gate's stage mark. A stage mark is a TOKEN the gates count by
+						 * equality -- naming one in prose mints a fake instance and fails a
+						 * correct build. Describe other stages; never quote their marks. */
+						suppress_play = 0;   /* the track ladder decodes again (gigawhattt, luuuciano) */
+						g_vol_pair = 0;   /* the VOL-pair release swallow (mirrors _rt_swallow for the track-ladder code) */
+						g_fxrst_lock = 1;   /* HATCHREL-849: ARM the release swallow, do not clear it.
+						                     * This gesture ends in a TRACK CHORD, and the M27 combo machine reads trk_raw
+						                     * directly, ~120 lines before the suppress_play guard -- which only blanks the
+						                     * single-button decode and cannot protect it. Lift FN before the tracks (the
+						                     * natural way to let go) and the bare 1+2 reaches combo_held, which toggles
+						                     * trk[].muted on true idle: marc got tracks 1 and 2 muted every time (09-17).
+						                     * FXRST2-564 documented this hazard for the 1+4 chord and built exactly this
+						                     * swallow for it; 848 CLEARED it here, which was worse than doing nothing.
+						                     * It is not a stuck-latch candidate anyway -- it self-clears on any pass the
+						                     * ladder is out of a combo band -- so setting it loses nothing. */
+						g_mon_mute = 0u;   /* a forgotten monitor mute is indistinguishable from "no audio" */
+						g_pg_open = 0;   /* the faders are volume again, not FX */
+						hatch_wide();   /* HATCHWIDE-851: window, chop, repeat, directions, heads, FX */
+						g_led_ack = 60;  /* ~0.5 s solid: done */
+						g_led_fill = 0;
+						h4_fired = 1;
+					} else if (_h >= 300) {
+						int _lit = (int)(((_h - 300) * NUM_TRACK_LEDS) / 1700) + 1;
+						if (_lit > NUM_TRACK_LEDS) _lit = NUM_TRACK_LEDS;
+						g_led_fill = (uint8_t)_lit;
+					}
+				}
+			}
 			/* M31: 1600 -> 1773. M27 made multi-track combos reachable codes on
 			 * this ladder (2+3+4 = 1683, ALL4 = 1743), and anything over the old
 			 * 1600 counted as a PLAY press under FN - three phantom taps inside
@@ -14070,6 +14264,57 @@ int main(void)
 						br_setwin((uint32_t)ws, (uint32_t)(we - ws));   /* BRFIX-806: Q8 of the audible cycle -- 800 converted the other three sites and missed this copy, so FN + faders 1/2 saturated to the whole cycle */
 					}
 				}
+				if (SP1_SCRUB_ENABLED && !g_br_on && g_loop_len && g_loop_active) {
+					/* SCRUB-845, PARKED BY SCRUBOFF-848: FN + PLAY + any fader = scrub the WHOLE
+					 * SONG. Held for the turntable line; the constant above folds this away for
+					 * the looper without letting it rot. The repeat
+					 * owns all four of these faders as its window when it is live, hence
+					 * !g_br_on; outside it the chord is unbound. (W376: the repeat's own
+					 * stage marks are deliberately not written here -- a mark is a token the
+					 * gates count by equality, and naming one in prose fails a correct
+					 * build.) */
+					static int64_t sc_press = -1;
+					static int16_t sc_snap[NTRK];
+					static uint8_t sc_eng[NTRK], sc_pend, sc_q;
+					static int64_t sc_at, sc_mv;
+					if (sc_press != combo_start) {   /* re-arm per hold, the hf_/wf_/bf_ law */
+						sc_press = combo_start;
+						for (int k = 0; k < NTRK; k++) { sc_snap[k] = -1; sc_eng[k] = 0; }
+						sc_pend = 0; sc_at = 0; sc_mv = 0;
+						/* seed from where the tape actually IS, so the deadband below is
+						 * measured against the truth and the first move is a real move. */
+						sc_q = (uint8_t)(((uint64_t)(g_consume_pos % g_loop_len) << 8) / g_loop_len);
+					}
+					const int64_t snow = k_uptime_get();
+					for (int k = 0; k < NTRK; k++) {
+						int fv = ladder_read(&adc_ladder[LAD_FADER0 + k]);
+						if (fv < 0) continue;
+						int q = (int)((uint32_t)fv * 256u / 3700u);
+						if (q > 255) q = 255;
+						if (sc_snap[k] < 0) { sc_snap[k] = (int16_t)q; continue; }
+						if (!sc_eng[k]) {
+							int d = q - (int)sc_snap[k]; if (d < 0) d = -d;
+							if (d < 7) continue;      /* M31 intent gate, ~2.7% of travel */
+							sc_eng[k] = 1;
+							combo_seen = 1;           /* the press is spent */
+							g_fh_latch[k] = 1; g_fh_lastq[k] = -1;   /* the volume pickup law, as every other FN fader gesture */
+						}
+						int dq = q - (int)sc_q; if (dq < 0) dq = -dq;
+						if (dq < 2) continue;             /* ADC deadband */
+						sc_pend = 1; sc_q = (uint8_t)q; sc_mv = snow;
+					}
+					if (sc_pend && g_rec_track < 0 &&
+					    (snow - sc_at >= 150 || snow - sc_mv >= 100)) {
+						/* DEFER AND SETTLE, not a flat timer: the wf_* handler's comment
+						 * records that re-pointing every 60 ms through a sweep reads as a
+						 * ~16 Hz tremolo. <=6.7 seeks/s while moving, and one more 100 ms
+						 * after the fader stops so the landing is exact. */
+						sc_at = snow; sc_pend = 0;
+						g_restart_to = (uint32_t)(((uint64_t)sc_q * (uint64_t)g_loop_len) >> 8);
+						for (int k = 0; k < NTRK; k++) g_head_blip[k] = 3;   /* M14's ~16 ms per-track dip masks the re-anchor; the master is never ducked */
+						g_restart_req = 1;
+					}
+				}
 				k_msleep(25);
 				continue;                /* combo owns the button */
 			}
@@ -14231,7 +14476,10 @@ int main(void)
 								 * it changed, so reading it meant moving the control that changes it
 								 * (W361/W362). PG7QUIET-830 stills the chase for 2 s, so the count is
 								 * read against a dead row. */
-								if (_id == 7u && g_grid_active) led_flash_lane(2, grid_bpb());
+								if (_id == 7u && g_grid_active) {
+									led_flash_lane(2, grid_bpb());
+									g_bar_sync = 1;   /* BARSYNC-845 (marc 09-16): the opening animation gets a still row, and the count that follows starts at 1 rather than wherever the page happened to open. */
+								}
 							}
 						}   /* PF-545 r4: the same
 						          * FN+hold-TN dwell TOGGLES its page (W156).
@@ -14640,7 +14888,16 @@ int main(void)
 					 * at any sane BPM (469 ms at 128). */
 					g_grid_bpm_q8[g_slot] = 0;
 					g_grid_n[g_slot] = 0u; g_grid_o[g_slot] = 0u;   /* GRIDCORE-733: the tape grid goes with it */
-					g_grid_bpb[g_slot] = 0u;   /* BEATSPB-824: and so does the bar -- a cleared song must not keep a 3 nothing on the panel explains */
+					/* BPBKEEP-845 (marc, W375): THE BAR LENGTH DOES NOT GO WITH THE GRID.
+					 * BEATSPB-824 zeroed g_grid_bpb here on the reasoning that a cleared song
+					 * must not keep a bar nothing on the panel explains. But deleting a grid is
+					 * HOW YOU RE-TAP A TEMPO, and a re-tap does not mean 'and put me back in 4':
+					 * marc lost a 7 to this on 09-16. The bar is a property of the SONG (per slot,
+					 * persisted in block 2's e4, whitelisted 3/5/7 on load), not of the grid that
+					 * sits on it, and page 7's lane-2 KILL TAP is the explicit way back to four.
+					 * So the bar SURVIVES this gesture, deliberately. Do not 'restore' the clear.
+					 * The two remaining clears are correct and untouched: the page-7 reset chord
+					 * (a page reset owns every control the page sets) and the kill tap. */
 					g_grid_off_q8[g_slot] = 0;   /* NUDGE-717: the offset goes with the grid (the tail rides the same save) */
 					g_gridrec_beat_samps = 0;    /* LOCKLOAD-725: no grid, no stored beat */
 					g_grid_active = 0;
@@ -14872,6 +15129,11 @@ int main(void)
 						 * was a grid off by the retune ratio (row 127). */
 						g_grid_fresh = 1;   /* M20 F1: taps = truth */
 						g_grid_anchor = tap_first_s;
+						if (tap_n == 4) g_bar_sync = 1;   /* BARSYNC-845 (W374) + TAPSYNC1-847 (W379): raise the downbeat gate ONCE PER RUN, not once per tap.
+						                                  * This body runs on EVERY tap from the fourth on, and tap_n was incremented just above, so tap_n == 4 IS the
+						                                  * first commit of this run. Re-raising it per tap gated the chase off for beats 2->0 and on for 0->1, so at
+						                                  * 4 bpb only lights 1 and 2 ever appeared while tapping (marc, 09-17). The gate answers WHERE THE EYE JOINS
+						                                  * the count -- a once-per-run event -- so it belongs on the run, not on the state the run rewrites. */
 						g_grid_next_tick = g_sample_clock;
 						g_grid_active = 1;
 						g_grid_save_req = 1;
@@ -14919,6 +15181,8 @@ int main(void)
 				}
 			}
 			all_off();
+			g_led_fill = 0;   /* FILLFIX-850: FN is up, so the hatch's branch will not run again --
+			                   * clear the fill here or the count-up stays frozen on the row (marc 09-17). */
 			/* If the combo was ended by lifting FUNCTION FIRST while PLAY is
 			 * still down, swallow that trailing PLAY until it is released, so
 			 * it can't leak into the normal decode as a restart / play-stop. */
@@ -15590,6 +15854,11 @@ int main(void)
 						g_mt_sp++;   /* BNC-597: PLAY was the bounce modifier -- spent */
 					} else if (ep_play_held) {
 						/* BNC-570 B1a: the hold DISPATCHES here now. */
+						g_restart_to = 0u;   /* RESTCLR-846 (W377): a PLAY-hold restart says WHERE it means -- the song start.
+						                      * g_restart_req is one flag serving two intents, so without this the restart
+						                      * consumes a scrub request that is still pending and lands on the scrub's
+						                      * position instead. One audio block wide, unreachable by a human, and still
+						                      * wrong: state the intent at the raise site rather than rely on the race. */
 						g_restart_req = 1; g_mt_rst++;
 					} else if (g_rec_track < 0) {
 						g_playing = !g_playing; g_mt_tap++;
