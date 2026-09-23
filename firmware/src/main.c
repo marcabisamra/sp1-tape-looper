@@ -995,12 +995,23 @@ struct x3_trk {
 	uint8_t  pan;
 	uint8_t  rsv;
 };
+/* TRIM2-874: the trim record, appended INSIDE the x3 table so the existing sizeof-memcpy carries it.
+ * The song's head/tail are SAMPLES (one time on every track, whatever its block size); a track's own
+ * are BLOCKS of that track. Its own magic + sum; a zeroed or foreign region reads as no trim. */
+#define TRIM_MAGIC 0x324D5254u   /* 'TRM2' */
+struct trim_rec {
+	uint32_t magic;
+	uint16_t ver, sum;
+	uint32_t song_h[NUM_SLOTS], song_t[NUM_SLOTS];      /* samples off every track's head / tail */
+	uint16_t trk_h[NUM_SLOTS][NTRK], trk_t[NUM_SLOTS][NTRK];   /* blocks off this track's head / tail (ungridded songs only) */
+};
 struct x3_tab {
 	uint32_t magic;
 	uint16_t ver;
 	uint16_t sum;                 /* over the entry bytes only */
 	uint32_t rsv0, rsv1;
 	struct x3_trk t[NUM_SLOTS][NTRK];
+	struct trim_rec trim;          /* TRIM2-874: after the entries; the table's sum stops at t[] */
 };
 static struct x3_tab g_x3;
 static volatile uint8_t g_x3_ok;
@@ -1324,6 +1335,90 @@ static volatile uint32_t g_grid_base_blocks;
 /* Blocks for n grid beats. Base-referenced when the song has one at the same
  * tempo (siblings then lock exactly); otherwise the whole run is rounded once
  * — error <= half a block per TAKE instead of half a block per BEAT. */
+/* ---- TRIM2-874: the record's accessors. Read = validated or zero; write = STAGE (re-seal, no save). ---- */
+static uint16_t trim_sum(const struct trim_rec *r)
+{
+	const uint8_t *q = (const uint8_t *)&r->song_h[0];
+	const uint32_t n = (uint32_t)(sizeof(*r) - 8u);   /* everything after magic / ver / sum */
+	uint16_t sm = 0;
+	for (uint32_t i = 0; i < n; i++) sm = (uint16_t)(sm + q[i]);
+	return sm;
+}
+static int trim_valid(void)
+{
+	static uint16_t seen = 0xFFFFu; static uint8_t ok;   /* the verdict cached on the sum FIELD */
+	if (!g_x3_ok || g_x3.trim.magic != TRIM_MAGIC) return 0;
+	if (g_x3.trim.sum != seen) { seen = g_x3.trim.sum; ok = (trim_sum(&g_x3.trim) == seen); }
+	return ok;
+}
+static void trim_song_get(uint32_t slot, uint32_t *h, uint32_t *t)
+{
+	*h = 0u; *t = 0u;
+	if (slot < NUM_SLOTS && trim_valid()) { *h = g_x3.trim.song_h[slot]; *t = g_x3.trim.song_t[slot]; }
+}
+static void trim_trk_get(uint32_t slot, int i, uint32_t *h, uint32_t *t)
+{
+	*h = 0u; *t = 0u;
+	if (slot < NUM_SLOTS && i >= 0 && i < NTRK && trim_valid()) { *h = g_x3.trim.trk_h[slot][i]; *t = g_x3.trim.trk_t[slot][i]; }
+}
+static void trim_seal(void)
+{
+	/* STAGE only: the readers see the new value; the eMMC write waits for trim_settle() (856's lesson:
+	 * a sweep calls this on nearly every controls pass, and the save flag is a card write). */
+	g_x3.trim.magic = TRIM_MAGIC; g_x3.trim.ver = 2u;
+	g_x3.trim.sum = trim_sum(&g_x3.trim);
+}
+static int trim_song_set(uint32_t slot, uint32_t h, uint32_t t)
+{
+	if (slot >= NUM_SLOTS) return 0;
+	if (!trim_valid()) { memset(&g_x3.trim, 0, sizeof(g_x3.trim)); trim_seal(); }   /* first trim on this card, or a foreign record */
+	if (g_x3.trim.song_h[slot] == h && g_x3.trim.song_t[slot] == t) return 0;
+	g_x3.trim.song_h[slot] = h; g_x3.trim.song_t[slot] = t;
+	trim_seal(); return 1;
+}
+static int trim_trk_set(uint32_t slot, int i, uint32_t h, uint32_t t)
+{
+	if (slot >= NUM_SLOTS || i < 0 || i >= NTRK) return 0;
+	if (h > 0xFFFFu) h = 0xFFFFu; if (t > 0xFFFFu) t = 0xFFFFu;
+	if (!trim_valid()) { memset(&g_x3.trim, 0, sizeof(g_x3.trim)); trim_seal(); }
+	if (g_x3.trim.trk_h[slot][i] == h && g_x3.trim.trk_t[slot][i] == t) return 0;
+	g_x3.trim.trk_h[slot][i] = (uint16_t)h; g_x3.trim.trk_t[slot][i] = (uint16_t)t;
+	trim_seal(); return 1;
+}
+/* THE LIVE GEOMETRY: this track's head / tail in ITS OWN blocks (the song's converted + its own),
+ * clamped so the region keeps at least the floor. Written by trim_apply() on the controls thread (and
+ * the mixer's own song-load helper), read by the tile on the streamer. uint16 stores are atomic. */
+static volatile uint16_t g_trim_hb[NTRK], g_trim_tb[NTRK];
+static uint32_t g_trim_dirty_ms;      /* last staged change (ms|1); 0 = settled */
+static int8_t   g_trim_fl_lane = -1;   /* the lane + count the settle will flash */
+static uint8_t  g_trim_fl_n;
+#define TRIM_HYST_Q     4   /* counts of fader travel a trim fader must move from its last APPLIED reading */
+#define TRIM_SETTLE_MS  200u
+static int16_t  g_trim_q4 = -1;                         /* F4's last applied reading (-1 = none) */
+static int16_t  g_trim_qt[NTRK] = { -1, -1, -1, -1 };   /* the hold + fader's, per track */
+/* how many blocks of a `full`-block lap the trims may take between them: all but 1/16 (>= 2 blocks stay) */
+/* TRIM2-874: a two-sided fader. Centre = untrimmed; UP = the tail (133..255); DOWN = the head (0..123). */
+static uint8_t trim_q_from(uint32_t h, uint32_t t, uint32_t mx)
+{
+	if (!mx) return 128u;
+	if (t)  { uint32_t v = 133u + (t * 122u + mx / 2u) / mx; return (uint8_t)(v > 255u ? 255u : v); }
+	if (h)  { uint32_t v = (h * 123u + mx / 2u) / mx;        return (uint8_t)(v >= 123u ? 0u : 123u - v); }
+	return 128u;
+}
+static void trim_units_from(int q, uint32_t mx, uint32_t *h, uint32_t *t)
+{
+	*h = 0u; *t = 0u;
+	if (!mx) return;
+	if (q >= 133) *t = ((uint32_t)(q - 133) * mx + 61u) / 122u;
+	else if (q <= 123) *h = ((uint32_t)(123 - q) * mx + 61u) / 123u;
+	if (*t > mx) *t = mx;
+	if (*h > mx) *h = mx;
+}
+static uint32_t trim_max_blocks(uint32_t full)
+{
+	const uint32_t keep = (full / 16u) < 2u ? 2u : (full / 16u);
+	return (full > keep) ? full - keep : 0u;
+}
 static uint32_t grid_len_blocks(uint32_t nbeats, uint32_t spb)   /* GP-518 */
 {
 	uint32_t bs = g_gridrec_beat_samps;
@@ -1798,6 +1893,62 @@ static void chop_meta_encode(uint8_t *c, uint32_t d, uint32_t o)
  * blocks: the old line rounded with a hard-coded 280, which is 1.77x wrong for a mono song. Nothing is written
  * back to the card -- an existing song simply stops drifting against its own metronome and MIDI clock.
  * Its own function because the caller is the slot-switch service, which lives inside the mixer (W291). */
+/* the grid's LIVE beat count: n scaled by the audible lap over the full lap. Exact for whole-beat
+ * trims, which is all the gesture allows on a gridded song. g_grid_n itself is NEVER written trimmed. */
+static uint32_t grid_n_live(uint32_t slot)
+{
+	if (slot >= NUM_SLOTS) return 0u;
+	const uint32_t n = g_grid_n[slot];
+	const uint32_t L = g_meta.slot[slot].loop_len;
+	uint32_t h, t; trim_song_get(slot, &h, &t);
+	if (!n || !L || (!h && !t) || h + t >= L) return n;
+	const uint32_t r = (uint32_t)(((uint64_t)n * (L - h - t) + L / 2u) / L);
+	return r ? r : 1u;
+}
+/* TRIM2-874: derive the LIVE geometry from the record. Idempotent; returns 1 if anything moved.
+ *   per track : g_trim_hb/tb = the song's head/tail in this track's blocks + its own, clamped to the
+ *               region's floor (1/16 of the lap it tiles: the base lap when it is a whole number of
+ *               laps of it, else its own length);
+ *   the song  : g_loop_len / g_loop_blocks = the AUDIBLE lap = base - head - tail, in the base's block,
+ *               for the grid, the ticks and the LEDs. Stored lengths are never touched. */
+static int __attribute__((noinline)) trim_apply(void)
+{
+	int moved = 0;
+	if (g_slot >= NUM_SLOTS) return 0;
+	const uint32_t Lf = g_meta.slot[g_slot].loop_len;
+	uint32_t sh, st; trim_song_get(g_slot, &sh, &st);
+	uint32_t _sp = 0u, _lb = 0u;   /* the BASE take's format: the shortest present one */
+	for (int k = 0; k < NTRK; k++)
+		if (trk[k].state == TS_PLAY && trk[k].len_blocks && (!_lb || trk[k].len_blocks < _lb)) { _lb = trk[k].len_blocks; _sp = TSPBI(k); }
+	if (!_sp) _sp = SAMP_PER_BLK;
+	const uint32_t base_full = Lf ? (Lf + _sp / 2u) / _sp : 0u;
+	for (int i = 0; i < NTRK; i++) {
+		uint32_t h = 0u, t = 0u;
+		if (trk[i].state == TS_PLAY && trk[i].len_blocks) {
+			const uint32_t spb = TSPBI(i), gb = trk[i].len_blocks;
+			const uint32_t bf = Lf ? (Lf + spb / 2u) / spb : 0u;   /* the base lap in THIS track's blocks */
+			const uint32_t lap = (bf && gb >= bf && (gb % bf) == 0u) ? bf : gb;   /* what this track tiles */
+			const uint32_t th = 0u, tt = 0u;   /* TRIMGLOBAL-877: the trim is global; the per-track rows are not read */
+			h = (sh + spb / 2u) / spb + th;
+			t = (st + spb / 2u) / spb + tt;
+			const uint32_t mx = trim_max_blocks(lap);
+			if (h > mx) h = mx;
+			if (h + t > mx) t = mx - h;
+		}
+		if (g_trim_hb[i] != h) { g_trim_hb[i] = (uint16_t)h; moved = 1; }
+		if (g_trim_tb[i] != t) { g_trim_tb[i] = (uint16_t)t; moved = 1; }
+	}
+	if (Lf && base_full) {   /* the audible lap, snapped to the base's block */
+		uint32_t hb = (sh + _sp / 2u) / _sp, tb = (st + _sp / 2u) / _sp;
+		const uint32_t mx = trim_max_blocks(base_full);
+		if (hb > mx) hb = mx;
+		if (hb + tb > mx) tb = mx - hb;
+		const uint32_t lb = base_full - hb - tb;
+		const uint32_t want = (lb ? lb : 1u) * _sp;
+		if (g_loop_len != want) { g_loop_blocks = lb ? lb : 1u; g_loop_len = want; moved = 1; }
+	}
+	return moved;
+}
 static void __attribute__((noinline)) gridlap_load(void)
 {
 	uint32_t _lb = 0u, _sp = 0u;
@@ -1810,6 +1961,8 @@ static void __attribute__((noinline)) gridlap_load(void)
 		g_loop_blocks = (g_loop_len + _sp / 2u) / _sp;
 		g_loop_len    = g_loop_blocks * _sp;
 	}
+	(void)trim_apply();   /* TRIM2-874: the loaded song comes up trimmed. This helper is the mixer's
+	                       * own call at song load, so the trim costs the mixer nothing (rule 11). */
 }
 static uint32_t chop_div_cap(void)
 {
@@ -3524,7 +3677,7 @@ static void fx_reset_all(void)
         g_lfo_div[0] = 0u; g_lfo_div[1] = 0u; g_lfo_div[2] = 2u;
         g_dst_typ = 0u;
         for (int _r = 0; _r < 9; _r++) g_pg_route[_r] = RT_BOTH;   /* INFX-672 */
-        g_mon_mute = 0u;
+        /* MONKEEP-878: the monitor mute survives the FX reset (marc 09-23); the hatch clears it */
         for (int _f = 0; _f < 4; _f++) {
                 g_fx_pick[_f]  = 1;
                 g_fx_lastq[_f] = -1;
@@ -3537,6 +3690,19 @@ static const int16_t flt_hp_tab[14] = {   /* 30 Hz .. 4.5 kHz, exp */
 	64, 95, 139, 204, 301, 442, 650, 955,
 	1404, 2064, 3032, 4451, 6520, 9512 };
 static uint8_t           g_fh_latch[NTRK];   /* fader owes a volume re-cross */
+/* FHARM-854: does fader i actually owe a re-cross? Only if its PHYSICAL position has diverged
+ * from the volume that track owns by more than the pickup window the clear already uses. Reads
+ * the ladder, so it is controls-thread only and must never be called from the engine. */
+static int fh_needs_latch(int i)
+{
+	if (i < 0 || i >= NTRK) return 1;
+	const int fv = ladder_read(&adc_ladder[LAD_FADER0 + i]);
+	if (fv < 0) return 1;                      /* ADC error: assume it owes, the safe side */
+	uint32_t q = (uint32_t)fv * 256u / 3700u;
+	if (q > 256u) q = 256u;
+	const int d = (int)q - (int)trk[i].vol_q8;
+	return (d < -15 || d > 15);
+}
 static int               g_fh_lastq[NTRK];   /* last raw read while latched */
 #define heads_engaged() (g_heads_mode && trk[g_head_src].state == TS_PLAY)
 static volatile uint8_t  g_dip_req;                /* M10: controls -> mixer, declick dip at a chop edit */
@@ -3731,7 +3897,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 14\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -5276,32 +5442,44 @@ static void __attribute__((optimize("O2"), noinline)) fx_chain_block(int32_t *mi
 	}
 	const int16_t *lv = _bnc ? g_bnc_live : g_live_blk;
 	const uint32_t lg = g_live_got;
-	if (pm_trk) {
-		/* tracks only: take the monitor out (PASS A added exactly these
-		 * values), run the page, put it back -- int32, exact */
-		for (uint32_t f = 0; f < lg; f++) { mix32[f] -= lv[2u * f]; mix32R[f] -= lv[2u * f + 1u]; }
-		fx_chain_run(mix32, mix32R, pm_trk);
-		for (uint32_t f = 0; f < lg; f++) { mix32[f] += lv[2u * f]; mix32R[f] += lv[2u * f + 1u]; }
-	}
-	if (g_eq_live) pm_both |= 16u;   /* EQ-691: page 5 is always on the MIX */
-	if (pm_both) fx_chain_run(mix32, mix32R, pm_both);
-	/* monitor mute (pages mode): a gain on the live pair only, ramped over
-	 * ~4 blocks so the toggle never clicks; the recorder never sees it */
-	{
+	int32_t mon_g0 = 256, mon_gd = 0; int mon_on = 0;   /* MONPRE-879 */
+	{	/* MONPRE-879: the monitor mute FIRST -- the live pair leaves the mix before any page processes it.
+		 * (After the pages, subtracting the DRY pair left processed-minus-dry behind: marc heard the input
+		 * through a full wobble and through the tone off centre.) Same ~4-block ramp, same exact int32. */
 		const int32_t tg = g_mon_mute ? 0 : 256;   /* MUTEANY-738: anywhere */
-		int32_t g = g_mon_g_s;
-		if (g != tg || g != 256) {
-			const int32_t g0 = g;
-			if (g < tg) { g += 64; if (g > tg) g = tg; } else if (g > tg) { g -= 64; if (g < tg) g = tg; }
-			g_mon_g_s = g;
-			const int32_t gd = g - g0;
+		const int32_t g0 = g_mon_g_s;
+		int32_t g = g0;
+		if (g < tg) { g += 64; if (g > tg) g = tg; } else if (g > tg) { g -= 64; if (g < tg) g = tg; }
+		g_mon_g_s = g;
+		mon_g0 = g0; mon_gd = g - g0;
+		mon_on = (g0 != 256 || g != 256);
+		if (mon_on)
 			for (uint32_t f = 0; f < lg; f++) {
-				int32_t k = 256 - (g0 + ((gd * (int32_t)(f + 1u)) >> 8));   /* what to take away */
+				const int32_t k = 256 - (mon_g0 + ((mon_gd * (int32_t)(f + 1u)) >> 8));   /* what to take away */
 				mix32[f]  -= ((int32_t)lv[2u * f]      * k) >> 8;
 				mix32R[f] -= ((int32_t)lv[2u * f + 1u] * k) >> 8;
 			}
+	}
+	if (pm_trk) {
+		/* tracks only: take the monitor out (PASS A added exactly these
+		 * values), run the page, put it back -- int32, exact. MONPRE-879: only the part of the pair still
+		 * in the mix is bracketed; unmuted, k is 0 and this is the whole pair, as before. No branch around
+		 * the run, so the compiler keeps ONE call site (the wrapper's gate counts them). */
+		for (uint32_t f = 0; f < lg; f++) {
+			const int32_t k = 256 - (mon_g0 + ((mon_gd * (int32_t)(f + 1u)) >> 8));
+			mix32[f]  -= (int32_t)lv[2u * f]      - (((int32_t)lv[2u * f]      * k) >> 8);
+			mix32R[f] -= (int32_t)lv[2u * f + 1u] - (((int32_t)lv[2u * f + 1u] * k) >> 8);
+		}
+		fx_chain_run(mix32, mix32R, pm_trk);
+		for (uint32_t f = 0; f < lg; f++) {
+			const int32_t k = 256 - (mon_g0 + ((mon_gd * (int32_t)(f + 1u)) >> 8));
+			mix32[f]  += (int32_t)lv[2u * f]      - (((int32_t)lv[2u * f]      * k) >> 8);
+			mix32R[f] += (int32_t)lv[2u * f + 1u] - (((int32_t)lv[2u * f + 1u] * k) >> 8);
 		}
 	}
+	if (g_eq_live) pm_both |= 16u;   /* EQ-691: page 5 is always on the MIX */
+	if (pm_both) fx_chain_run(mix32, mix32R, pm_both);
+	/* MONPRE-879: the monitor mute moved to the top of this function */
 }
 
 /* NOINL-589 (W280): with the effect chain gone (EFXM2-588) the mixer became
@@ -5820,8 +5998,8 @@ static void __attribute__((noinline)) pa_armed(int rt_i, int16_t lsamp, uint32_t
 			/* GRIDCORE-733: with a loop the beat IS loop_len / n (exact); only the
 			 * first take of a tapped song derives it from the clock. The punch line's
 			 * beat-in-bar is kept: the first take's stop turns it into the "1". */
-			if (g_loop_len && g_slot < NUM_SLOTS && g_grid_n[g_slot])
-				g_gridrec_beat_samps = (g_loop_len + g_grid_n[g_slot] / 2u) / g_grid_n[g_slot];
+			if (g_loop_len && g_slot < NUM_SLOTS && grid_n_live(g_slot))
+				g_gridrec_beat_samps = (g_loop_len + grid_n_live(g_slot) / 2u) / grid_n_live(g_slot);
 			else
 				g_gridrec_beat_samps = (uint32_t)
 					(((uint64_t)g_grid_beat_frames *
@@ -9176,6 +9354,8 @@ static void __attribute__((noinline)) bk_promote(struct looptrk *t)
  * iterate the alignment offset, do not unpin. */
 /* PAGE7V-718: set track t's nudge (1..255, 128 = centre) with 717's law -- refused while the
  * track is taking, the M14 dip when it is playing, the tail marked dirty. Controls thread only. */
+static uint8_t g_nudge_pend;       /* NUDGEKEEP (TRIMGLOBAL-877): lanes whose new take will re-centre the nudge */
+static uint8_t g_nudge_save_pend;  /* ... and a block-2 save owed once no take is in flight */
 static void nudge_set(int t, uint8_t v)
 {
 	if (t < 0 || t >= NTRK || g_slot >= NUM_SLOTS || v == 0u) return;
@@ -9213,42 +9393,47 @@ static uint32_t __attribute__((noinline)) nudge_anchor(int i, uint32_t start_mod
  * they drifted, and a fix applied to one of them is a bug in the other four (W350). Everything calls these now.
  * The tile math is 804's, verbatim. `base` is the song's loop in THIS TRACK's blocks (TLOOPB), so fixed mode takes the
  * same branch in every caller -- PASS 2 used to measure it in 280-sample blocks, which is wrong for a mono take. */
-static void __attribute__((noinline)) chop_tile(uint32_t gb, uint32_t spb,
+static void __attribute__((noinline)) chop_tile(const struct looptrk *tp, uint32_t gb, uint32_t spb,
                                                 uint32_t *pwper, uint32_t *pwin, uint32_t *pwbase, uint32_t *pcyc)
 {
 	const uint32_t cdiv = g_chop_div ? g_chop_div : 1u, coff = g_chop_off;
-	const uint32_t _ll = g_loop_len;
+	/* TRIM2-874: the FULL lap from the stored loop -- g_loop_len is the AUDIBLE (trimmed) lap now, which
+	 * the grid and the LEDs want, but the tile must measure laps of the take as recorded. */
+	const uint32_t _ll = (g_slot < NUM_SLOTS) ? g_meta.slot[g_slot].loop_len : g_loop_len;
 	const uint32_t base = (_ll && spb) ? ((_ll + spb / 2u) / spb) : 0u;   /* TLOOPB, from the track's own geometry */
-	uint32_t cyc, win, wbase, wper;
-	if (g_fixed_len && base && gb >= base && (gb % base) == 0u) {
-		wper = base;
-		win = (wper + cdiv / 2u) / cdiv; if (win == 0u) win = 1u;   /* CHOPROUND-811: a musical division, rounded -- not truncated onto the storage grid (W348) */
-		if (win > wper) win = wper;
-		wbase = (coff * wper + cdiv / 2u) / cdiv;   /* CHOPROUND-811: each offset lands on the NEAREST block to its musical position */
-		if (wbase + win > wper) wbase = wper - win;
-		cyc = (gb / wper) * win;
-	} else {
-		wper = gb;
-		win = (gb + cdiv / 2u) / cdiv; if (win == 0u) win = 1u;   /* CHOPROUND-811 (W348) */
-		if (win > gb) win = gb;
-		wbase = (coff * gb + cdiv / 2u) / cdiv;   /* CHOPROUND-811 */
-		if (wbase + win > gb) wbase = gb - win;
-		cyc = win;
-	}
+	const int _ti = (int)(tp - trk);
+	const uint32_t th = (_ti >= 0 && _ti < NTRK) ? g_trim_hb[_ti] : 0u;
+	const uint32_t tt = (_ti >= 0 && _ti < NTRK) ? g_trim_tb[_ti] : 0u;
+	uint32_t cyc, win, wbase, wper, rs, rlen;
+	/* TRIM2-874: the lap is tiled by the BASE lap when this take is a whole number of them (fixed mode,
+	 * as before -- and now also whenever a trim is set, so a multi-lap overdub skips the trimmed part of
+	 * EACH lap and stays in ratio with the base); otherwise by its own length, as before. The trims cut a
+	 * REGION [rs, rs + rlen) out of every lap; the chop and the free window subdivide THAT. h = t = 0
+	 * makes the region the whole lap and every line below identical to the 805 tile's. */
+	if ((g_fixed_len || th || tt) && base && gb >= base && (gb % base) == 0u) wper = base;
+	else wper = gb;
+	rs = (th < wper) ? th : 0u;
+	rlen = (wper > rs + tt) ? wper - rs - tt : 1u;
+	if (rlen == 0u) rlen = 1u;
+	win = (rlen + cdiv / 2u) / cdiv; if (win == 0u) win = 1u;   /* CHOPROUND-811: a musical division, rounded -- not truncated onto the storage grid (W348) */
+	if (win > rlen) win = rlen;
+	wbase = rs + (coff * rlen + cdiv / 2u) / cdiv;   /* CHOPROUND-811: each offset lands on the NEAREST block to its musical position */
+	if (wbase + win > rs + rlen) wbase = rs + rlen - win;
+	cyc = (gb / wper) * win;
 	if (g_win_free) {   /* CHOPNEST-813: the free window is the REGION; the rocker's chop SUBDIVIDES it.
 	                     * Read the pair defensively (torn store). With cdiv == 1 / coff == 0 this reduces
 	                     * exactly to M16's old override, so a region with no chop is unchanged. */
 		uint32_t ws = g_win_s8, we = g_win_e8;
 		if (we < ws) { uint32_t t2 = ws; ws = we; we = t2; }
-		uint32_t rbase = (ws * wper) >> 8;
-		uint32_t rlen  = ((we - ws + 1u) * wper) >> 8;
-		if (rlen == 0u) rlen = 1u;
-		if (rbase >= wper) rbase = wper - 1u;
-		if (rbase + rlen > wper) rlen = wper - rbase;
-		win = (rlen + cdiv / 2u) / cdiv; if (win == 0u) win = 1u;   /* CHOPROUND-811's law, on the region */
-		if (win > rlen) win = rlen;
-		wbase = rbase + (coff * rlen + cdiv / 2u) / cdiv;
-		if (wbase + win > rbase + rlen) wbase = rbase + rlen - win;
+		uint32_t rbase = rs + ((ws * rlen) >> 8);
+		uint32_t rl2   = ((we - ws + 1u) * rlen) >> 8;
+		if (rl2 == 0u) rl2 = 1u;
+		if (rbase >= rs + rlen) rbase = rs + rlen - 1u;
+		if (rbase + rl2 > rs + rlen) rl2 = rs + rlen - rbase;
+		win = (rl2 + cdiv / 2u) / cdiv; if (win == 0u) win = 1u;   /* CHOPROUND-811's law, on the region */
+		if (win > rl2) win = rl2;   /* CHOPROUND-811 (W348) */
+		wbase = rbase + (coff * rl2 + cdiv / 2u) / cdiv;   /* CHOPROUND-811 */
+		if (wbase + win > rbase + rl2) wbase = rbase + rl2 - win;
 		cyc = (gb / wper) * win;
 	}
 	*pwper = wper ? wper : 1u; *pwin = win ? win : 1u;
@@ -9436,8 +9621,16 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 			for (int _dk = 0; _dk < NTRK; _dk++)
 				if (trk[_dk].state == TS_REC || trk[_dk].state == TS_DONE)
 					_di = false;
-			static uint32_t _dcp;
-			if (g_consume_pos != _dcp) { _dcp = g_consume_pos; _di = false; }
+			static uint32_t _dcp; static int64_t _dcp_t;
+			{	/* DMPGATE-874: "consume frozen" was two passes 2 ms apart against a playhead that
+				 * moves every 5.33 ms -- one pass in three passed the gate DURING PLAY and the dump
+				 * (12 reads + 8 printk lines + an 8 ms sleep per block, per pass) starved PASS 2:
+				 * every PLAY capture since 466 carried its own stutter. A real clock, and the
+				 * transport's own word. */
+				const int64_t _dnow = k_uptime_get();
+				if (g_consume_pos != _dcp) { _dcp = g_consume_pos; _dcp_t = _dnow; }
+				if (g_playing || _dnow - _dcp_t < 100) _di = false;
+			}
 			if (_di) {
 				uint8_t *_db = metabuf;   /* STACKT-716: the song-index buffer, idle in this pass */
 				if (!g_dmp_state) {
@@ -9825,7 +10018,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 					uint32_t _gb   = t->len_blocks ? t->len_blocks
 					               : (TLOOPB(i) ? TLOOPB(i) : 1u);
 					uint32_t _cyc, _win, _wb, _wper;   /* CHOPCORE-805: the prime fills from the SAME tile PASS 2 serves */
-					chop_tile(_gb, TSPB(t), &_wper, &_win, &_wb, &_cyc);
+					chop_tile(t, _gb, TSPB(t), &_wper, &_win, &_wb, &_cyc);
 					uint32_t _want = (RING_SAMPLES / 2u) + 16u * TSPB(t);
 					if (_want > RING_SAMPLES) _want = (RING_SAMPLES - WOB_RING_RSV) - TSPB(t);
 					if (g_win_rev)
@@ -10080,7 +10273,7 @@ static void __attribute__((aligned(2048))) streamer_thread(void *a, void *b, voi
 				 * BARS, uniform and phase-locked, multi-bar variation
 				 * preserved. div=1 reduces to the original math. */
 				uint32_t cyc, win, wbase, wper;   /* CHOPCORE-805: ONE tile definition, shared with the prime, br_tile and the LEDs */
-				chop_tile(gb, TSPB(hsrc), &wper, &win, &wbase, &cyc);
+				chop_tile(hsrc, gb, TSPB(hsrc), &wper, &win, &wbase, &cyc);
 				/* BOUNDARY BUDGET: a chunk clipped by the loop wrap or the
 				 * content/silence boundary used to consume this track's
 				 * WHOLE turn in the round — so the only track with a
@@ -10563,7 +10756,7 @@ static void __attribute__((noinline)) grid_follow_tape(void)
 {
 	static uint32_t g_gf_bf, g_gf_bf_L; static uint64_t g_gf_bf_ns;   /* CPU-780 O3: the beat-frames cache (function-local so the 24-h proof carries it) */
 	const uint32_t L = g_loop_len;
-	const uint32_t n = (g_slot < NUM_SLOTS) ? g_grid_n[g_slot] : 0u;
+	const uint32_t n = (g_slot < NUM_SLOTS) ? grid_n_live(g_slot) : 0u;
 	uint32_t moved;
 	{	/* the 64-bit shadow of the playhead: the 2^32 wrap (24.8 h) is a small
 		 * forward step and disappears; a BACKWARD step is a reset (restart, first
@@ -11540,7 +11733,7 @@ static void controls_diag(void)
 		       (unsigned)g_pg_route[1], (unsigned)g_pg_route[2], (unsigned)g_pg_route[3], (unsigned)g_pg_route[4],
 		       (unsigned)g_mon_mute, (unsigned)g_in_blk, (unsigned)g_inw_blk);   /* INFX-672 */
 		printk("GR,src=%u,n=%u,o=%u,L=%u,bf=%u,tk=%u,lap=%u,u=%u,bib=%u\n",   /* GRIDCORE-733: 1 = the tape is the clock, 2 = the tapped clock; beats in the loop; the 1; loop_len; the wall beat now; tick index; ticks in the last lap (= 24n) */
-		       (unsigned)g_grid_src, (unsigned)((g_slot < NUM_SLOTS) ? g_grid_n[g_slot] : 0u), (unsigned)((g_slot < NUM_SLOTS) ? g_grid_o[g_slot] : 0u),
+		       (unsigned)g_grid_src, (unsigned)((g_slot < NUM_SLOTS) ? grid_n_live(g_slot) : 0u), (unsigned)((g_slot < NUM_SLOTS) ? g_grid_o[g_slot] : 0u),
 		       (unsigned)g_loop_len, (unsigned)g_grid_beat_frames, (unsigned)g_grid_tick_prev, (unsigned)g_grid_lap_tk, (unsigned)grid_bpb(), (unsigned)g_grid_bib);   /* BEATSPB-824 */
 		printk("BK,p=%u,s=%u,l=%u,c=%u,b=%u,n=%u\n",   /* BAKE-619/TRUE-621: prints baked, last speed q16, last len (baked blocks), capped, blocks this print, loop chosen at the stop */
 		       (unsigned)g_bk_prints, (unsigned)g_bk_last_spd, (unsigned)g_bk_len,
@@ -11925,7 +12118,7 @@ static enum trk_btn decode_tracks(int v)
 static void __attribute__((noinline)) br_tile(const struct looptrk *t, uint32_t gb, uint32_t *pwin, uint32_t *pcyc)
 {
 	uint32_t wper, wbase;   /* CHOPCORE-805: the beat repeat reads the streamer's tile, not a copy of it */
-	chop_tile(gb, TSPB(t), &wper, pwin, &wbase, pcyc);
+	chop_tile(t, gb, TSPB(t), &wper, pwin, &wbase, pcyc);
 }
 /* BRCHOP-800: publish the FN layer's Q8 view from the first repeated track. */
 static void br_publish8(void)
@@ -11960,7 +12153,7 @@ static void __attribute__((noinline)) br_geom(uint32_t div, uint32_t den)
 		uint32_t line_blk;   /* the last window boundary at or before the playhead, in this track's blocks (free-running) */
 		{	/* BRGRID-764: on a gridded song the boundaries are the BEAT LINES (GRIDCORE: O + k * L / n), subdivided by the
 			 * window; ungridded: multiples of the window in the free-running count, as before. */
-			const uint32_t n = (g_slot < NUM_SLOTS) ? (uint32_t)g_grid_n[g_slot] : 0u;
+			const uint32_t n = (g_slot < NUM_SLOTS) ? grid_n_live(g_slot) : 0u;
 			if (n && g_loop_len) {   /* windows of L / div from the 1 (O): every beat line when div is a multiple of n, every other beat for the 2-beat window */
 				const uint32_t O = (g_slot < NUM_SLOTS) ? g_grid_o[g_slot] : 0u;
 				const uint32_t off = (uint32_t)((((uint64_t)((P + g_loop_len - (O % g_loop_len)) % g_loop_len) * div) % g_loop_len) / div);   /* samples into the current window */
@@ -12025,7 +12218,7 @@ static void __attribute__((noinline)) br_click(int down)   /* BRDIR-757: `down` 
 {
 	if (!g_br_on) {
 		if (!g_playing || (g_rec_track >= 0 && !g_bnc_on) || !g_loop_active || !g_loop_len) return;   /* BRBNC-758: a repeat may start during a bounce (not during a plain take) */
-		uint32_t n = (g_slot < NUM_SLOTS) ? (uint32_t)g_grid_n[g_slot] : 0u;
+		uint32_t n = (g_slot < NUM_SLOTS) ? grid_n_live(g_slot) : 0u;
 		if (n == 0u || n > CHOP_DIV_MAX / 2u) n = 8u;   /* ungridded: eighths of the loop */
 		if (!down && n > 1u && (n & 1u) == 0u) n /= 2u;   /* BRBEAT-755 / BRDIR-757: UP first = ONE beat; DOWN first = TWO beats */
 		g_br_div = n;
@@ -12045,7 +12238,7 @@ static void __attribute__((noinline)) br_click(int down)   /* BRDIR-757: `down` 
 static void __attribute__((noinline)) br_release(int roll)
 {
 	if (!g_br_on) return;
-	if (!roll && !g_bnc_on && g_loop_len && g_slot < NUM_SLOTS && g_grid_n[g_slot]) {
+	if (!roll && !g_bnc_on && g_loop_len && g_slot < NUM_SLOTS && grid_n_live(g_slot)) {
 		for (int i = 0; i < NTRK; i++) {   /* one reference track: the hold is one musical amount for the whole tape */
 			struct looptrk *t = &trk[i];
 			if (!g_br_w[i] || t->state != TS_PLAY || head_active(i) || !t->len_blocks) continue;
@@ -12056,7 +12249,7 @@ static void __attribute__((noinline)) br_release(int roll)
 			const uint32_t c_rep = (g_br_b[i] + brph) % cyc;                    /* where the repeat is */
 			const uint32_t c_rol = chop_phase(i, t->start_blk, pwbc, gb, cyc, spb);   /* where the tape is (CHOPANCHOR-805) */
 			uint32_t raw = ((c_rol + cyc - c_rep) % cyc) * spb;                 /* the hold, in loop samples */
-			const uint32_t n = (uint32_t)g_grid_n[g_slot];
+			const uint32_t n = grid_n_live(g_slot);
 			uint32_t u = grid_bpb();   /* BEATSPB-824: the STORED bar, not a guess. 804's ladder tried %% 4 first, so a 12/24/48-beat waltz always took the 4 branch -- the one input it existed to serve. */
 			if (u > n) u = n;          /* a bar can never be longer than the loop it rounds inside */
 			const uint32_t unit = (uint32_t)(((uint64_t)g_loop_len * u) / n);
@@ -12594,6 +12787,24 @@ static void led_flash_lane(int i, uint32_t count)
 			g_led_quiet_ms = _end;
 	}
 }
+/* TRIM2-874: a sweep touched the record -- remember what to flash and start the stillness clock. The
+ * geometry is NOT moved here: the phase mapper takes the absolute block counter modulo the cycle, so every
+ * live re-apply would jump the loop's phase. Only the LED follows the fader. */
+static void trim_touch(int lane, uint32_t count)
+{
+	g_trim_fl_lane = (int8_t)lane; g_trim_fl_n = (uint8_t)(count > 4u ? 4u : count);
+	g_trim_dirty_ms = k_uptime_get_32() | 1u;
+}
+/* the gesture is over (still for TRIM_SETTLE_MS, or a one-shot) -- pay ONCE: the geometry, the covering
+ * snap + dip for the splice, ONE eMMC write, ONE flash. */
+static void trim_settle(void)
+{
+	(void)trim_apply();
+	g_chop_req = 1; g_dip_req = 1;
+	g_meta_save_req = 1;   /* the x3 write rides this flag -- once per gesture, not per tick */
+	if (g_trim_fl_lane >= 0) led_flash_lane(g_trim_fl_lane, g_trim_fl_n);
+	g_trim_fl_lane = -1; g_trim_dirty_ms = 0u;
+}
 static void page_led_depth(int i, uint32_t amt)
 {
 	if (g_led_fl_n[i]) {   /* the count overlay owns the LED until it is done */
@@ -12746,7 +12957,7 @@ static void led_service(void)
 		if (g_sec_led) {
 			for (int i = 0; i < NUM_TRACK_LEDS; i++)
 				page_led_depth(i, (g_sec_led == (uint8_t)(i + 1) && g_slot < NUM_SLOTS)
-				                  ? bipolar_depth(g_trk_nudge[g_slot][i] ? g_trk_nudge[g_slot][i] : 128u) : 0u);
+				                  ? bipolar_depth(g_trk_nudge[g_slot][i] ? g_trk_nudge[g_slot][i] : 128u) : 0u);   /* TRIMGLOBAL-877 */
 		} else if (_rt7 >= 0 && _rt7 < NTRK && trk[_rt7].state == TS_REC && _ta7 && _pn7) {
 			const uint32_t _rc7 = trk[_rt7].rec_count;
 			const uint32_t _unit = _ta7 / _pn7;
@@ -12902,7 +13113,7 @@ static void led_service(void)
 					uint32_t gb2 = hs2->len_blocks ? hs2->len_blocks
 						     : (g_loop_blocks ? g_loop_blocks : 1u);
 					uint32_t wper2, win2, wb2, cyc2;   /* CHOPCORE-805: the light marks the AUDIBLE wrap -- the real tile, */
-					chop_tile(gb2, TSPB(hs2), &wper2, &win2, &wb2, &cyc2);   /* fixed mode included, which the old ad-hoc cyc ignored */
+					chop_tile(hs2, gb2, TSPB(hs2), &wper2, &win2, &wb2, &cyc2);   /* fixed mode included, which the old ad-hoc cyc ignored */
 					uint32_t ho2 = heads_engaged()
 					             ? (((uint32_t)g_head_pos[i] * cyc2) >> 8) : 0u;
 					uint32_t pwb2 = (uint32_t)(g_consume_pos / TSPB(hs2));   /* CHOPCORE-805: the track's own blocks, not a fixed 280 */
@@ -13379,9 +13590,9 @@ static void __attribute__((noinline)) grid_load_song(uint32_t ns)
 		g_grid_bpm_q8[ns] = (uint16_t)((48000ULL * 60u * 256u * nb) / L);
 		g_grid_save_req = 1;
 	}
-	if (L && g_grid_n[ns]) {
+	if (L && grid_n_live(ns)) {
 		g_grid_active = 1;   /* the service publishes bf / anchor_e from the tape next block */
-		g_grid_beat_frames = (uint32_t)(((uint64_t)L * 65536u) / ((uint64_t)g_grid_n[ns] * (g_play_speed_q16 ? g_play_speed_q16 : 65536u)));
+		g_grid_beat_frames = (uint32_t)(((uint64_t)L * 65536u) / ((uint64_t)grid_n_live(ns) * (g_play_speed_q16 ? g_play_speed_q16 : 65536u)));
 		if (!g_grid_beat_frames) g_grid_beat_frames = 1u;
 		g_grid_anchor = g_sample_clock; g_grid_anchor_e = g_grid_anchor;
 		g_grid_next_tick = g_sample_clock;
@@ -13780,6 +13991,50 @@ int main(void)
 
 	while (1) {
 		feed_wdt();
+		if (g_trim_dirty_ms && (uint32_t)(k_uptime_get_32() - g_trim_dirty_ms) >= TRIM_SETTLE_MS)
+			trim_settle();   /* TRIM2-874: the sweep has been still -- pay once */
+		else if (!g_trim_dirty_ms && g_playing && g_loop_active && !g_xfer_mode && trim_apply()) {   /* TRIM2-874: reconcile (a load / cancel inside the mixer reset the lap) */
+			g_chop_req = 1; g_dip_req = 1;
+		}
+		if (!g_trim_dirty_ms && !g_xfer_mode && g_slot < NUM_SLOTS && g_rec_track < 0 &&
+		    !g_meta.slot[g_slot].loop_len) {
+			/* TRIMGLOBAL-877: an EMPTY song has no trim -- the next first take starts a new loop, and a
+			 * leftover trim would cut its end. Some tracks left = the trim stays; the grid alone = stays. */
+			int _te_any = 0;
+			for (int _k = 0; _k < NTRK; _k++)
+				if (trk[_k].state != TS_EMPTY || g_meta.slot[g_slot].present[_k]) _te_any = 1;
+			if (!_te_any) {
+				uint32_t _eh, _et; trim_song_get(g_slot, &_eh, &_et);
+				int _te = ((_eh || _et) && trim_song_set(g_slot, 0u, 0u));   /* never seals a card that has no trim */
+				for (int _k = 0; _k < NTRK; _k++) {
+					uint32_t _kh, _kt; trim_trk_get(g_slot, _k, &_kh, &_kt);
+					if ((_kh || _kt) && trim_trk_set(g_slot, _k, 0u, 0u)) _te = 1;
+				}
+				if (_te) {
+					printk("TRIM,empty,slot=%u,h=%u,t=%u\n", (unsigned)g_slot, (unsigned)_eh, (unsigned)_et);
+					(void)trim_apply();
+					g_trim_q4 = -1;
+					for (int _k = 0; _k < NTRK; _k++) g_trim_qt[_k] = -1;
+					g_meta_save_req = 1;   /* one x3 write */
+				}
+			}
+		}
+		if (g_nudge_pend && !g_xfer_mode) {   /* TRIMGLOBAL-877 NUDGEKEEP: the take started -> its lane re-centres */
+			for (int _k = 0; _k < NTRK; _k++) {
+				if (!(g_nudge_pend & (1u << _k))) continue;
+				const uint8_t _ns = trk[_k].state;
+				if (_ns == TS_REC || _ns == TS_DONE) {
+					if (g_slot < NUM_SLOTS && g_trk_nudge[g_slot][_k]) {
+						g_trk_nudge[g_slot][_k] = 0u; g_nudge_save_pend = 1;
+						printk("NUDGE,clear,trk=%d\n", _k + 1);
+					}
+					g_nudge_pend &= (uint8_t)~(1u << _k);
+				} else if (_ns != TS_ARMED && !g_arm_req[_k] && g_bnc_arm != (int8_t)_k && g_rec_track != _k) {
+					g_nudge_pend &= (uint8_t)~(1u << _k);   /* cancelled before it started: the old take keeps its nudge */
+				}
+			}
+		}
+		if (g_nudge_save_pend && g_rec_track < 0 && !g_xfer_mode) { g_nudge_save_pend = 0; g_grid_dirty_ms = k_uptime_get_32() | 1u; }
 
 		/* USB block-transfer in progress: audio is paused and the streamer is
 		 * servicing reads/writes. Ignore the controls and show a "busy" pattern
@@ -13968,6 +14223,29 @@ int main(void)
 						g_mon_mute = 0u;   /* a forgotten monitor mute is indistinguishable from "no audio" */
 						g_pg_open = 0;   /* the faders are volume again, not FX */
 						hatch_wide();   /* HATCHWIDE-851: window, chop, repeat, directions, heads, FX */
+						{	/* HATCHARM-876: a pending take is the one state the hatch left behind, and it
+							 * refuses PLAY (tap and hold), the song switch and the rocker. Cancel it the way a
+							 * stop tap does: ARMED -> nothing written; REC -> finalised as a take. */
+							const int _hrt = g_rec_track;
+							if (_hrt >= 0 && _hrt < NTRK) {
+								printk("HATCH,cancel,trk=%d,st=%s\n", _hrt + 1,
+								       (trk[_hrt].state == TS_ARMED) ? "ARMED" : (trk[_hrt].state == TS_REC) ? "REC" : "OTHER");
+								g_stop_req = 1;
+							}
+						}
+						{	/* HATCHALL-879: the emergency button -- pages 6 and 7, the trim, the tape speed */
+							for (int _k = 0; _k < NTRK; _k++) { place_set(_k, 128u); nudge_set(_k, 128u); }
+							if (g_slot < NUM_SLOTS) {
+								g_grid_off_q8[g_slot] = 0; g_take_preset[g_slot] = 0u;
+								g_grid_bpb[g_slot] = 0u;
+								g_grid_dirty_ms = k_uptime_get_32() | 1u;
+								if (trim_song_set(g_slot, 0u, 0u)) { g_trim_fl_lane = -1; trim_settle(); }
+								g_trim_q4 = -1;
+							}
+							g_play_speed_q16 = 65536u;
+							g_play_bpm = 80;
+							printk("HATCH,all\n");
+						}
 						g_led_ack = 60;  /* ~0.5 s solid: done */
 						g_led_fill = 0;
 						h4_fired = 1;
@@ -14459,6 +14737,14 @@ int main(void)
 								 * way. This is the SAME latch heads mode uses on ITS exit;
 								 * the volume simply stays put until a fader crosses it. */
 								for (int _f = 0; _f < 4; _f++) {
+									/* FHARM-854: arm ONLY a fader that has actually
+									 * drifted past the pickup window. One that never
+									 * moved is still at the volume it owes, so latching
+									 * it disables a control for nothing -- and arming all
+									 * four from an ordinary page close is exactly W373's
+									 * failure mode. A fader that COULD jump still latches,
+									 * so the bug the latch exists for cannot come back. */
+									if (!fh_needs_latch(_f)) { g_fh_latch[_f] = 0; continue; }
 									g_fh_latch[_f] = 1;
 									g_fh_lastq[_f] = -1;
 								}
@@ -14922,7 +15208,7 @@ int main(void)
 					 * then everything behaves exactly as normal.
 					 * Nothing to remember, nothing to turn off,
 					 * no state to read off the panel afterwards. */
-					if (g_grid_active && g_grid_beat_frames && g_loop_len && g_slot < NUM_SLOTS && g_grid_n[g_slot]) {
+					if (g_grid_active && g_grid_beat_frames && g_loop_len && g_slot < NUM_SLOTS && grid_n_live(g_slot)) {
 						/* GRIDCORE-733: a loaded song snaps by its SPEED -- the loop is
 						 * untouched (n beats in L samples is the tempo), so the snap is
 						 * exact and reversible. bf = the wall beat now; nb = the wall
@@ -15103,8 +15389,8 @@ int main(void)
 						 * previous tap's -- so tap 5 retuned to ~1x and undid tap 4.) */
 						uint32_t native_q8 = 0;
 						if (g_loop_len > 0u) {
-							if (g_grid_n[g_slot]) {   /* GRIDCORE-733: n beats in L samples, at 1x */
-								native_q8 = (uint32_t)((48000ULL * 60u * 256u * g_grid_n[g_slot]) / g_loop_len);
+							if (grid_n_live(g_slot)) {   /* GRIDCORE-733: n beats in L samples, at 1x */
+								native_q8 = (uint32_t)((48000ULL * 60u * 256u * grid_n_live(g_slot)) / g_loop_len);
 							} else if (g_grid_bpm_q8[g_slot] && g_play_speed_q16) {
 								native_q8 = (uint32_t)(((uint64_t)g_grid_bpm_q8[g_slot] << 16) / g_play_speed_q16);
 							}
@@ -15171,7 +15457,7 @@ int main(void)
 								if (nb > 255u) nb = 255u;
 								g_grid_n[g_slot] = (uint8_t)nb;
 							}
-							g_grid_bpm_q8[g_slot] = (uint16_t)((48000ULL * 60u * 256u * g_grid_n[g_slot]) / g_loop_len);
+							g_grid_bpm_q8[g_slot] = (uint16_t)((48000ULL * 60u * 256u * grid_n_live(g_slot)) / g_loop_len);
 							g_grid_o_req_w = tap_first_s; g_grid_o_req = 1u;
 						} else {
 							g_grid_beat_frames = nf;   /* F9: exact (the clock grid of an empty song) */
@@ -15206,6 +15492,8 @@ int main(void)
 				 * way. This is the SAME latch heads mode uses on ITS exit;
 				 * the volume simply stays put until a fader crosses it. */
 				for (int _f = 0; _f < 4; _f++) {
+					/* FHARM-854: see the twin above -- arm only what actually drifted. */
+					if (!fh_needs_latch(_f)) { g_fh_latch[_f] = 0; continue; }
 					g_fh_latch[_f] = 1;
 					g_fh_lastq[_f] = -1;
 				}
@@ -15631,6 +15919,8 @@ int main(void)
 					g_bnc_arm = (int8_t)ti;
 					g_bk_mode = 0u; g_bnc_arm_t = tnow; g_bk_trk_ctl = (int8_t)ti;   /* TAPECOPY-684 / HOLDSTOP-686 */
 					g_take_auto_at = 0u;          /* STACKT-716: a bounce never takes the preset */
+					if (g_slot < NUM_SLOTS && trim_trk_set(g_slot, ti, 0u, 0u)) g_meta_save_req = 1;   /* TRIM2-874: a new take clears its trims (saves only if there were any) */
+					g_nudge_pend |= (uint8_t)(1u << ti);   /* TRIMGLOBAL-877: a bounce onto a lane is a new take there */
 					__DSB();                      /* the flag lands before the request */
 					g_arm_req[ti] = 1;
 				} else {
@@ -15777,6 +16067,13 @@ int main(void)
 							} else if (ti == 2 && g_grid_bpb[g_slot]) {
 								g_grid_bpb[g_slot] = 0u; g_grid_dirty_ms = k_uptime_get_32() | 1u;   /* BEATSPB-824: back to four */
 								g_fx_pick[2] = 1; g_fx_lastq[2] = -1;
+							} else if (ti == 3 && trim_song_set(g_slot, 0u, 0u)) {
+								/* TRIM2-874: T4's tap = the song's head and tail back to none; one-shot, so it
+								 * settles at once (the long OFF blink = none); the pickup + hysteresis re-arm */
+								g_trim_fl_lane = 3; g_trim_fl_n = 0u;
+								trim_settle();
+								g_trim_q4 = -1;
+								g_fx_pick[3] = 1; g_fx_lastq[3] = -1;
 							}
 						}
 						tap_deadline[ti] = 0;
@@ -15939,11 +16236,19 @@ int main(void)
 			 * began inside the window (stable test: the deadline is only
 			 * consumed by the quick-toggle or by this delete, so it cannot
 			 * lapse mid-hold) and has dwelt DTAP_DEL_HOLD_MS. */
-			if (!armed_press[ti] && ti != stop_tap_trk && !g_heads_mode &&
+			if (!armed_press[ti] && ti != stop_tap_trk && !g_heads_mode && !g_pg_open &&
+			    /* DELPAGE-854: an OPEN PAGE owns the track taps (PF-545 / W156), and the
+			     * record-ARM hold immediately below has always carried this guard. The
+			     * DELETE dwell never did, so a double-tap-hold erased a track from inside
+			     * an FX or timing page -- silent, destructive, and nobody reported it.
+			     * Found by inventorying the readers of a gesture we chose NOT to use. */
 			    tap_deadline[ti] > 0 && press_t[ti] <= tap_deadline[ti] &&
 			    k_uptime_get() - press_t[ti] >= DTAP_DEL_HOLD_MS) {
 				tap_deadline[ti] = 0;
 				g_del_req[ti] = 1;
+				if (g_slot < NUM_SLOTS && trim_trk_set(g_slot, ti, 0u, 0u)) g_meta_save_req = 1;   /* TRIM2-874: a new take clears its trims (saves only if there were any) */
+				if (g_slot < NUM_SLOTS && g_trk_nudge[g_slot][ti]) { g_trk_nudge[g_slot][ti] = 0u; g_grid_dirty_ms = k_uptime_get_32() | 1u; }   /* TRIMGLOBAL-877: a deleted track takes its nudge with it */
+				g_nudge_pend &= (uint8_t)~(1u << ti);
 				g_head_rev[ti] = 0;   /* REV2-641: an empty track has no direction */
 				trk[ti].muted = 0;
 				armed_press[ti] = 1;   /* spend the press: its release
@@ -16016,6 +16321,8 @@ int main(void)
 							(_sc > _back) ? (_sc - _back) : _sc;
 					}
 					g_take_auto_at = take_preset_samps();   /* STACKT-716: the preset for THIS take (0 = none) */
+					if (g_slot < NUM_SLOTS && trim_trk_set(g_slot, ti, 0u, 0u)) g_meta_save_req = 1;   /* TRIM2-874: a new take clears its trims (saves only if there were any) */
+					g_nudge_pend |= (uint8_t)(1u << ti);   /* TRIMGLOBAL-877: re-centre when this take really starts */
 					g_arm_req[ti] = 1;
 					g_playing = 1;                   /* recording implies play */
 				}
@@ -16099,10 +16406,10 @@ int main(void)
 					const int _held = (committed >= TRK_1 && committed <= TRK_4) ? (int)committed : -1;
 					const int _slot = (_held < 0) ? 0 : (fi == _held) ? 1 : (fi == ((_held + 1) & 3)) ? 2 : 0;   /* 1 = own fader, 2 = the fader to the right (SHAPE-696) */
 					if (g_pg_open && ((g_pg_id >= 1u && g_pg_id <= 4u && _slot) ||
-					    (g_pg_id == 7u && _slot == 1 && g_slot < NUM_SLOTS))) {   /* NUDGE-717: page 7, own fader = the nudge */
+					    (g_pg_id == 7u && _slot == 1 && g_slot < NUM_SLOTS))) {   /* NUDGE-717: page 7, own fader = the nudge (TRIMGLOBAL-877: the per-track trim is gone) */
 						volatile uint8_t *_tab = (g_pg_id == 7u) ? &g_trk_nudge[g_slot][_held]
 						                       : (_slot == 1) ? &g_sec[g_pg_id - 1u][_held] : &g_sec2[g_pg_id - 1u][_held];
-						if (g_pg_id == 7u && *_tab == 0u) *_tab = 128u;   /* unset reads as centre */
+						if (g_pg_id == 7u && _slot == 1 && *_tab == 0u) *_tab = 128u;   /* unset reads as centre */
 						if (!sec_on[fi]) { sec_on[fi] = 1; sec_q0[fi] = (int)q; sec_moved[fi] = 0; sec_base[fi] = (int)*_tab; }
 						int _d = (int)q - sec_q0[fi];
 						if (!sec_moved[fi] && (_d >= 7 || _d <= -7)) {   /* SECGATE-822: M31's intent gate (3 -> 7, ~2.7 % of travel). 3 sat under the measured drift of a loose fader, so a bump during a TAP spent the press and the cycle never fired. */
@@ -16195,15 +16502,58 @@ int main(void)
 							/* NOOFF-821: OFFWAKE-697 deleted -- no OFF slot left to wake from. It tested the fader POSITION, not movement, so it re-fired on every scan and made OFF unreachable. */
 						}
 						if (!g_fx_pick[fi] && fi == 0)
-							g_flt_pos = (uint8_t)_q8;   /* ONE filter,
-							 * two handles: FN+fader-4 and this page fader
-							 * drive the SAME state (the map's decision) */
+							g_flt_pos = (uint8_t)_q8;   /* THE filter's one
+							 * handle. It used to have two: FN + fader 4 wrote
+							 * this same state until the 812 zoom stage took it
+							 * away and made that gesture the window zoom -- the
+							 * fader's drift under a chop-hold was stripping the
+							 * low end from all four loops. This page fader is
+							 * now the only writer. */
 					} else if (g_pg_open && g_pg_id == 7u) {
 						/* STACKT-716: page 7 owns the faders -- F1 = the downbeat
 						 * offset (bipolar, +-1/2 beat), F2 = the preset take length
-						 * (off / 1 / 2 / 4 / 8), F3 = BEATS PER BAR (BEATSPB-824: 2 / 3 / 4 / 6),
-						 * F4 nothing; the pickup law (W155). */
-						if (fi < 3 && g_slot < NUM_SLOTS) {
+						 * (off / 1 / 2 / 4 / 8), F3 = BEATS PER BAR (3 / 4 / 5 / 7 since BPBSET-833 -- the set the code below actually reads),
+						 * F4 = THE SONG'S HEAD / TAIL TRIM (TRIM2-874); the pickup law (W155). */
+						if (fi == 3 && g_slot < NUM_SLOTS) {
+							/* TRIM2-874: F4 = THE SONG'S HEAD AND TAIL. Centre = untrimmed; up cuts
+							 * the tail, down cuts the head. Gridded: WHOLE BEATS, down to one beat,
+							 * tempo preserved. Ungridded: blocks of the base take, down to 1/16 of the
+							 * lap. The pickup law as on every lane; 4 counts of hysteresis around the
+							 * last applied reading (the ladder drifts); applied when the fader is still. */
+							const uint32_t _Lf = g_meta.slot[g_slot].loop_len;
+							const uint32_t _nf = g_grid_n[g_slot];
+							uint32_t _unit, _max;
+							if (_nf) { _unit = (_Lf + _nf / 2u) / _nf; _max = (_nf > 1u) ? _nf - 1u : 0u; }   /* beats: one stays */
+							else {
+								uint32_t _sp = 0u, _lb = 0u;
+								for (int k = 0; k < NTRK; k++)
+									if (trk[k].state == TS_PLAY && trk[k].len_blocks && (!_lb || trk[k].len_blocks < _lb)) { _lb = trk[k].len_blocks; _sp = TSPBI(k); }
+								_unit = _sp ? _sp : SAMP_PER_BLK; _max = trim_max_blocks(_lb);               /* blocks: 1/16 stays */
+							}
+							if (_Lf && _unit && _max) {
+								uint32_t _ch, _ct; trim_song_get(g_slot, &_ch, &_ct);
+								_ch /= _unit; _ct /= _unit;
+								const uint8_t _pv = trim_q_from(_ch, _ct, _max);
+								int _q8 = (int)((q > 255u) ? 255u : q);
+								if (g_fx_pick[fi]) {
+									int _d = _q8 - (int)_pv;
+									int _p = g_fx_lastq[fi];
+									g_fx_lastq[fi] = _q8;
+									if ((_d >= -6 && _d <= 6) ||
+									    (_p >= 0 && ((_p - (int)_pv > 0) != (_d > 0))))
+										g_fx_pick[fi] = 0;
+								}
+								if (!g_fx_pick[fi] &&
+								    (g_trim_q4 < 0 || _q8 - g_trim_q4 >= TRIM_HYST_Q || g_trim_q4 - _q8 >= TRIM_HYST_Q)) {
+									uint32_t _nh, _nt; trim_units_from(_q8, _max, &_nh, &_nt);
+									if (_nh != _ch || _nt != _ct) {
+										(void)trim_song_set(g_slot, _nh * _unit, _nt * _unit);
+										trim_touch(3, _nh ? _nh : _nt);   /* the geometry, the snap, the write and the flash on stillness */
+									}
+									g_trim_q4 = (int16_t)_q8;
+								}
+							}
+						} else if (fi < 3 && g_slot < NUM_SLOTS) {
 							const uint8_t _cur = g_take_preset[g_slot];
 							const uint32_t _ubar = grid_bpb();   /* BEATSPB-824 */
 							uint8_t _pv = (fi == 0) ? (uint8_t)((int)g_grid_off_q8[g_slot] + 128)
