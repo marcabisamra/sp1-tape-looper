@@ -3897,7 +3897,7 @@ static uint32_t tempo_median_ioi(void)
 static uint32_t tempo_refine(uint32_t bs)
 {
 	/* PAD-594 / PADHOST-715 (W287): the mixer's 32-byte line; the build sets the count. */
-	__asm__ volatile(".rept 8\n\tnop\n\t.endr");
+	__asm__ volatile(".rept 2\n\tnop\n\t.endr");
 	if (!bs || g_tempo.n < 4u) return 0u;
 	if (!g_tempo.first_onset || g_tempo.last_onset <= g_tempo.first_onset)
 		return 0u;
@@ -15254,7 +15254,13 @@ int main(void)
 										* TSPBI(k3);
 							}
 							/* r7: beat_set did the rec beat too */
-							g_dip_req = 1;   /* declick, as ever */
+							{	/* ROUNDDIP-881: declick only what jumped -- the dip is the MASTER envelope and ducks
+								 * the live input too; with no playing track there is nothing to hide (marc 09-23) */
+								int _rd = 0;
+								for (int k4 = 0; k4 < NTRK; k4++)
+									if (trk[k4].state == TS_PLAY && trk[k4].len_samps) _rd = 1;
+								if (_rd) g_dip_req = 1;
+							}
 						}
 					}
 					if (g_snap_took) {
